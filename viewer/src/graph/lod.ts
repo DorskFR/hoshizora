@@ -39,6 +39,7 @@ export interface LodOptions {
   maxLinks: number;
   effectFilter: ReadonlySet<EffectKind>;
   transitive: boolean;
+  hideKinds?: ReadonlySet<NodeKind>;
 }
 
 export interface View {
@@ -87,6 +88,7 @@ export function buildView(index: GraphIndex, opts: LodOptions): View {
   const repOf = new Map<string, string>();
   const groups = new Map<string, string[]>();
   for (const n of index.graph.nodes) {
+    if (opts.hideKinds?.has(n.kind)) continue;
     const rep = representative(index, n.id, opts.level, opts.expanded);
     if (!rep) continue;
     repOf.set(n.id, rep);

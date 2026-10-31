@@ -73,6 +73,9 @@ export class Scene {
   private cheapNodes = false;
   private denseNodes = false;
   private fitPending = false;
+  private hovered: string | null = null;
+  private readonly labelLayer: HTMLElement;
+  private readonly labelEls = new Map<string, HTMLElement>();
   private batchedLinks: { mesh: THREE.LineSegments; links: SceneLink[] } | null = null;
   private batchedNodes: { points: THREE.Points; nodes: ViewNode[] } | null = null;
 
@@ -128,6 +131,9 @@ export class Scene {
       .linkDirectionalParticleColor(() => "#ffe29a")
       .onNodeClick((n) => this.handleClick(n as ViewNode))
       .onBackgroundClick(() => this.cb.onBackground())
+      .onNodeHover((n) => {
+        this.hovered = n ? (n as ViewNode).id : null;
+      })
       .d3AlphaDecay(0.03)
       .d3VelocityDecay(0.35)
       .warmupTicks(30)
@@ -137,8 +143,11 @@ export class Scene {
     this.fg.onEngineStop(() => {
       if (!this.fitPending) return;
       this.fitPending = false;
-      this.fg.zoomToFit(700, 80);
+      this.fit();
     });
+    this.labelLayer = document.createElement("div");
+    this.labelLayer.className = "labels";
+    el.appendChild(this.labelLayer);
     this.fg.d3Force("cluster", this.clusterForce());
     this.fg.scene().add(this.glowGroup);
     const light = new THREE.PointLight(0x8899ff, 1.5, 0, 0);
@@ -146,7 +155,12 @@ export class Scene {
     this.fg.scene().add(light);
     this.tick = this.tick.bind(this);
     this.raf = requestAnimationFrame(this.tick);
-    new ResizeObserver(() => this.fg.width(el.clientWidth).height(el.clientHeight)).observe(el);
+    let resizeTimer = 0;
+    new ResizeObserver(() => {
+      this.fg.width(el.clientWidth).height(el.clientHeight);
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => this.fit(500), 250);
+    }).observe(el);
   }
 
   setView(view: View): void {
@@ -171,14 +185,16 @@ export class Scene {
     this.cheapLinks = links.length > BATCH_LINKS_ABOVE;
     this.cheapNodes = view.nodes.length > BATCH_NODES_ABOVE;
     this.denseNodes = view.nodes.length > DECORATE_BELOW;
-    this.fitPending = prev.size === 0;
-    if (this.fitPending) {
-      if (view.nodes.length < 600) window.setTimeout(() => this.fg.zoomToFit(700, 80), 1500);
+    this.fitPending = true;
+    if (prev.size === 0) {
+      if (view.nodes.length < 600) window.setTimeout(() => this.fit(), 1500);
       else {
         const r = layoutRadius(view.nodes);
         this.fg.cameraPosition({ x: 0, y: r * 0.6, z: r * 2.6 }, { x: 0, y: 0, z: 0 }, 0);
       }
     }
+    for (const el of this.labelEls.values()) el.remove();
+    this.labelEls.clear();
     this.clearGlows(false);
     this.fg.warmupTicks(this.cheapNodes ? 0 : 30).cooldownTicks(this.cheapNodes ? 150 : 260);
     this.fg.graphData({ nodes: view.nodes, links });
@@ -285,6 +301,75 @@ export class Scene {
     }
   }
 
+  private labelCandidates(): ViewNode[] {
+    const out: ViewNode[] = [];
+    const seen = new Set<string>();
+    const add = (id: string | null) => {
+      if (!id || seen.has(id)) return;
+      const n = this.nodes.get(id);
+      if (!n) return;
+      seen.add(id);
+      out.push(n);
+    };
+    add(this.hovered);
+    add(this.selected);
+    if (this.highlight && this.highlight.nodes.size <= MAX_HIGHLIGHT_LABELS) {
+      for (const id of this.highlight.nodes) add(id);
+    }
+    if (!this.cheapNodes) {
+      const all = Array.from(this.nodes.values());
+      for (const n of all) {
+        if (out.length >= MAX_LABELS) break;
+        if (n.aggregate) add(n.id);
+      }
+      const synthetic = all.filter(
+        (n) => n.kind === "route" || n.kind === "table" || n.kind === "topic" || n.kind === "host",
+      );
+      if (synthetic.length <= MAX_SYNTHETIC_LABELS) for (const n of synthetic) add(n.id);
+      for (const n of all) {
+        if (out.length >= MAX_LABELS) break;
+        if (n.entrypoint) add(n.id);
+      }
+    }
+    return out.slice(0, MAX_LABELS);
+  }
+
+  private updateLabels(): void {
+    const wanted = this.labelCandidates();
+    const keep = new Set<string>();
+    const w = this.labelLayer.clientWidth;
+    const h = this.labelLayer.clientHeight;
+    for (const n of wanted) {
+      if (n.x === undefined) continue;
+      if (
+        this.highlight &&
+        !this.highlight.nodes.has(n.id) &&
+        n.id !== this.selected &&
+        n.id !== this.hovered
+      )
+        continue;
+      const p = this.fg.graph2ScreenCoords(n.x, n.y ?? 0, n.z ?? 0);
+      if (p.z > 1 || p.x < -50 || p.y < -20 || p.x > w + 50 || p.y > h + 20) continue;
+      keep.add(n.id);
+      let el = this.labelEls.get(n.id);
+      if (!el) {
+        el = document.createElement("span");
+        el.className = `label kind-${n.kind}${n.aggregate ? " aggregate" : ""}`;
+        el.textContent = n.label;
+        this.labelLayer.appendChild(el);
+        this.labelEls.set(n.id, el);
+      }
+      el.classList.toggle("focus", n.id === this.selected || n.id === this.hovered);
+      el.style.transform = `translate(${p.x.toFixed(1)}px, ${(p.y - 14).toFixed(1)}px)`;
+    }
+    for (const [id, el] of this.labelEls) {
+      if (!keep.has(id)) {
+        el.remove();
+        this.labelEls.delete(id);
+      }
+    }
+  }
+
   drawCalls(): number {
     return this.fg.renderer().info.render.calls;
   }
@@ -316,6 +401,40 @@ export class Scene {
   setHighlight(h: Highlight | null): void {
     this.highlight = h;
     this.restyle();
+    if (h && h.nodes.size > 0) {
+      window.setTimeout(() => this.fit(), 300);
+    }
+  }
+
+  /** Frames the highlighted subgraph when there is one, otherwise everything. Extent is measured in the camera plane so depth outliers do not shrink the view. */
+  fit(ms = 700): void {
+    const h = this.highlight;
+    const nodes = Array.from(this.nodes.values()).filter(
+      (n) => n.x !== undefined && (!h || h.nodes.size === 0 || h.nodes.has(n.id)),
+    );
+    if (nodes.length === 0) return;
+    const c = new THREE.Vector3();
+    for (const n of nodes) c.add(new THREE.Vector3(n.x, n.y ?? 0, n.z ?? 0));
+    c.divideScalar(nodes.length);
+    const camera = this.fg.camera() as THREE.PerspectiveCamera;
+    const dir = new THREE.Vector3().copy(camera.position).sub(c);
+    if (dir.lengthSq() < 1) dir.set(0, 0.3, 1);
+    dir.normalize();
+    const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), dir).normalize();
+    if (right.lengthSq() < 0.01) right.set(1, 0, 0);
+    const up = new THREE.Vector3().crossVectors(dir, right).normalize();
+    const tanV = Math.tan((camera.fov * Math.PI) / 360);
+    const tanH = tanV * camera.aspect;
+    let dist = 30;
+    const d = new THREE.Vector3();
+    for (const n of nodes) {
+      d.set(n.x!, n.y ?? 0, n.z ?? 0).sub(c);
+      const along = d.dot(dir);
+      const need = Math.max(Math.abs(d.dot(right)) / tanH, Math.abs(d.dot(up)) / tanV) * 1.12;
+      dist = Math.max(dist, along + need + 10);
+    }
+    const pos = c.clone().add(dir.multiplyScalar(dist));
+    this.fg.cameraPosition({ x: pos.x, y: pos.y, z: pos.z }, { x: c.x, y: c.y, z: c.z }, ms);
   }
 
   setHeat(values: Map<string, number> | null): void {
@@ -333,7 +452,7 @@ export class Scene {
   focus(id: string, ms = 900): void {
     const n = this.nodes.get(id);
     if (!n || n.x === undefined) return;
-    const dist = 140;
+    const dist = Math.max(140, layoutRadius(Array.from(this.nodes.values())) * 1.2);
     const len = Math.hypot(n.x, n.y ?? 0, n.z ?? 0) || 1;
     const ratio = 1 + dist / len;
     this.fg.cameraPosition(
@@ -343,21 +462,42 @@ export class Scene {
     );
   }
 
-  zoomToFit(): void {
-    this.fg.zoomToFit(600, 40);
+  /** Glow sizes scale with the layout so flashes stay visible on large graphs. */
+  private glowScale(): number {
+    return Math.max(1, layoutRadius(Array.from(this.nodes.values())) / 160);
   }
 
-  flash(id: string, color = "#ffffff", size = 14, duration = 900): void {
+  zoomToFit(): void {
+    this.fit(600);
+  }
+
+  flash(id: string, color = "#ffffff", size = 14, duration = 1500): void {
     const node = this.nodes.get(id);
     if (!node) return;
-    this.addGlow({ node, from: null, to: null, color, size, duration, persistent: false });
+    this.addGlow({
+      node,
+      from: null,
+      to: null,
+      color,
+      size: size * this.glowScale(),
+      duration,
+      persistent: false,
+    });
   }
 
   travel(fromId: string, toId: string, color = "#ffe29a", duration = 700, size = 7): void {
     const from = this.nodes.get(fromId);
     const to = this.nodes.get(toId);
     if (!from || !to || from === to) return;
-    this.addGlow({ node: null, from, to, color, size, duration, persistent: false });
+    this.addGlow({
+      node: null,
+      from,
+      to,
+      color,
+      size: size * this.glowScale(),
+      duration,
+      persistent: false,
+    });
     const link = this.linkIds.get(`${fromId}|${toId}`) ?? this.linkIds.get(`${toId}|${fromId}`);
     if (link && !this.cheapLinks) this.fg.emitParticle(link);
   }
@@ -436,6 +576,7 @@ export class Scene {
     const now = performance.now();
     this.frames++;
     this.updateBatches();
+    this.updateLabels();
     if (now - this.lastFpsAt >= 1000) {
       this.currentFps = Math.round((this.frames * 1000) / (now - this.lastFpsAt));
       this.frames = 0;
@@ -457,9 +598,9 @@ export class Scene {
           g.sprite.scale.set(g.size * pulse, g.size * pulse, 1);
           g.sprite.material.opacity = 0.75;
         } else {
-          const s = g.size * (1 + t * 1.8);
+          const s = g.size * (1 + t * 0.8);
           g.sprite.scale.set(s, s, 1);
-          g.sprite.material.opacity = 1 - t;
+          g.sprite.material.opacity = (1 - t) ** 2;
         }
       } else if (g.from && g.to) {
         const e = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
@@ -579,11 +720,6 @@ export class Scene {
       ring.rotation.x = Math.PI / 2;
       const group = new THREE.Group();
       group.add(mesh, ring);
-      if (!this.denseNodes) {
-        const label = this.label(n.label, "#dfe6ff", 5);
-        label.position.y = 9;
-        group.add(label);
-      }
       return group;
     }
     if (this.cheapNodes || this.denseNodes) return undefined as unknown as THREE.Object3D;
@@ -615,9 +751,6 @@ export class Scene {
     }
     if (n.aggregate) {
       const r = Math.cbrt(this.val(n)) * 3;
-      const label = this.label(n.label, packageColor(n.pkgIndex, 80), n.kind === "package" ? 8 : 5);
-      label.position.y = r + 6;
-      group.add(label);
       if (n.kind === "package") {
         const ring = new THREE.Mesh(
           new THREE.RingGeometry(r + 2, r + 2.6, 48),
@@ -633,27 +766,6 @@ export class Scene {
       }
     }
     return group;
-  }
-
-  private label(text: string, color: string, size: number): THREE.Sprite {
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d")!;
-    const font = "600 48px Inter, system-ui, sans-serif";
-    ctx.font = font;
-    const w = Math.ceil(ctx.measureText(text).width) + 16;
-    canvas.width = Math.max(2, w);
-    canvas.height = 64;
-    ctx.font = font;
-    ctx.fillStyle = color;
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, 8, 32);
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.minFilter = THREE.LinearFilter;
-    const sprite = new THREE.Sprite(
-      new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }),
-    );
-    sprite.scale.set((size * canvas.width) / canvas.height, size, 1);
-    return sprite;
   }
 
   private clusterForce() {
@@ -681,6 +793,9 @@ export class Scene {
 type ForceNode = ViewNode & { vx?: number; vy?: number; vz?: number };
 
 const BATCH_LINKS_ABOVE = 1500;
+const MAX_LABELS = 120;
+const MAX_HIGHLIGHT_LABELS = 60;
+const MAX_SYNTHETIC_LABELS = 40;
 
 function packageCount(nodes: ViewNode[]): number {
   return Math.max(1, new Set(nodes.map((n) => n.pkg).filter(Boolean)).size);

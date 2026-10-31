@@ -2,7 +2,7 @@ import type { Store } from "../state";
 import type { Insight, TraceSummary } from "../types";
 import { clear, fmtMs, fmtNanos, fmtRate, h, shortId } from "./dom";
 
-const INSIGHT_LABELS: Record<Insight["kind"], string> = {
+const INSIGHT_LABELS: Partial<Record<string, string>> = {
   inefficient: "Inefficient code",
   hot_path: "Hot paths",
   waiting: "Waiting on I/O",
@@ -75,7 +75,9 @@ export class InsightsPanel {
       else groups.set(i.kind, [i]);
     }
     for (const [kind, items] of groups) {
-      this.body.append(h("h3", null, `${INSIGHT_LABELS[kind]} (${items.length})`));
+      this.body.append(
+        h("h3", null, `${INSIGHT_LABELS[kind] ?? kind.replace(/_/g, " ")} (${items.length})`),
+      );
       for (const i of items) {
         const name = this.store.index.node(i.node)?.name ?? shortId(i.node);
         this.body.append(
@@ -92,6 +94,31 @@ export class InsightsPanel {
 }
 
 function describe(i: Insight): string {
+  const known = describeKnown(i);
+  const extra = extraFields(
+    Object.fromEntries(Object.entries(i).filter(([k]) => !KNOWN_FIELDS.has(k))),
+  );
+  return extra ? `${known} · ${extra}` : known;
+}
+
+const KNOWN_FIELDS = new Set([
+  "kind",
+  "node",
+  "self_p95_nanos",
+  "complexity",
+  "reasons",
+  "rate_per_sec",
+  "p95_nanos",
+  "wait_ratio",
+  "on",
+  "children",
+  "saved_nanos",
+  "effect",
+  "line",
+  "observed_calls_per_parent",
+]);
+
+function describeKnown(i: Insight): string {
   switch (i.kind) {
     case "inefficient":
       return `self p95 ${fmtNanos(i.self_p95_nanos)} · ${i.complexity} · ${i.reasons.join(", ")}`;
@@ -105,7 +132,20 @@ function describe(i: Insight): string {
       return `${i.effect} at L${i.line}${i.observed_calls_per_parent ? ` · ${i.observed_calls_per_parent.toFixed(1)} calls/parent` : ""}`;
     case "never_observed":
       return "reachable statically, never seen at runtime";
+    default:
+      return extraFields(i);
   }
+}
+
+/** Unknown insight kinds and fields are shown as `key: value` so new backend findings stay visible. */
+function extraFields(i: object): string {
+  return Object.entries(i)
+    .filter(([k]) => k !== "kind" && k !== "node")
+    .map(
+      ([k, v]) =>
+        `${k}: ${typeof v === "number" ? (k.endsWith("_nanos") ? fmtNanos(v) : v.toFixed(2)) : Array.isArray(v) ? v.map((x) => (typeof x === "string" ? shortId(x) : String(x))).join(", ") : String(v)}`,
+    )
+    .join(" · ");
 }
 
 export class TracesPanel {
@@ -169,11 +209,11 @@ export class TracesPanel {
         h(
           "button",
           { class: `trace${errors ? " err" : ""}`, onclick: () => this.onPick(t) },
-          h("b", null, t.root.name),
+          h("b", null, t.root),
           h(
             "span",
             { class: "muted small" },
-            `${t.root.service} · ${fmtMs((t1 - t0) / 1e6)} · ${t.spans.length} spans${errors ? ` · ${errors} errors` : ""}`,
+            `${t.spans[0]?.service ?? ""} · ${fmtMs((t1 - t0) / 1e6)} · ${t.spans.length} spans${errors ? ` · ${errors} errors` : ""}`,
           ),
           h(
             "span",

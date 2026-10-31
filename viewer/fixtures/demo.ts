@@ -1182,7 +1182,15 @@ export function buildTrace(traceId: string, baseNanos: number, jitter = 1): Trac
     node: s.node,
     join: s.node ? "code_function" : null,
   }));
-  return { trace_id: traceId, root: spans[0]!, spans };
+  const root = spans[0]!;
+  return {
+    trace_id: traceId,
+    root: root.name,
+    root_node: root.node,
+    start_unix_nanos: root.start_unix_nanos,
+    duration_nanos: root.end_unix_nanos - root.start_unix_nanos,
+    spans,
+  };
 }
 
 export function demoStats(scale = 1): NodeStats[] {

@@ -1,7 +1,15 @@
 import type { Backend } from "./api";
 import type { Level } from "./graph/lod";
 import type { GraphIndex } from "./graph/query";
-import type { EffectKind, Graph, Impact, NodeStats, Subgraph, TraceSummary } from "./types";
+import type {
+  EffectKind,
+  Graph,
+  Impact,
+  NodeKind,
+  NodeStats,
+  Subgraph,
+  TraceSummary,
+} from "./types";
 import { EFFECT_KINDS } from "./types";
 
 export type Mode = "explore" | "flow" | "impact";
@@ -27,6 +35,7 @@ export class Store {
   expanded = new Set<string>();
   effectFilter = new Set<EffectKind>(EFFECT_KINDS);
   transitive = false;
+  hideKinds = new Set<NodeKind>(["dependency"]);
   maxLinks = 6000;
   selected: string | null = null;
   mode: Mode = "explore";

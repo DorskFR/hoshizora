@@ -39,6 +39,15 @@ export class Legend {
       id: "lg-transitive",
       onchange: () => this.setTransitive(transitive.checked),
     });
+    const deps = h("input", {
+      type: "checkbox",
+      id: "lg-deps",
+      onchange: () => {
+        if (deps.checked) this.store.hideKinds.delete("dependency");
+        else this.store.hideKinds.add("dependency");
+        this.store.emit("view", undefined);
+      },
+    });
     const colorBy = h(
       "select",
       { "aria-label": "Colour nodes by", onchange: () => onColorBy(colorBy.value as ColorBy) },
@@ -53,6 +62,7 @@ export class Legend {
         { class: "legend-row" },
         colorBy,
         h("label", { class: "check" }, transitive, " transitive effects"),
+        h("label", { class: "check" }, deps, " dependencies"),
       ),
       effects,
       h(

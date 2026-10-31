@@ -864,3 +864,95 @@ label.check {
 .drawer-open .legend {
   display: none;
 }
+
+.drawer-open .canvas {
+  bottom: 42vh;
+}
+
+.labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.labels .label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #dfe6ff;
+  background: rgba(5, 7, 15, 0.55);
+  white-space: nowrap;
+  transform-origin: 0 0;
+  text-shadow: 0 1px 2px #000;
+}
+
+.labels .label.focus {
+  color: #fff;
+  background: rgba(122, 162, 255, 0.35);
+  outline: 1px solid rgba(122, 162, 255, 0.6);
+}
+
+.labels .label.kind-route,
+.labels .label.kind-table,
+.labels .label.kind-topic,
+.labels .label.kind-host {
+  font-family: var(--mono);
+  font-weight: 500;
+}
+
+.labels .label.aggregate {
+  font-size: 13px;
+}
+
+.ticker {
+  position: absolute;
+  top: 56px;
+  left: 10px;
+  width: 320px;
+  margin: 0;
+  padding: 6px 10px;
+  list-style: none;
+  font-size: 11px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  z-index: 5;
+  display: none;
+}
+
+.ticker.on {
+  display: block;
+}
+
+.ticker:empty::after {
+  content: "waiting for spans…";
+  color: var(--muted);
+}
+
+.ticker .tick {
+  padding: 1px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: ticker-in 0.15s ease-out;
+}
+
+.ticker .tick.err {
+  color: var(--error);
+}
+
+@keyframes ticker-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

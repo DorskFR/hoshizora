@@ -280,7 +280,11 @@ export interface Insights {
 
 export interface TraceSummary {
   trace_id: string;
-  root: RuntimeSpan;
+  /** Name of the root span. */
+  root: string;
+  root_node: string | null;
+  start_unix_nanos: number;
+  duration_nanos: number;
   spans: RuntimeSpan[];
 }
 

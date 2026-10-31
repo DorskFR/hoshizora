@@ -253,7 +253,7 @@ export class Drawer {
     clear(this.extra);
     if (controls) this.extra.append(controls);
     const wf = waterfall(trace.spans);
-    this.title.textContent = `Trace ${trace.trace_id} · ${trace.root.name} · ${fmtMs(wf.totalMs)} · ${trace.spans.length} spans`;
+    this.title.textContent = `Trace ${trace.trace_id} · ${trace.root} · ${fmtMs(wf.totalMs)} · ${trace.spans.length} spans`;
     clear(this.body);
     const labelW = 240;
     const rowH = 22;

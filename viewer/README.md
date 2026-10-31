@@ -6,6 +6,7 @@ writes `dist/` with relative asset paths so the Rust binary can embed it.
 ```sh
 npm install
 npm run dev            # http://localhost:5173, proxies /api and /v1 to 127.0.0.1:7317
+HOSHIZORA_API=http://127.0.0.1:7399 npm run dev -- --port 5174   # proxy to another server
 npm run dev -- --open  # same, opens the browser
 npm run build          # -> dist/
 npm run check          # tsc --noEmit

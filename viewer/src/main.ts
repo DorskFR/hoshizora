@@ -6,8 +6,8 @@ import { GraphIndex } from "./graph/query";
 import { Scene } from "./graph/scene";
 import { SpanTracker, scheduleReplay } from "./runtime/tracker";
 import { type HeatMetric, Store } from "./state";
-import type { Insight, LiveEvent, NodeStats, TraceSummary } from "./types";
-import { h } from "./ui/dom";
+import type { Insight, LiveEvent, NodeStats, RuntimeSpan, TraceSummary } from "./types";
+import { fmtMs, h } from "./ui/dom";
 import { Drawer } from "./ui/drawer";
 import { Legend } from "./ui/legend";
 import { InsightsPanel, TracesPanel } from "./ui/lists";
@@ -61,6 +61,22 @@ async function main(): Promise<void> {
   let replayTimers: number[] = [];
   let flowTimers: number[] = [];
 
+  const ticker = h("ul", { class: "ticker", "aria-label": "Recent spans", "aria-live": "off" });
+  app.append(ticker);
+  function tick(span: RuntimeSpan): void {
+    const dur = (span.end_unix_nanos - span.start_unix_nanos) / 1e6;
+    const node = span.node ? (store.index.node(span.node)?.name ?? null) : null;
+    const li = h(
+      "li",
+      { class: span.error ? "tick err" : "tick" },
+      h("b", null, span.service),
+      ` · ${node ?? span.name}`,
+      h("span", { class: "muted" }, ` ${fmtMs(dur)}`),
+    );
+    ticker.prepend(li);
+    while (ticker.childElementCount > 10) ticker.lastElementChild?.remove();
+  }
+
   const drawer = new Drawer(store);
   const panel = new NodePanel(store, {
     flow: (id) => startFlow(id),
@@ -93,6 +109,7 @@ async function main(): Promise<void> {
       maxLinks: store.maxLinks,
       effectFilter: store.effectFilter,
       transitive: store.transitive,
+      hideKinds: store.hideKinds,
     });
     buildCache = { repOf: view.repOf };
     scene.setView(view);
@@ -235,15 +252,16 @@ async function main(): Promise<void> {
 
   function onLive(ev: LiveEvent): void {
     if (ev.type === "span") {
+      tick(ev.span);
       const hops = tracker.record(ev.span);
       if (ev.span.node) {
         const r = rep(ev.span.node);
-        if (r) scene.flash(r, ev.span.error ? "#f94144" : "#9ad0ff", 9, 700);
+        if (r) scene.flash(r, ev.span.error ? "#f94144" : "#7fd0ff", 16, 1500);
       }
       for (const hop of hops) {
         const a = rep(hop.from);
         const b = rep(hop.to);
-        if (a && b && a !== b) scene.travel(a, b, "#9ad0ff", 600, 5);
+        if (a && b && a !== b) scene.travel(a, b, "#7fd0ff", 900, 7);
       }
     } else {
       applyStats(ev.stats);
@@ -258,6 +276,7 @@ async function main(): Promise<void> {
 
   function setRuntime(on: boolean): void {
     store.runtimeOn = on;
+    ticker.classList.toggle("on", on);
     store.emit("runtime", undefined);
     if (on) {
       stopStream = backend.stream(onLive, (open) => toolbar.setLive(open));
