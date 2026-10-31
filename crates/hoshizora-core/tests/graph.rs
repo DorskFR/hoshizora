@@ -1871,3 +1871,41 @@ fn multi_candidate_edges_do_not_propagate_effects() {
         "flow keeps the dimmed edges"
     );
 }
+
+#[test]
+fn methods_called_through_stoplisted_names_stay_alive() {
+    let files = vec![
+        file(
+            "webui/src/spawnForm.ts",
+            Language::TypeScript,
+            "src/spawnForm",
+            vec![],
+            vec![
+                ty("SpawnForm", 1, &[]),
+                func("SpawnForm.submit", 2, 10, vec![call("dispatchToK8s", 3)]),
+                func("dispatchToK8s", 16, 20, vec![call("fetch", 17)]),
+                func("SpawnForm.neverCalled", 11, 15, vec![]),
+            ],
+        ),
+        file(
+            "webui/src/Modal.svelte",
+            Language::TypeScript,
+            "src/Modal.svelte",
+            vec![import("./spawnForm", &["SpawnForm"])],
+            vec![attrs(
+                func("launch", 1, 5, vec![recv(call("form.submit", 2), "form")]),
+                &["ui:click"],
+            )],
+        ),
+    ];
+    let idx = Index::new(build_graph(Path::new("/repo"), files, &Packs::builtin()));
+    let dead: Vec<&str> = idx.dead().iter().map(|n| n.id.as_str()).collect();
+    assert!(
+        !dead.contains(&"fn:webui/src/spawnForm.ts#SpawnForm.submit"),
+        "{dead:?}"
+    );
+    assert!(
+        dead.contains(&"fn:webui/src/spawnForm.ts#SpawnForm.neverCalled"),
+        "{dead:?}"
+    );
+}

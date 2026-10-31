@@ -15,7 +15,7 @@ use super::{Ctx, FileScope, ImportTarget, effects};
 /// Names matching more candidates than this are dropped rather than guessed.
 pub(crate) const MAX_CANDIDATES: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Family {
     Rust,
     Python,

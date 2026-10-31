@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use hoshizora_model::{Complexity, EdgeKind, EffectKind, EntrypointKind, Language, Visibility};
+use hoshizora_model::{
+    Complexity, EdgeKind, EffectKind, EntrypointKind, Language, SymbolKind, Visibility,
+};
 
 use super::Ctx;
 
@@ -575,12 +577,46 @@ pub(crate) fn dead(ctx: &mut Ctx) {
     for &s in &stack {
         reachable[s] = true;
     }
-    while let Some(i) = stack.pop() {
-        for &t in &next[i] {
-            if !reachable[t] {
-                reachable[t] = true;
-                stack.push(t);
+    let mut live_method_names: HashSet<(super::resolve::Family, &str)> = HashSet::new();
+    let mut scanned = vec![false; ctx.fns.len()];
+    loop {
+        while let Some(i) = stack.pop() {
+            for &t in &next[i] {
+                if !reachable[t] {
+                    reachable[t] = true;
+                    stack.push(t);
+                }
             }
+        }
+        // Methods called on receivers of unknown type are kept alive by name, and become roots.
+        for f in 0..ctx.fns.len() {
+            if scanned[f] || !reachable[ctx.fns[f].node] {
+                continue;
+            }
+            scanned[f] = true;
+            let family = super::resolve::family(ctx.files[ctx.fns[f].file].language);
+            for call in ctx.symbol(f).body.iter().flat_map(|b| &b.calls) {
+                if call.receiver.is_some() {
+                    live_method_names.insert((family, call.name.as_str()));
+                }
+            }
+        }
+        for f in 0..ctx.fns.len() {
+            let node = ctx.fns[f].node;
+            let sym = ctx.symbol(f);
+            if !reachable[node]
+                && sym.kind == SymbolKind::Method
+                && live_method_names.contains(&(
+                    super::resolve::family(ctx.files[ctx.fns[f].file].language),
+                    sym.name.as_str(),
+                ))
+            {
+                reachable[node] = true;
+                stack.push(node);
+            }
+        }
+        if stack.is_empty() {
+            break;
         }
     }
 
