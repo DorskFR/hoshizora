@@ -1,14 +1,7 @@
-import {
-  EDGE_COLORS,
-  EFFECT_COLORS,
-  EFFECT_ICONS,
-  IMPACT,
-  SYNTHETIC_COLORS,
-} from "../graph/colors";
-import { layoutFlow } from "../graph/flowLayout";
+import { IMPACT } from "../graph/colors";
 import { waterfall } from "../runtime/tracker";
 import type { Store } from "../state";
-import type { Impact, Subgraph, TraceSummary } from "../types";
+import type { Impact, TraceSummary } from "../types";
 import { clear, fmtMs, h, shortId } from "./dom";
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -62,132 +55,6 @@ export class Drawer {
   private open(): void {
     this.el.hidden = false;
     document.body.classList.add("drawer-open");
-  }
-
-  showFlow(flow: Subgraph): void {
-    this.open();
-    clear(this.extra);
-    const rootName = this.store.index.node(flow.root)?.name ?? shortId(flow.root);
-    this.title.textContent = `Flow from ${rootName} · ${flow.nodes.length} nodes${flow.truncated ? " · truncated" : ""}`;
-    clear(this.body);
-    const layout = layoutFlow(flow.steps);
-    if (!layout.boxes.length) {
-      this.body.append(h("p", { class: "muted pad" }, "Nothing reachable."));
-      return;
-    }
-    const colW = 150;
-    const rowH = 64;
-    const boxW = 124;
-    const boxH = 40;
-    const laneW = 110;
-    const width = laneW + layout.cols * colW + 20;
-    const height = layout.lanes.length * rowH + 12;
-    const root = svg("svg", {
-      width,
-      height,
-      class: "flow-svg",
-      role: "img",
-      "aria-label": "Flow swimlanes",
-    });
-    const defs = svg("defs", {});
-    defs.append(
-      svg(
-        "marker",
-        {
-          id: "arrow",
-          viewBox: "0 0 10 10",
-          refX: 9,
-          refY: 5,
-          markerWidth: 7,
-          markerHeight: 7,
-          orient: "auto-start-reverse",
-        },
-        svg("path", { d: "M0 0 L10 5 L0 10 z", fill: "#9aa5c4" }),
-      ),
-    );
-    root.append(defs);
-    layout.lanes.forEach((lane, r) => {
-      root.append(
-        svg("rect", {
-          x: 0,
-          y: r * rowH + 6,
-          width,
-          height: rowH - 2,
-          class: `lane ${r % 2 ? "alt" : ""}`,
-        }),
-      );
-      root.append(svg("text", { x: 10, y: r * rowH + rowH / 2 + 8, class: "lane-label" }, lane));
-    });
-    const center = (b: { col: number; row: number }) => ({
-      x: laneW + b.col * colW + boxW / 2,
-      y: b.row * rowH + 6 + rowH / 2,
-    });
-    for (const a of layout.arrows) {
-      const from = center(layout.boxes[a.from]!);
-      const to = center(layout.boxes[a.to]!);
-      const x1 = from.x + boxW / 2;
-      const x2 = to.x - boxW / 2;
-      const mx = (x1 + x2) / 2;
-      const d = `M${x1} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${x2} ${to.y}`;
-      root.append(
-        svg("path", {
-          d,
-          class: "flow-arrow",
-          stroke: EDGE_COLORS[a.kind],
-          "marker-end": "url(#arrow)",
-        }),
-      );
-      root.append(
-        svg(
-          "text",
-          {
-            x: mx,
-            y: (from.y + to.y) / 2 - 6,
-            class: "arrow-label",
-            fill: EDGE_COLORS[a.kind],
-            "text-anchor": "middle",
-          },
-          a.kind,
-        ),
-      );
-    }
-    for (const b of layout.boxes) {
-      const n = this.store.index.node(b.node);
-      const c = center(b);
-      const color = n
-        ? (SYNTHETIC_COLORS[n.kind] ??
-          (n.effects.direct[0] ? EFFECT_COLORS[n.effects.direct[0].kind] : "#5b6b95"))
-        : "#5b6b95";
-      const g = svg("g", {
-        class: `flow-box${this.store.selected === b.node ? " selected" : ""}`,
-        transform: `translate(${c.x - boxW / 2}, ${c.y - boxH / 2})`,
-        tabindex: 0,
-        role: "button",
-      });
-      g.append(svg("rect", { width: boxW, height: boxH, rx: 6, stroke: color }));
-      g.append(
-        svg("text", { x: 8, y: 17, class: "box-name" }, truncate(n?.name ?? shortId(b.node), 16)),
-      );
-      const icons = n
-        ? Array.from(new Set(n.effects.direct.map((e) => e.kind)))
-            .map((k) => EFFECT_ICONS[k])
-            .join(" ")
-        : "";
-      g.append(
-        svg(
-          "text",
-          { x: 8, y: 32, class: "box-sub", fill: color },
-          `${n?.kind ?? ""}${icons ? `  ${icons}` : ""}${n?.dead ? "  dead" : ""}`,
-        ),
-      );
-      g.append(svg("title", {}, n?.qualified_name ?? b.node));
-      g.addEventListener("click", () => this.store.select(b.node));
-      g.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") this.store.select(b.node);
-      });
-      root.append(g);
-    }
-    this.body.append(h("div", { class: "scroll-x" }, root));
   }
 
   showImpact(impact: Impact): void {

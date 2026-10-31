@@ -1,5 +1,6 @@
 import type { Confidence, EdgeKind, EffectKind, EntrypointKind, NodeKind } from "../types";
 import { SYNTHETIC_KINDS } from "../types";
+import { isTestNode } from "./filters";
 import type { GraphIndex } from "./query";
 
 export type Level = "packages" | "files" | "functions";
@@ -40,6 +41,9 @@ export interface LodOptions {
   effectFilter: ReadonlySet<EffectKind>;
   transitive: boolean;
   hideKinds?: ReadonlySet<NodeKind>;
+  hideTests?: boolean;
+  /** Draw a route as part of whatever stands for its handler (or caller) while that is collapsed. */
+  foldRoutes?: boolean;
 }
 
 export interface View {
@@ -69,9 +73,16 @@ export function representative(
   id: string,
   level: Level,
   expanded: ReadonlySet<string>,
+  foldRoutes = false,
 ): string | null {
   const n = index.node(id);
   if (!n) return null;
+  if (foldRoutes && n.kind === "route") {
+    const owner = routeOwner(index, id);
+    if (!owner) return level === "functions" ? id : null;
+    const r = representative(index, owner, level, expanded);
+    return r && r !== owner ? r : id;
+  }
   if (SYNTHETIC_KINDS.has(n.kind)) return id;
   const pkg = n.kind === "package" ? n.id : index.packageOf(id);
   const pkgOpen = level !== "packages" || (pkg !== null && expanded.has(pkg));
@@ -89,7 +100,13 @@ export function buildView(index: GraphIndex, opts: LodOptions): View {
   const groups = new Map<string, string[]>();
   for (const n of index.graph.nodes) {
     if (opts.hideKinds?.has(n.kind)) continue;
-    const rep = representative(index, n.id, opts.level, opts.expanded);
+    if (
+      opts.hideTests &&
+      (n.kind === "function" || n.kind === "type" || n.kind === "file") &&
+      isTestNode(n)
+    )
+      continue;
+    const rep = representative(index, n.id, opts.level, opts.expanded, opts.foldRoutes);
     if (!rep) continue;
     repOf.set(n.id, rep);
     const g = groups.get(rep);
@@ -182,6 +199,13 @@ export function buildView(index: GraphIndex, opts: LodOptions): View {
   const all = Array.from(merged.values()).sort((x, y) => linkScore(y) - linkScore(x));
   const links = all.slice(0, opts.maxLinks);
   return { nodes, links, repOf, dropped: all.length - links.length };
+}
+
+/** The handler of a route, or the first caller when no handler resolved. */
+export function routeOwner(index: GraphIndex, route: string): string | null {
+  const handler = index.out.get(route)?.find((e) => e.kind === "handles");
+  if (handler) return handler.to;
+  return index.in.get(route)?.find((e) => e.kind === "requests")?.from ?? null;
 }
 
 function rankConfidence(c: Confidence): number {

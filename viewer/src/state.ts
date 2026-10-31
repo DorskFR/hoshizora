@@ -36,6 +36,8 @@ export class Store {
   effectFilter = new Set<EffectKind>(EFFECT_KINDS);
   transitive = false;
   hideKinds = new Set<NodeKind>(["dependency"]);
+  hideTests = true;
+  foldRoutes = true;
   maxLinks = 6000;
   selected: string | null = null;
   mode: Mode = "explore";
@@ -47,7 +49,10 @@ export class Store {
   traces: TraceSummary[] = [];
   private handlers = new Map<keyof Events, Set<Handler<unknown>>>();
 
-  constructor(readonly backend: Backend) {}
+  constructor(
+    readonly backend: Backend,
+    readonly projectName: string | null = null,
+  ) {}
 
   on<K extends keyof Events>(event: K, fn: Handler<Events[K]>): () => void {
     let set = this.handlers.get(event);

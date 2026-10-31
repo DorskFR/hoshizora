@@ -1,30 +1,140 @@
 import "./styles.css";
-import { createBackend, isMockMode } from "./api";
+import { type Backend, createProjects, type ProjectsApi } from "./api";
 import { FLOW, IMPACT } from "./graph/colors";
 import { buildView, containersToExpand } from "./graph/lod";
 import { GraphIndex } from "./graph/query";
 import { Scene } from "./graph/scene";
+import { formatRoute, parseRoute, type Route } from "./router";
 import { SpanTracker, scheduleReplay } from "./runtime/tracker";
 import { type HeatMetric, Store } from "./state";
-import type { Insight, LiveEvent, NodeStats, RuntimeSpan, TraceSummary } from "./types";
-import { fmtMs, h } from "./ui/dom";
+import { storyFromFlow } from "./story/build";
+import type {
+  Edge,
+  Insight,
+  LiveEvent,
+  NodeStats,
+  Project,
+  RuntimeSpan,
+  Story,
+  TraceSummary,
+} from "./types";
+import { fmtMs, h, shortId } from "./ui/dom";
 import { Drawer } from "./ui/drawer";
+import { EntrypointPicker } from "./ui/entrypoints";
+import { ProjectHome } from "./ui/home";
 import { Legend } from "./ui/legend";
 import { InsightsPanel, TracesPanel } from "./ui/lists";
 import { NodePanel } from "./ui/panel";
+import { panelResizer } from "./ui/resize";
+import { StoryView } from "./ui/story";
 import { Toolbar } from "./ui/toolbar";
 
-async function main(): Promise<void> {
+interface Mounted {
+  applyRoute(r: Route): void;
+}
+
+function splashEl(...lines: (Node | string)[]): HTMLElement {
+  return h("div", { class: "splash" }, h("span", { class: "kanji" }, "星空"), ...lines);
+}
+
+async function boot(): Promise<void> {
   const app = document.getElementById("app")!;
-  const backend = await createBackend();
-  const store = new Store(backend);
+  const projects = await createProjects();
+  let list: Project[] | null = null;
+  try {
+    list = await projects.list();
+  } catch (err) {
+    console.warn("project list unavailable", err);
+  }
+  const multi = list !== null;
+  const normalise = (r: Route): Route =>
+    !multi && r.view === "home" ? { ...r, project: null, view: "map" } : r;
+  const isHome = (r: Route) => multi && r.project === null && r.view === "home";
+
+  const initial = normalise(parseRoute(location.hash));
+  const shown = { home: isHome(initial), project: initial.project };
+  let mounted: Mounted | null = null;
+  window.addEventListener("hashchange", () => {
+    const r = normalise(parseRoute(location.hash));
+    if (isHome(r) !== shown.home || (!shown.home && r.project !== shown.project)) {
+      location.reload();
+      return;
+    }
+    mounted?.applyRoute(r);
+  });
+
+  const open = async (route: Route) => {
+    let project: Project | null = null;
+    if (route.project !== null) {
+      project = await waitUntilReady(app, projects, route.project);
+      if (!project) return;
+    }
+    mounted = await mountProject(app, projects.backend(route.project), { project, multi, route });
+  };
+
+  if (!shown.home) {
+    await open(initial);
+    return;
+  }
+  const view = new ProjectHome(projects, (id) => {
+    const route: Route = { project: id, view: "map", node: null };
+    view.stop();
+    view.el.remove();
+    shown.home = false;
+    shown.project = id;
+    location.hash = formatRoute(route);
+    void open(route);
+  });
+  app.append(view.el);
+  await view.start();
+}
+
+async function waitUntilReady(
+  app: HTMLElement,
+  projects: ProjectsApi,
+  id: string,
+): Promise<Project | null> {
+  const status = h("span", null, "loading project…");
+  const splash = splashEl(status);
+  app.append(splash);
+  for (;;) {
+    let p: Project;
+    try {
+      p = await projects.get(id);
+    } catch (err) {
+      splash.replaceChildren(
+        h("span", { class: "kanji" }, "星空"),
+        h("span", { class: "error" }, `Unknown project ${id}: ${(err as Error).message}`),
+        h("a", { href: "#/", class: "button" }, "All projects"),
+      );
+      return null;
+    }
+    if (p.status === "ready") {
+      splash.remove();
+      return p;
+    }
+    if (p.status === "failed") {
+      splash.replaceChildren(
+        h("span", { class: "kanji" }, "星空"),
+        h("span", { class: "error" }, `${p.name} failed to index: ${p.error ?? "unknown error"}`),
+        h("a", { href: "#/", class: "button" }, "All projects"),
+      );
+      return null;
+    }
+    status.textContent = `${p.name}: ${p.status}…`;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
+async function mountProject(
+  app: HTMLElement,
+  backend: Backend,
+  ctx: { project: Project | null; multi: boolean; route: Route },
+): Promise<Mounted> {
+  const store = new Store(backend, ctx.project?.name ?? null);
+  const projectId = ctx.route.project;
   const canvasHost = h("div", { class: "canvas" });
-  const splash = h(
-    "div",
-    { class: "splash" },
-    h("span", { class: "kanji" }, "星空"),
-    h("span", null, "loading graph…"),
-  );
+  const splash = splashEl(h("span", null, "loading graph…"));
   app.append(canvasHost, splash);
 
   try {
@@ -32,10 +142,10 @@ async function main(): Promise<void> {
   } catch (err) {
     splash.replaceChildren(
       h("span", { class: "kanji" }, "星空"),
-      h("span", { class: "error" }, `Cannot load /api/graph: ${(err as Error).message}`),
+      h("span", { class: "error" }, `Cannot load the graph: ${(err as Error).message}`),
       h("span", { class: "muted" }, "Run `hoshizora serve`, or open with ?mock for fixtures."),
     );
-    return;
+    return { applyRoute: () => undefined };
   }
   store.index = new GraphIndex(store.graph);
   splash.remove();
@@ -59,7 +169,6 @@ async function main(): Promise<void> {
   const tracker = new SpanTracker();
   let stopStream: (() => void) | null = null;
   let replayTimers: number[] = [];
-  let flowTimers: number[] = [];
 
   const ticker = h("ul", { class: "ticker", "aria-label": "Recent spans", "aria-live": "off" });
   app.append(ticker);
@@ -77,10 +186,21 @@ async function main(): Promise<void> {
     while (ticker.childElementCount > 10) ticker.lastElementChild?.remove();
   }
 
+  const go = (r: Omit<Route, "project">) => {
+    location.hash = formatRoute({ ...r, project: projectId });
+  };
+  const openStory = (id: string) => go({ view: "story", node: id });
   const drawer = new Drawer(store);
+  const picker = new EntrypointPicker(store.index, openStory, (id) => store.select(id));
   const panel = new NodePanel(store, {
-    flow: (id) => startFlow(id),
+    story: openStory,
     impact: (id) => startImpact(id),
+    browseFlows: () => picker.open(),
+  });
+  const story = new StoryView(store.index, {
+    select: (id) => store.select(id),
+    close: () => go({ view: "map", node: store.selected }),
+    showOnMap: (s) => showStoryOnMap(s),
   });
   const insights = new InsightsPanel(store, (i) => pickInsight(i));
   const traces = new TracesPanel(store, (t) => replayTrace(t));
@@ -90,12 +210,21 @@ async function main(): Promise<void> {
     heat: (metric) => setHeat(metric),
     togglePanel: (name) => (name === "insights" ? insights.toggle() : traces.toggle()),
     zoomToFit: () => scene.zoomToFit(),
+    story: openStory,
+    browseFlows: () => picker.open(),
+    home: ctx.multi
+      ? () => {
+          location.hash = "#/";
+        }
+      : null,
   });
   app.append(
     toolbar.el,
-    h("div", { class: "right" }, panel.el, insights.el, traces.el),
+    story.el,
+    h("div", { class: "right" }, panelResizer(app), panel.el, insights.el, traces.el),
     legend.el,
     drawer.el,
+    picker.el,
   );
 
   let buildCache = { repOf: new Map<string, string>() };
@@ -110,6 +239,8 @@ async function main(): Promise<void> {
       effectFilter: store.effectFilter,
       transitive: store.transitive,
       hideKinds: store.hideKinds,
+      hideTests: store.hideTests,
+      foldRoutes: store.foldRoutes,
     });
     buildCache = { repOf: view.repOf };
     scene.setView(view);
@@ -169,60 +300,67 @@ async function main(): Promise<void> {
     if (changed) store.emit("view", undefined);
   }
 
-  async function startFlow(id: string): Promise<void> {
-    stopFlowAnimation();
+  let storyToken = 0;
+  async function loadStory(id: string): Promise<void> {
+    const token = ++storyToken;
+    const name = store.index.node(id)?.name ?? shortId(id);
+    document.body.classList.add("story-open");
+    scene.pause(true);
+    story.showLoading(name);
+    let result: Story | null = null;
+    let approximate = false;
     try {
-      store.flow = await backend.flow(id);
+      result = await backend.story(id);
+      if (!result || result.steps.length === 0) {
+        approximate = true;
+        result = storyFromFlow(store.index, await backend.flow(id, 12));
+      }
     } catch (err) {
-      store.status(`flow failed: ${(err as Error).message}`);
+      if (token === storyToken)
+        story.showError(name, `Could not build the story: ${(err as Error).message}`);
       return;
     }
-    store.mode = "flow";
-    store.impact = null;
-    store.emit("mode", "flow");
-    revealAll(store.flow.nodes);
-    applyHighlight();
-    drawer.showFlow(store.flow);
-    animateFlow();
+    if (token !== storyToken) return;
+    story.show(result, { approximate });
+    story.setSelected(id);
+    if (store.selected !== id) store.select(id);
   }
 
-  function animateFlow(): void {
-    const flow = store.flow;
-    if (!flow) return;
-    const lastAtDepth: string[] = [];
-    let i = 0;
-    for (const step of flow.steps) {
-      const parent = step.depth > 0 ? lastAtDepth[step.depth - 1] : undefined;
-      lastAtDepth[step.depth] = step.node;
-      lastAtDepth.length = step.depth + 1;
-      const from = parent ? rep(parent) : null;
-      const to = rep(step.node);
-      const delay = i * 420;
-      flowTimers.push(
-        window.setTimeout(() => {
-          if (to) scene.flash(to, FLOW, 12, 800);
-          if (from && to && from !== to) scene.travel(from, to, FLOW, 400);
-        }, delay),
-      );
-      i++;
+  function closeStory(): void {
+    storyToken++;
+    if (!story.open) return;
+    story.hide();
+    document.body.classList.remove("story-open");
+    scene.pause(false);
+  }
+
+  function showStoryOnMap(s: Story): void {
+    const nodes = new Set<string>();
+    for (const step of s.steps) {
+      nodes.add(step.node);
+      for (const f of step.folded) nodes.add(f);
     }
-    flowTimers.push(
-      window.setTimeout(
-        () => {
-          if (store.mode === "flow") animateFlow();
-        },
-        i * 420 + 1500,
-      ),
-    );
-  }
-
-  function stopFlowAnimation(): void {
-    for (const t of flowTimers) clearTimeout(t);
-    flowTimers = [];
+    const edges: Edge[] = s.links.map((l) => ({
+      from: l.from,
+      to: l.to,
+      kind: l.kind,
+      confidence: l.confidence,
+      line: null,
+      loop_depth: 0,
+      conditional: false,
+      awaited: !l.detached,
+      attrs: {},
+    }));
+    store.flow = { root: s.root, nodes: [...nodes], edges, steps: [], truncated: s.truncated };
+    store.impact = null;
+    store.mode = "flow";
+    go({ view: "map", node: s.root });
+    store.emit("mode", "flow");
+    revealAll(nodes);
+    applyHighlight();
   }
 
   async function startImpact(id: string): Promise<void> {
-    stopFlowAnimation();
     try {
       store.impact = await backend.impact(id);
     } catch (err) {
@@ -373,15 +511,19 @@ async function main(): Promise<void> {
 
   store.on("view", rebuildView);
   store.on("selection", (id) => {
+    if (story.open) {
+      story.setSelected(id);
+      return;
+    }
     const r = id ? rep(id) : null;
     scene.setSelected(r);
     if (r) scene.focus(r);
-    if (store.mode === "flow" && store.flow) drawer.showFlow(store.flow);
-    else if (store.mode === "impact" && store.impact) drawer.showImpact(store.impact);
+    if (store.mode === "impact" && store.impact) drawer.showImpact(store.impact);
+    const want = formatRoute({ project: projectId, view: "map", node: id });
+    if (location.hash !== want) history.replaceState(null, "", want);
   });
   store.on("mode", (mode) => {
     if (mode === "explore") {
-      stopFlowAnimation();
       drawer.hide();
       applyHighlight();
     }
@@ -391,35 +533,60 @@ async function main(): Promise<void> {
     const target = ev.target as HTMLElement;
     const typing =
       target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT";
-    if (ev.key === "/" && !typing) {
-      ev.preventDefault();
-      toolbar.search.focus();
-    } else if (ev.key === "Escape") {
+    if (ev.key === "Escape") {
       if (typing) target.blur();
+      else if (picker.isOpen) picker.close();
+      else if (story.open) go({ view: "map", node: store.selected });
       else if (store.mode !== "explore") store.setMode("explore");
       else store.select(null);
-    } else if (ev.key === "f" && !typing && store.selected) {
-      startFlow(store.selected);
-    } else if (ev.key === "i" && !typing && store.selected) {
+      return;
+    }
+    if (typing || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    if (ev.key === "/") {
+      ev.preventDefault();
+      toolbar.search.focus();
+    } else if (ev.key === "e") {
+      ev.preventDefault();
+      picker.open();
+    } else if (ev.key === "s" && store.selected) {
+      ev.preventDefault();
+      openStory(store.selected);
+    } else if (ev.key === "i" && store.selected && !story.open) {
       startImpact(store.selected);
+    } else if (story.open && (ev.key === "+" || ev.key === "=")) {
+      story.zoomBy(1.25);
+    } else if (story.open && ev.key === "-") {
+      story.zoomBy(0.8);
+    } else if (story.open && ev.key === "0") {
+      story.fit("all");
     }
   });
 
+  function applyRoute(r: Route): void {
+    if (r.view === "story" && r.node) {
+      if (!story.open || story.root !== r.node) void loadStory(r.node);
+      return;
+    }
+    closeStory();
+    if (r.node && r.node !== store.selected) store.select(r.node);
+  }
+
   setInterval(() => toolbar.setFps(scene.fps()), 1000);
   rebuildView();
-  if (isMockMode() && !params.has("synthetic")) setRuntime(true);
   if (params.get("live") === "1") setRuntime(true);
   if (params.has("select")) store.select(params.get("select"));
-  if (params.has("flow")) startFlow(params.get("flow")!);
+  if (params.has("flow")) openStory(params.get("flow")!);
   if (params.has("impact")) startImpact(params.get("impact")!);
+  applyRoute(ctx.route);
   (window as unknown as { hoshizora: unknown }).hoshizora = {
     store,
     scene,
     fps: () => scene.fps(),
     drawCalls: () => scene.drawCalls(),
   };
+  return { applyRoute };
 }
 
-main().catch((err) => {
+boot().catch((err) => {
   document.getElementById("app")!.append(h("div", { class: "error pad" }, String(err)));
 });

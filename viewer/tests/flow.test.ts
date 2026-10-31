@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { demoGraph, demoIds } from "../fixtures/demo";
-import { layoutFlow } from "../src/graph/flowLayout";
 import { flowFrom, GraphIndex, impactOf } from "../src/graph/query";
 
 const index = new GraphIndex(demoGraph);
@@ -35,28 +34,5 @@ describe("impactOf", () => {
     expect(ui.path[0]).toBe(demoIds.onSubmit);
     expect(ui.path.at(-1)).toBe(demoIds.check_inventory);
     expect(ui.path).toContain("route:POST /reserve");
-  });
-});
-
-describe("layoutFlow", () => {
-  it("assigns lanes in first-appearance order and arrows to the DFS parent", () => {
-    const flow = flowFrom(index, demoIds.onSubmit);
-    const layout = layoutFlow(flow.steps);
-    expect(layout.lanes[0]).toBe("webui");
-    expect(layout.lanes).toContain("network");
-    expect(layout.lanes).toContain("database");
-    expect(layout.cols).toBe(flow.steps.length);
-    const reserveBox = layout.boxes.find((b) => b.node === demoIds.reserve)!;
-    const arrow = layout.arrows.find((a) => a.to === reserveBox.index)!;
-    expect(layout.boxes[arrow.from]!.node).toBe("route:POST /reserve");
-    expect(arrow.kind).toBe("handles");
-    // the second sibling of create_order links back to create_order, not to the previous leaf
-    const insertBox = layout.boxes.find((b) => b.node === demoIds.insert_order)!;
-    const insertArrow = layout.arrows.find((a) => a.to === insertBox.index)!;
-    expect(layout.boxes[insertArrow.from]!.node).toBe(demoIds.create_order);
-  });
-
-  it("handles an empty flow", () => {
-    expect(layoutFlow([])).toEqual({ lanes: [], boxes: [], arrows: [], cols: 0 });
   });
 });

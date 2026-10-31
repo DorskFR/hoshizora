@@ -1,6 +1,7 @@
+import { isTestNode } from "../graph/filters";
 import type { Level } from "../graph/lod";
 import type { HeatMetric, Store } from "../state";
-import type { EntrypointKind, GraphNode, SearchHit } from "../types";
+import type { SearchHit } from "../types";
 import { clear, h } from "./dom";
 
 export interface ToolbarActions {
@@ -8,23 +9,18 @@ export interface ToolbarActions {
   heat(metric: HeatMetric): void;
   togglePanel(name: "insights" | "traces"): void;
   zoomToFit(): void;
+  story(id: string): void;
+  browseFlows(): void;
+  home: (() => void) | null;
 }
 
-const ENTRY_GROUPS: { kind: EntrypointKind; label: string }[] = [
-  { kind: "ui_handler", label: "UI handlers" },
-  { kind: "http_handler", label: "HTTP handlers" },
-  { kind: "main", label: "main" },
-  { kind: "cli", label: "CLI" },
-  { kind: "job", label: "Jobs" },
-  { kind: "test", label: "Tests" },
-  { kind: "export", label: "Exports" },
-];
+const STORY_KINDS = new Set(["function", "route", "type"]);
+const SHOWN_HITS = 14;
 
 export class Toolbar {
   readonly el: HTMLElement;
   readonly search: HTMLInputElement;
   private readonly results: HTMLElement;
-  private readonly entryMenu: HTMLElement;
   private readonly fpsEl: HTMLElement;
   private readonly statusEl: HTMLElement;
   private readonly modeEl: HTMLElement;
@@ -33,6 +29,8 @@ export class Toolbar {
   private debounce = 0;
   private active = -1;
   private hits: SearchHit[] = [];
+  private hiddenTests = 0;
+  private showTests = false;
 
   constructor(
     private readonly store: Store,
@@ -40,18 +38,21 @@ export class Toolbar {
   ) {
     this.search = h("input", {
       type: "search",
-      placeholder: "Search symbols, files, routes, tables…  ( / )",
+      placeholder: "Search functions, routes, tables…  ( / )",
       "aria-label": "Search nodes",
       autocomplete: "off",
       oninput: () => this.onInput(),
       onkeydown: (ev) => this.onKey(ev),
     });
     this.results = h("ul", { class: "results", role: "listbox", hidden: true });
-    this.entryMenu = h("div", { class: "menu", hidden: true, role: "menu" });
-    const entryBtn = h(
+    const flowsBtn = h(
       "button",
-      { class: "ghost", "aria-label": "Entrypoints", onclick: () => this.toggleEntrypoints() },
-      "⚑ Entrypoints",
+      {
+        class: "primary",
+        title: "Every UI action, HTTP route, command and job: pick one to see its story (e)",
+        onclick: () => this.actions.browseFlows(),
+      },
+      "▶ Flows",
     );
 
     const levelSel = h(
@@ -99,13 +100,18 @@ export class Toolbar {
       "header",
       { class: "toolbar" },
       h(
-        "div",
-        { class: "brand" },
+        actions.home ? "button" : "div",
+        {
+          class: "brand",
+          title: actions.home ? "All projects" : "",
+          onclick: () => actions.home?.(),
+        },
         h("span", { class: "kanji" }, "星空"),
         h("span", null, "hoshizora"),
       ),
+      store.projectName && h("span", { class: "project-name" }, store.projectName),
+      flowsBtn,
       h("div", { class: "search-wrap" }, this.search, this.results),
-      h("div", { class: "entry-wrap" }, entryBtn, this.entryMenu),
       levelSel,
       this.modeEl,
       h("span", { class: "spacer" }),
@@ -140,10 +146,7 @@ export class Toolbar {
     });
     this.renderMode();
     document.addEventListener("click", (ev) => {
-      if (!this.el.contains(ev.target as Node)) {
-        this.results.hidden = true;
-        this.entryMenu.hidden = true;
-      }
+      if (!this.el.contains(ev.target as Node)) this.results.hidden = true;
     });
   }
 
@@ -162,7 +165,7 @@ export class Toolbar {
       h(
         "span",
         { class: `chip mode-${this.store.mode}` },
-        this.store.mode === "flow" ? "Flow" : "Impact",
+        this.store.mode === "flow" ? "Story on map" : "Impact",
       ),
       h(
         "button",
@@ -183,21 +186,39 @@ export class Toolbar {
       this.results.hidden = true;
       return;
     }
-    this.debounce = window.setTimeout(async () => {
-      try {
-        this.hits = await this.store.backend.search(q, 15);
-      } catch {
-        this.hits = [];
-      }
-      this.active = -1;
-      this.renderResults();
-    }, 120);
+    this.debounce = window.setTimeout(() => this.runSearch(q), 120);
+  }
+
+  private async runSearch(q: string): Promise<void> {
+    let all: SearchHit[] = [];
+    try {
+      all = await this.store.backend.search(q, 80);
+    } catch {
+      all = [];
+    }
+    if (this.search.value.trim() !== q) return;
+    const isTest = (hit: SearchHit) => {
+      const n = this.store.index.node(hit.node);
+      return n ? isTestNode(n) : false;
+    };
+    const kept = this.showTests ? all : all.filter((hit) => !isTest(hit));
+    this.hiddenTests = all.length - kept.length;
+    this.hits = kept.slice(0, SHOWN_HITS);
+    this.active = -1;
+    this.renderResults();
   }
 
   private renderResults(): void {
     clear(this.results);
-    this.results.hidden = this.hits.length === 0;
+    this.results.hidden = false;
+    if (!this.hits.length)
+      this.results.append(h("li", { class: "muted pad" }, "No matches outside tests."));
     this.hits.forEach((hit, i) => {
+      const n = this.store.index.node(hit.node);
+      const where = n?.file
+        ? `${n.file}${n.span ? `:${n.span.start_line}` : ""}`
+        : hit.qualified_name;
+      const canStory = STORY_KINDS.has(hit.kind);
       this.results.append(
         h(
           "li",
@@ -206,12 +227,60 @@ export class Toolbar {
             class: i === this.active ? "active" : "",
             onclick: () => this.pick(hit.node),
           },
-          h("span", { class: `kind kind-${hit.kind}` }, hit.kind),
-          h("span", null, hit.name),
-          h("span", { class: "muted mono small" }, hit.qualified_name),
+          h(
+            "span",
+            { class: `kind kind-${hit.kind}` },
+            n?.entrypoint === "test" ? "test" : hit.kind,
+          ),
+          h(
+            "span",
+            { class: "hit-main" },
+            h("b", null, hit.name),
+            n?.entrypoint && n.entrypoint !== "test"
+              ? h("span", { class: "chip entry small" }, n.entrypoint.replace("_", " "))
+              : null,
+            h("span", { class: "muted mono small hit-file" }, where),
+          ),
+          canStory &&
+            h(
+              "button",
+              {
+                class: "ghost small story-btn",
+                title: "Open the story from here",
+                onclick: (ev) => {
+                  ev.stopPropagation();
+                  this.results.hidden = true;
+                  this.search.value = "";
+                  this.actions.story(hit.node);
+                },
+              },
+              "▶ Story",
+            ),
         ),
       );
     });
+    if (this.hiddenTests || this.showTests) {
+      const toggle = h("input", {
+        type: "checkbox",
+        checked: this.showTests,
+        onchange: () => {
+          this.showTests = toggle.checked;
+          void this.runSearch(this.search.value.trim());
+        },
+      });
+      this.results.append(
+        h(
+          "li",
+          { class: "results-foot muted small" },
+          h(
+            "label",
+            { class: "check" },
+            toggle,
+            this.showTests ? " include tests" : ` include tests (${this.hiddenTests} hidden)`,
+          ),
+        ),
+      );
+    }
   }
 
   private onKey(ev: KeyboardEvent): void {
@@ -223,7 +292,12 @@ export class Toolbar {
       this.renderResults();
     } else if (ev.key === "Enter") {
       const hit = this.hits[this.active] ?? this.hits[0];
-      if (hit) this.pick(hit.node);
+      if (!hit) return;
+      if (ev.shiftKey && STORY_KINDS.has(hit.kind)) {
+        this.results.hidden = true;
+        this.search.value = "";
+        this.actions.story(hit.node);
+      } else this.pick(hit.node);
     } else if (ev.key === "Escape") {
       this.results.hidden = true;
       this.search.blur();
@@ -232,44 +306,7 @@ export class Toolbar {
 
   private pick(id: string): void {
     this.results.hidden = true;
-    this.entryMenu.hidden = true;
     this.search.value = "";
     this.store.select(id);
-  }
-
-  private async toggleEntrypoints(): Promise<void> {
-    if (!this.entryMenu.hidden) {
-      this.entryMenu.hidden = true;
-      return;
-    }
-    clear(this.entryMenu);
-    this.entryMenu.hidden = false;
-    this.entryMenu.append(h("div", { class: "muted pad" }, "Loading…"));
-    let entries: GraphNode[] = [];
-    try {
-      entries = await this.store.backend.entrypoints();
-    } catch (err) {
-      clear(this.entryMenu);
-      this.entryMenu.append(h("div", { class: "error pad" }, (err as Error).message));
-      return;
-    }
-    clear(this.entryMenu);
-    for (const group of ENTRY_GROUPS) {
-      const items = entries.filter((e) => e.entrypoint === group.kind);
-      if (!items.length) continue;
-      this.entryMenu.append(h("div", { class: "menu-group" }, `${group.label} (${items.length})`));
-      for (const n of items.slice(0, 50)) {
-        this.entryMenu.append(
-          h(
-            "button",
-            { class: "menu-item", role: "menuitem", onclick: () => this.pick(n.id) },
-            h("span", null, n.name),
-            h("span", { class: "muted mono small" }, n.file ?? n.qualified_name),
-          ),
-        );
-      }
-    }
-    if (!this.entryMenu.childElementCount)
-      this.entryMenu.append(h("div", { class: "muted pad" }, "No entrypoints"));
   }
 }

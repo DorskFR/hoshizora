@@ -1,3 +1,4 @@
+import { isTestNode } from "../graph/filters";
 import type { Store } from "../state";
 import type { Insight, TraceSummary } from "../types";
 import { clear, fmtMs, fmtNanos, fmtRate, h, shortId } from "./dom";
@@ -11,9 +12,13 @@ const INSIGHT_LABELS: Partial<Record<string, string>> = {
   never_observed: "Never observed",
 };
 
+const INSIGHTS_PER_GROUP = 40;
+
 export class InsightsPanel {
   readonly el: HTMLElement;
   private readonly body: HTMLElement;
+  private all: Insight[] = [];
+  private showTests = false;
 
   constructor(
     private readonly store: Store,
@@ -49,21 +54,48 @@ export class InsightsPanel {
     this.body.append(h("div", { class: "muted pad" }, "Loading…"));
     try {
       const { insights } = await this.store.backend.insights();
-      this.render(insights);
+      this.all = insights;
+      this.render();
     } catch (err) {
       clear(this.body);
       this.body.append(h("div", { class: "error pad" }, (err as Error).message));
     }
   }
 
-  private render(insights: Insight[]): void {
+  private render(): void {
     clear(this.body);
+    const isTest = (i: Insight) => {
+      const n = this.store.index.node(i.node);
+      return n ? isTestNode(n) : false;
+    };
+    const insights = this.showTests ? this.all : this.all.filter((i) => !isTest(i));
+    const hidden = this.all.length - insights.length;
+    if (hidden || this.showTests) {
+      const box = h("input", {
+        type: "checkbox",
+        checked: this.showTests,
+        onchange: () => {
+          this.showTests = box.checked;
+          this.render();
+        },
+      });
+      this.body.append(
+        h(
+          "label",
+          { class: "check small muted" },
+          box,
+          this.showTests ? " include tests" : ` include tests (${hidden} hidden)`,
+        ),
+      );
+    }
     if (!insights.length) {
       this.body.append(
         h(
           "p",
           { class: "muted pad" },
-          "No findings yet. Insights appear once the graph is analysed and spans arrive.",
+          this.all.length
+            ? "Every finding is in test code."
+            : "No findings yet. Insights appear once the graph is analysed and spans arrive.",
         ),
       );
       return;
@@ -75,20 +107,34 @@ export class InsightsPanel {
       else groups.set(i.kind, [i]);
     }
     for (const [kind, items] of groups) {
-      this.body.append(
-        h("h3", null, `${INSIGHT_LABELS[kind] ?? kind.replace(/_/g, " ")} (${items.length})`),
+      const group = h(
+        "details",
+        { class: "insight-group" },
+        h(
+          "summary",
+          null,
+          `${INSIGHT_LABELS[kind] ?? kind.replace(/_/g, " ")} `,
+          h("span", { class: "count" }, String(items.length)),
+        ),
       );
-      for (const i of items) {
-        const name = this.store.index.node(i.node)?.name ?? shortId(i.node);
-        this.body.append(
+      group.open = this.body.querySelector("details") === null || items.length <= 8;
+      for (const i of items.slice(0, INSIGHTS_PER_GROUP)) {
+        const n = this.store.index.node(i.node);
+        group.append(
           h(
             "button",
             { class: `insight insight-${i.kind}`, onclick: () => this.onPick(i) },
-            h("b", null, name),
+            h("b", null, n?.name ?? shortId(i.node)),
+            n?.file && h("span", { class: "muted small mono" }, n.file),
             h("span", { class: "muted small" }, describe(i)),
           ),
         );
       }
+      if (items.length > INSIGHTS_PER_GROUP)
+        group.append(
+          h("p", { class: "muted small pad" }, `+${items.length - INSIGHTS_PER_GROUP} more`),
+        );
+      this.body.append(group);
     }
   }
 }

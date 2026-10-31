@@ -1,3 +1,4 @@
+import { cctuiGraph, cctuiInsights, cctuiSources, cctuiSpawnStory } from "../../fixtures/cctui";
 import {
   buildTrace,
   demoFlowSpans,
@@ -7,33 +8,68 @@ import {
   demoStats,
 } from "../../fixtures/demo";
 import { syntheticGraph } from "../../fixtures/synthetic";
-import type { Backend } from "../api";
+import type { Backend, ProjectsApi } from "../api";
 import { flowFrom, GraphIndex, impactOf } from "../graph/query";
+import { storyFromFlow } from "../story/build";
 import type {
+  AddProject,
   Graph,
   GraphNode,
+  Insight,
   LiveEvent,
   NodeDetail,
   NodeStats,
+  Project,
   SearchHit,
+  Story,
   TraceSummary,
 } from "../types";
 
 const MS = 1_000_000;
 
+export interface MockDataset {
+  graph: Graph;
+  sources: Record<string, string>;
+  insights: Insight[];
+  stories: Story[];
+  live: boolean;
+}
+
+export const DATASETS = {
+  cctui: (): MockDataset => ({
+    graph: cctuiGraph,
+    sources: cctuiSources,
+    insights: cctuiInsights,
+    stories: [cctuiSpawnStory],
+    live: false,
+  }),
+  shop: (): MockDataset => ({
+    graph: demoGraph,
+    sources: demoSources,
+    insights: demoInsights,
+    stories: [],
+    live: true,
+  }),
+  synthetic: (functions: number): MockDataset => ({
+    graph: syntheticGraph({ functions }),
+    sources: {},
+    insights: [],
+    stories: [],
+    live: false,
+  }),
+};
+
 export class MockBackend implements Backend {
   private readonly g: Graph;
   private readonly index: GraphIndex;
   private readonly recent: TraceSummary[] = [];
-  private readonly synthetic: boolean;
   private statsCache: NodeStats[];
 
-  constructor(syntheticFunctions: number | null) {
-    this.synthetic = syntheticFunctions !== null;
-    this.g = this.synthetic ? syntheticGraph({ functions: syntheticFunctions! }) : demoGraph;
+  constructor(private readonly data: MockDataset) {
+    this.g = data.graph;
     this.index = new GraphIndex(this.g);
-    this.statsCache = this.synthetic ? [] : demoStats();
-    if (!this.synthetic) {
+    this.statsCache = data.live ? demoStats() : [];
+    if (data.live) {
       const now = Date.now() * MS;
       for (let i = 6; i >= 1; i--) {
         this.recent.push(
@@ -51,8 +87,9 @@ export class MockBackend implements Backend {
     const node = this.index.node(id);
     if (!node) throw new Error(`unknown node ${id}`);
     let source: NodeDetail["source"] = null;
-    if (node.file && node.span && demoSources[node.file]) {
-      const lines = demoSources[node.file]!.split("\n");
+    const text = node.file ? this.data.sources[node.file] : undefined;
+    if (node.file && node.span && text) {
+      const lines = text.split("\n");
       source = {
         file: node.file,
         start_line: node.span.start_line,
@@ -70,12 +107,12 @@ export class MockBackend implements Backend {
   }
 
   async search(q: string, limit = 20): Promise<SearchHit[]> {
-    const needle = q.toLowerCase();
+    const needle = q.toLowerCase().replace(/[\s_-]/g, "");
     if (!needle) return [];
     const hits: SearchHit[] = [];
     for (const n of this.g.nodes) {
-      const name = n.name.toLowerCase();
-      const qn = n.qualified_name.toLowerCase();
+      const name = n.name.toLowerCase().replace(/[_-]/g, "");
+      const qn = n.qualified_name.toLowerCase().replace(/[_-]/g, "");
       let score = 0;
       if (name === needle) score = 1;
       else if (name.startsWith(needle)) score = 0.8;
@@ -102,12 +139,18 @@ export class MockBackend implements Backend {
     return flowFrom(this.index, from, depth);
   }
 
+  async story(from: string): Promise<Story | null> {
+    const fixed = this.data.stories.find((s) => s.root === from);
+    if (fixed) return fixed;
+    return storyFromFlow(this.index, flowFrom(this.index, from));
+  }
+
   async impact(of: string, depth = 12) {
     return impactOf(this.index, of, depth);
   }
 
   async insights() {
-    return { insights: this.synthetic ? [] : demoInsights };
+    return { insights: this.data.insights };
   }
 
   async runtimeStats() {
@@ -125,7 +168,7 @@ export class MockBackend implements Backend {
   }
 
   stream(onEvent: (ev: LiveEvent) => void, onState?: (open: boolean) => void): () => void {
-    if (this.synthetic) {
+    if (!this.data.live) {
       onState?.(true);
       return () => onState?.(false);
     }
@@ -157,5 +200,142 @@ export class MockBackend implements Backend {
       for (const t of timers) clearTimeout(t);
       onState?.(false);
     };
+  }
+}
+
+interface MockProject {
+  project: Project;
+  dataset: () => MockDataset;
+}
+
+const STAGE_MS = 1800;
+
+/** In-memory projects; added repositories walk through cloning → indexing → ready on a timer. */
+export class MockProjects implements ProjectsApi {
+  private readonly projects = new Map<string, MockProject>();
+
+  constructor(private readonly syntheticFunctions: number | null) {
+    this.put(
+      {
+        id: "dorskfr-cctui",
+        name: "cctui",
+        source: { kind: "git", url: "https://github.com/DorskFR/cctui", ref: "main" },
+        status: "ready",
+        error: null,
+        commit: "4f2c9e1a7b3d5f60c8e2a1b9d7f3e5c2a4b6d8e0",
+        indexed_at: "2026-10-31T08:17:31Z",
+        nodes: cctuiGraph.nodes.length,
+        edges: cctuiGraph.edges.length,
+        services: ["cctui-server", "cctui-daemon"],
+      },
+      DATASETS.cctui,
+    );
+    this.put(
+      {
+        id: "shop",
+        name: "shop",
+        source: { kind: "path", path: "/home/dev/shop" },
+        status: "ready",
+        error: null,
+        commit: null,
+        indexed_at: "2026-10-30T18:02:11Z",
+        nodes: demoGraph.nodes.length,
+        edges: demoGraph.edges.length,
+        services: ["api", "worker"],
+      },
+      DATASETS.shop,
+    );
+  }
+
+  private put(project: Project, dataset: () => MockDataset): void {
+    this.projects.set(project.id, { project, dataset });
+  }
+
+  async list() {
+    if (this.syntheticFunctions !== null) return null;
+    return Array.from(this.projects.values()).map((p) => ({ ...p.project }));
+  }
+
+  async get(id: string) {
+    const p = this.projects.get(id);
+    if (!p) throw new Error(`unknown project ${id}`);
+    return { ...p.project };
+  }
+
+  async add(body: AddProject) {
+    const url = body.url.trim();
+    for (const p of this.projects.values())
+      if (p.project.source.kind === "git" && p.project.source.url === url) return { ...p.project };
+    const slug = url
+      .replace(/^https?:\/\/(www\.)?github\.com\//, "")
+      .replace(/\.git$/, "")
+      .replace(/[^a-zA-Z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .toLowerCase();
+    const project: Project = {
+      id: slug || `repo-${this.projects.size}`,
+      name:
+        body.name ||
+        url
+          .split("/")
+          .pop()
+          ?.replace(/\.git$/, "") ||
+        slug,
+      source: { kind: "git", url, ref: body.ref ?? null },
+      status: "cloning",
+      error: null,
+      commit: null,
+      indexed_at: null,
+      nodes: 0,
+      edges: 0,
+      services: body.services ?? [],
+    };
+    this.put(project, DATASETS.shop);
+    this.advance(project);
+    return { ...project };
+  }
+
+  private advance(project: Project): void {
+    const valid = /^(https?:\/\/|git@|ssh:\/\/)/.test(
+      project.source.kind === "git" ? project.source.url : "",
+    );
+    setTimeout(() => {
+      if (!valid) {
+        project.status = "failed";
+        project.error = "git clone: repository not found or not a git URL";
+        return;
+      }
+      project.status = "indexing";
+      project.commit = "9a1b2c3d4e5f60718293a4b5c6d7e8f901234567";
+      setTimeout(() => {
+        project.status = "ready";
+        project.indexed_at = new Date().toISOString();
+        project.nodes = demoGraph.nodes.length;
+        project.edges = demoGraph.edges.length;
+      }, STAGE_MS);
+    }, STAGE_MS);
+  }
+
+  async reindex(id: string) {
+    const p = this.projects.get(id);
+    if (!p) throw new Error(`unknown project ${id}`);
+    p.project.status = "indexing";
+    setTimeout(() => {
+      p.project.status = "ready";
+      p.project.indexed_at = new Date().toISOString();
+    }, STAGE_MS);
+    return { ...p.project };
+  }
+
+  async remove(id: string) {
+    this.projects.delete(id);
+  }
+
+  backend(id: string | null): Backend {
+    if (this.syntheticFunctions !== null)
+      return new MockBackend(DATASETS.synthetic(this.syntheticFunctions));
+    const p = id ? this.projects.get(id) : this.projects.values().next().value;
+    if (!p) throw new Error(`unknown project ${id}`);
+    return new MockBackend(p.dataset());
   }
 }

@@ -78,6 +78,7 @@ export class Scene {
   private readonly labelEls = new Map<string, HTMLElement>();
   private batchedLinks: { mesh: THREE.LineSegments; links: SceneLink[] } | null = null;
   private batchedNodes: { points: THREE.Points; nodes: ViewNode[] } | null = null;
+  private paused = false;
 
   constructor(
     el: HTMLElement,
@@ -317,49 +318,45 @@ export class Scene {
       for (const id of this.highlight.nodes) add(id);
     }
     if (!this.cheapNodes) {
-      const all = Array.from(this.nodes.values());
-      for (const n of all) {
+      const ranked = Array.from(this.nodes.values())
+        .filter((n) => n.aggregate || (n.synthetic && n.kind !== "dependency"))
+        .sort((a, b) => Number(b.aggregate) - Number(a.aggregate) || b.val - a.val);
+      for (const n of ranked) {
         if (out.length >= MAX_LABELS) break;
-        if (n.aggregate) add(n.id);
-      }
-      const synthetic = all.filter(
-        (n) => n.kind === "route" || n.kind === "table" || n.kind === "topic" || n.kind === "host",
-      );
-      if (synthetic.length <= MAX_SYNTHETIC_LABELS) for (const n of synthetic) add(n.id);
-      for (const n of all) {
-        if (out.length >= MAX_LABELS) break;
-        if (n.entrypoint) add(n.id);
+        add(n.id);
       }
     }
-    return out.slice(0, MAX_LABELS);
+    return out;
   }
 
+  /** Places labels in priority order and drops any that would overlap one already placed. */
   private updateLabels(): void {
     const wanted = this.labelCandidates();
     const keep = new Set<string>();
     const w = this.labelLayer.clientWidth;
     const h = this.labelLayer.clientHeight;
+    const placed: { x: number; y: number; w: number; h: number }[] = [];
     for (const n of wanted) {
       if (n.x === undefined) continue;
-      if (
-        this.highlight &&
-        !this.highlight.nodes.has(n.id) &&
-        n.id !== this.selected &&
-        n.id !== this.hovered
-      )
-        continue;
+      const focus = n.id === this.selected || n.id === this.hovered;
+      if (this.highlight && !this.highlight.nodes.has(n.id) && !focus) continue;
       const p = this.fg.graph2ScreenCoords(n.x, n.y ?? 0, n.z ?? 0);
       if (p.z > 1 || p.x < -50 || p.y < -20 || p.x > w + 50 || p.y > h + 20) continue;
-      keep.add(n.id);
       let el = this.labelEls.get(n.id);
+      const width = el ? Number(el.dataset.w) : estimateLabelWidth(n.label, n.aggregate);
+      const rect = { x: p.x - 2, y: p.y - 16, w: width + 4, h: 20 };
+      if (!focus && placed.some((r) => overlaps(r, rect))) continue;
+      placed.push(rect);
+      keep.add(n.id);
       if (!el) {
         el = document.createElement("span");
         el.className = `label kind-${n.kind}${n.aggregate ? " aggregate" : ""}`;
         el.textContent = n.label;
         this.labelLayer.appendChild(el);
+        el.dataset.w = String(el.offsetWidth || width);
         this.labelEls.set(n.id, el);
       }
-      el.classList.toggle("focus", n.id === this.selected || n.id === this.hovered);
+      el.classList.toggle("focus", focus);
       el.style.transform = `translate(${p.x.toFixed(1)}px, ${(p.y - 14).toFixed(1)}px)`;
     }
     for (const [id, el] of this.labelEls) {
@@ -367,6 +364,19 @@ export class Scene {
         el.remove();
         this.labelEls.delete(id);
       }
+    }
+  }
+
+  /** Stops rendering while another view covers the map. */
+  pause(paused: boolean): void {
+    if (paused === this.paused) return;
+    this.paused = paused;
+    if (paused) {
+      cancelAnimationFrame(this.raf);
+      this.fg.pauseAnimation();
+    } else {
+      this.fg.resumeAnimation();
+      this.raf = requestAnimationFrame(this.tick);
     }
   }
 
@@ -793,9 +803,19 @@ export class Scene {
 type ForceNode = ViewNode & { vx?: number; vy?: number; vz?: number };
 
 const BATCH_LINKS_ABOVE = 1500;
-const MAX_LABELS = 120;
+const MAX_LABELS = 60;
 const MAX_HIGHLIGHT_LABELS = 60;
-const MAX_SYNTHETIC_LABELS = 40;
+
+function estimateLabelWidth(text: string, aggregate: boolean): number {
+  return text.length * (aggregate ? 7.6 : 7) + 12;
+}
+
+function overlaps(
+  a: { x: number; y: number; w: number; h: number },
+  b: { x: number; y: number; w: number; h: number },
+): boolean {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
 
 function packageCount(nodes: ViewNode[]): number {
   return Math.max(1, new Set(nodes.map((n) => n.pkg).filter(Boolean)).size);
