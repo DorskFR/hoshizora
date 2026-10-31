@@ -96,22 +96,9 @@ export class Toolbar {
     this.statusEl = h("span", { class: "status muted", "aria-live": "polite" });
     this.modeEl = h("span", { class: "mode" });
 
-    this.el = h(
-      "header",
-      { class: "toolbar" },
-      h(
-        actions.home ? "button" : "div",
-        {
-          class: "brand",
-          title: actions.home ? "All projects" : "",
-          onclick: () => actions.home?.(),
-        },
-        h("span", { class: "kanji" }, "星空"),
-        h("span", null, "hoshizora"),
-      ),
-      store.projectName && h("span", { class: "project-name" }, store.projectName),
-      flowsBtn,
-      h("div", { class: "search-wrap" }, this.search, this.results),
+    const tools = h(
+      "div",
+      { class: "toolbar-tools" },
       levelSel,
       this.modeEl,
       h("span", { class: "spacer" }),
@@ -134,6 +121,25 @@ export class Toolbar {
         "⤢",
       ),
       this.fpsEl,
+    );
+
+    this.el = h(
+      "header",
+      { class: "toolbar" },
+      h(
+        actions.home ? "button" : "div",
+        {
+          class: "brand",
+          title: actions.home ? "All projects" : "",
+          onclick: () => actions.home?.(),
+        },
+        h("span", { class: "kanji" }, "星空"),
+        h("span", null, "hoshizora"),
+      ),
+      store.projectName && h("span", { class: "project-name" }, store.projectName),
+      flowsBtn,
+      h("div", { class: "search-wrap" }, this.search, this.results),
+      tools,
     );
 
     store.on("status", (msg) => {
