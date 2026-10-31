@@ -26,6 +26,22 @@ hoshizora index path/to/repo -o .hoshizora/graph.json
 hoshizora serve --graph .hoshizora/graph.json --root path/to/repo    # http://127.0.0.1:7317
 ```
 
+One server can hold several projects. Give it a data dir and add repositories by URL; each is
+shallow-cloned and indexed in the background, and the list survives restarts:
+
+```sh
+hoshizora serve --data-dir .hoshizora                      # or --project <url-or-path>, repeatable
+curl -X POST localhost:7317/api/projects -H 'content-type: application/json' \
+     -d '{"url":"https://github.com/tokio-rs/mini-redis","services":["mini-redis"]}'
+curl localhost:7317/api/projects                           # poll until status is "ready"
+curl localhost:7317/api/projects/tokio-rs-mini-redis/search?q=set
+```
+
+Every `/api/...` route also exists under `/api/projects/{id}/...`; the unprefixed form is the
+first project. Set `HOSHIZORA_GIT_TOKEN` to clone private GitHub repositories. Spans are routed
+to the project owning their `service.name`, else by the `x-hoshizora-project` header or
+`?project=`, else by where their `code.filepath` resolves.
+
 Point any OpenTelemetry SDK at it. hoshizora also listens on the standard OTLP/HTTP port 4318, so
 stock SDKs need no configuration:
 

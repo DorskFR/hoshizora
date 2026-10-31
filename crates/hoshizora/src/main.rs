@@ -1,4 +1,6 @@
 mod assets;
+mod git;
+mod projects;
 mod queries;
 mod server;
 
@@ -14,10 +16,13 @@ use hoshizora_model::NodeKind;
 use hoshizora_runtime::{NodeLookup, RuntimeConfig};
 use tracing_subscriber::EnvFilter;
 
+use crate::git::GitOptions;
+use crate::projects::{AppState, Indexer};
 use crate::queries::{GraphIndex, GraphQueries, parse_edge_kinds, parse_effect_kind};
-use crate::server::{AppState, DEFAULT_DEPTH};
+use crate::server::DEFAULT_DEPTH;
 
 const DEFAULT_GRAPH: &str = ".hoshizora/graph.json";
+const DEFAULT_DATA_DIR: &str = ".hoshizora";
 
 #[derive(Parser)]
 #[command(
@@ -46,11 +51,19 @@ enum Command {
     },
     /// Serve the API, the OTLP receiver and the viewer.
     Serve {
-        #[arg(long, default_value = DEFAULT_GRAPH)]
-        graph: PathBuf,
-        /// Source root used to read files; defaults to the root recorded in the graph.
+        /// Pre-built graph to serve as the first project (default `.hoshizora/graph.json`
+        /// when it exists and nothing else is registered).
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Source root of `--graph`; defaults to the root recorded in the graph.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Holds `projects.json`, clones (`repos/`) and graphs (`graphs/`).
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+        /// Git URL or local path to register at startup; repeatable.
+        #[arg(long = "project")]
+        projects: Vec<String>,
         /// Bind address; use 0.0.0.0 inside a container.
         #[arg(long, default_value = "127.0.0.1")]
         host: std::net::IpAddr,
@@ -129,20 +142,24 @@ fn main() -> anyhow::Result<()> {
         Command::Serve {
             graph,
             root,
+            data_dir,
+            projects,
             host,
             port,
             otlp_port,
             reindex,
             packs,
-        } => tokio::runtime::Runtime::new()?.block_on(cmd_serve(
+        } => tokio::runtime::Runtime::new()?.block_on(cmd_serve(ServeArgs {
             graph,
             root,
+            data_dir,
+            projects,
             host,
             port,
             otlp_port,
             reindex,
-            packs.as_deref(),
-        )),
+            packs,
+        })),
         Command::Query { graph, query } => cmd_query(&graph, query),
     }
 }
@@ -200,50 +217,69 @@ fn cmd_index(path: &Path, output: &Path, packs: Option<&Path>) -> anyhow::Result
     Ok(())
 }
 
-async fn cmd_serve(
-    graph_path: PathBuf,
+struct ServeArgs {
+    graph: Option<PathBuf>,
     root: Option<PathBuf>,
+    data_dir: PathBuf,
+    projects: Vec<String>,
     host: std::net::IpAddr,
     port: u16,
     otlp_port: u16,
     reindex: bool,
-    packs: Option<&Path>,
-) -> anyhow::Result<()> {
-    let graph = if reindex {
-        let root = root.clone().unwrap_or_else(|| PathBuf::from("."));
-        let graph = build_graph(&root, packs)?;
-        if let Some(parent) = graph_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        hoshizora_core::save(&graph, &graph_path)?;
-        graph
-    } else {
-        hoshizora_core::load(&graph_path).with_context(|| {
-            format!(
-                "loading {} (run `hoshizora index` first)",
-                graph_path.display()
-            )
-        })?
-    };
-    let root = root.unwrap_or_else(|| PathBuf::from(&graph.meta.root));
-    tracing::info!(
-        nodes = graph.nodes.len(),
-        edges = graph.edges.len(),
-        root = %root.display(),
-        "graph loaded"
+    packs: Option<PathBuf>,
+}
+
+async fn cmd_serve(args: ServeArgs) -> anyhow::Result<()> {
+    let packs = args.packs.clone();
+    let indexer: Indexer = Arc::new(move |root: &Path| build_graph(root, packs.as_deref()));
+    let state: Arc<AppState<GraphIndex>> = AppState::new(
+        args.data_dir.clone(),
+        indexer,
+        RuntimeConfig::default(),
+        GitOptions::from_env(),
     );
-    let state = AppState::new(GraphIndex::new(graph), root, RuntimeConfig::default());
+    let restored = state.restore()?;
+    if restored > 0 {
+        tracing::info!(projects = restored, "restored projects.json");
+    }
+    let legacy = args.graph.clone().or_else(|| {
+        let default = PathBuf::from(DEFAULT_GRAPH);
+        (restored == 0 && args.projects.is_empty() && (default.exists() || args.reindex))
+            .then_some(default)
+    });
+    if let Some(graph_path) = legacy {
+        serve_legacy_graph(
+            &state,
+            &graph_path,
+            args.root.clone(),
+            args.reindex,
+            args.packs.as_deref(),
+        )?;
+    }
+    for spec in &args.projects {
+        let project = if projects::is_url(spec) {
+            state
+                .add_git(hoshizora_model::api::AddProject {
+                    url: spec.clone(),
+                    ..Default::default()
+                })
+                .map_err(|e| anyhow::anyhow!("--project {spec}: {}", e.message))?
+        } else {
+            state.add_path(Path::new(spec), None)?
+        };
+        tracing::info!(project = project.id, status = ?project.status, "registered");
+    }
     server::spawn_stats_ticker(Arc::clone(&state));
     let app = server::router(Arc::clone(&state));
 
-    let main_addr = SocketAddr::from((host, port));
+    let main_addr = SocketAddr::from((args.host, args.port));
     let main = tokio::net::TcpListener::bind(main_addr)
         .await
         .with_context(|| format!("binding {main_addr}"))?;
     tracing::info!("hoshizora listening on http://{main_addr}");
 
-    let otlp_addr = SocketAddr::from((host, otlp_port));
-    let otlp = if otlp_port == port {
+    let otlp_addr = SocketAddr::from((args.host, args.otlp_port));
+    let otlp = if args.otlp_port == args.port {
         None
     } else {
         match tokio::net::TcpListener::bind(otlp_addr).await {
@@ -253,7 +289,8 @@ async fn cmd_serve(
             }
             Err(e) => {
                 tracing::warn!(
-                    "port {otlp_port} busy ({e}); export to http://{main_addr} instead (OTEL_EXPORTER_OTLP_ENDPOINT)"
+                    "port {} busy ({e}); export to http://{main_addr} instead (OTEL_EXPORTER_OTLP_ENDPOINT)",
+                    args.otlp_port
                 );
                 None
             }
@@ -268,6 +305,69 @@ async fn cmd_serve(
         }
         None => main_srv.await?,
     }
+    Ok(())
+}
+
+/// `serve --graph X [--root Y]`: loads (or rebuilds) one graph and registers it as the first
+/// project, so unprefixed `/api/...` routes keep working.
+fn serve_legacy_graph(
+    state: &Arc<AppState<GraphIndex>>,
+    graph_path: &Path,
+    root: Option<PathBuf>,
+    reindex: bool,
+    packs: Option<&Path>,
+) -> anyhow::Result<()> {
+    let graph = if reindex {
+        let root = root.clone().unwrap_or_else(|| PathBuf::from("."));
+        let graph = build_graph(&root, packs)?;
+        if let Some(parent) = graph_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        hoshizora_core::save(&graph, graph_path)?;
+        graph
+    } else {
+        hoshizora_core::load(graph_path).with_context(|| {
+            format!(
+                "loading {} (run `hoshizora index` first)",
+                graph_path.display()
+            )
+        })?
+    };
+    let root = root.unwrap_or_else(|| PathBuf::from(&graph.meta.root));
+    tracing::info!(
+        nodes = graph.nodes.len(),
+        edges = graph.edges.len(),
+        root = %root.display(),
+        "graph loaded"
+    );
+    let id = state
+        .list()
+        .into_iter()
+        .find(|p| state.root_of(p) == root)
+        .map(|p| p.id)
+        .unwrap_or_else(|| projects::path_slug(&root));
+    let stored = state.graph_path(&id);
+    if graph_path.canonicalize().ok() != stored.canonicalize().ok() {
+        if let Some(parent) = stored.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        hoshizora_core::save(&graph, &stored)?;
+    }
+    let project = hoshizora_model::api::Project {
+        name: id.clone(),
+        id,
+        source: hoshizora_model::api::ProjectSource::Path {
+            path: root.display().to_string(),
+        },
+        status: hoshizora_model::api::ProjectStatus::Ready,
+        error: None,
+        commit: None,
+        indexed_at: None,
+        nodes: 0,
+        edges: 0,
+        services: Vec::new(),
+    };
+    state.insert_ready(project, GraphIndex::new(graph), root, Some(0));
     Ok(())
 }
 

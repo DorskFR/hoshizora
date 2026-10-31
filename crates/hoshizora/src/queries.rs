@@ -6,6 +6,9 @@ use hoshizora_model::{Edge, EdgeKind, EffectKind, Graph, Insight, Node};
 use hoshizora_runtime::NodeLookup;
 
 pub trait GraphQueries: NodeLookup + 'static {
+    fn from_graph(graph: Graph) -> Self
+    where
+        Self: Sized;
     fn graph(&self) -> &Graph;
     fn incoming(&self, id: &str) -> Vec<Edge>;
     fn outgoing(&self, id: &str) -> Vec<Edge>;
@@ -43,6 +46,9 @@ impl NodeLookup for GraphIndex {
 }
 
 impl GraphQueries for GraphIndex {
+    fn from_graph(graph: Graph) -> Self {
+        Self::new(graph)
+    }
     fn graph(&self) -> &Graph {
         self.0.graph()
     }

@@ -8,14 +8,16 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{FromRequestParts, Query, RawPathParams, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use futures::Stream;
-use hoshizora_model::api::{Insights, NodeDetail, Source};
-use hoshizora_model::{EdgeKind, Graph, Insight, LiveEvent, Node, NodeStats};
+use hoshizora_model::api::{AddProject, Insights, NodeDetail, Project, ProjectStatus, Source};
+use hoshizora_model::{EdgeKind, Graph, Insight, LiveEvent, Node, NodeStats, RuntimeSpan};
+use hoshizora_runtime::route::{ProjectCandidate, project_for_span};
 use hoshizora_runtime::{NodeLookup, Runtime, RuntimeConfig, Trace, otlp};
 use serde::Deserialize;
 use tokio::sync::broadcast;
@@ -25,19 +27,22 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 use crate::assets;
+pub use crate::projects::AppState;
 use crate::queries::{GraphQueries, parse_edge_kinds, parse_effect_kind};
 
-pub struct AppState<Q: GraphQueries> {
+/// One ready project: its graph, runtime and live event stream.
+pub struct ProjectState<Q: GraphQueries> {
     pub queries: Arc<Q>,
     pub runtime: Mutex<Runtime<Arc<Q>>>,
     pub events: broadcast::Sender<LiveEvent>,
     pub root: PathBuf,
-    /// `/api/graph` bodies, serialised once: the graph is immutable per process.
+    /// `/api/graph` bodies, serialised once: the graph is immutable until a reindex replaces
+    /// the whole `ProjectState`.
     graph_json: Bytes,
     slim_graph_json: Bytes,
 }
 
-impl<Q: GraphQueries + 'static> AppState<Q> {
+impl<Q: GraphQueries + 'static> ProjectState<Q> {
     pub fn new(queries: Q, root: PathBuf, config: RuntimeConfig) -> Arc<Self> {
         let queries = Arc::new(queries);
         let runtime = Runtime::new(config, Arc::clone(&queries));
@@ -69,30 +74,79 @@ impl<Q: GraphQueries + 'static> AppState<Q> {
     }
 }
 
+/// The project a request addresses: `{project}` in the path, else the first registered one.
+pub struct Proj<Q: GraphQueries>(pub Arc<ProjectState<Q>>);
+
+impl<Q: GraphQueries> FromRequestParts<Arc<AppState<Q>>> for Proj<Q> {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState<Q>>,
+    ) -> Result<Self, AppError> {
+        let params = RawPathParams::from_request_parts(parts, state)
+            .await
+            .map_err(|e| AppError::bad_request(e.to_string()))?;
+        let id = params
+            .iter()
+            .find(|(k, _)| *k == "project")
+            .map(|(_, v)| v.to_string());
+        state.project_state(id.as_deref()).map(Proj)
+    }
+}
+
+fn path_param(params: &RawPathParams, name: &str) -> Result<String, AppError> {
+    params
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.to_string())
+        .ok_or_else(|| AppError::bad_request(format!("missing {name}")))
+}
+
 pub fn router<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) -> Router {
-    let api = Router::new()
-        .route("/api/graph", get(graph::<Q>))
-        .route("/api/nodes/{*id}", get(node_detail::<Q>))
-        .route("/api/source", get(source::<Q>))
-        .route("/api/search", get(search::<Q>))
-        .route("/api/entrypoints", get(entrypoints::<Q>))
-        .route("/api/flow", get(flow::<Q>))
-        .route("/api/impact", get(impact::<Q>))
-        .route("/api/story", get(story::<Q>))
-        .route("/api/dead", get(dead::<Q>))
-        .route("/api/effects", get(effects::<Q>))
-        .route("/api/insights", get(insights::<Q>))
-        .route("/api/runtime/stats", get(runtime_stats::<Q>))
-        .route("/api/runtime/traces", get(runtime_traces::<Q>))
-        .route("/api/runtime/traces/{trace_id}", get(runtime_trace::<Q>))
+    let api = project_routes::<Q>("/api")
+        .merge(project_routes::<Q>("/api/projects/{project}"))
+        .route(
+            "/api/projects",
+            get(list_projects::<Q>).post(add_project::<Q>),
+        )
+        .route(
+            "/api/projects/{project}",
+            get(get_project::<Q>).delete(delete_project::<Q>),
+        )
+        .route(
+            "/api/projects/{project}/reindex",
+            post(reindex_project::<Q>),
+        )
         .layer(CompressionLayer::new());
     Router::new()
         .merge(api)
         .route("/api/runtime/stream", get(stream::<Q>))
+        .route("/api/projects/{project}/runtime/stream", get(stream::<Q>))
         .route("/v1/traces", post(traces_ingest::<Q>))
         .fallback(static_assets)
         .layer(cors())
         .with_state(state)
+}
+
+/// Every graph/query/runtime route under `prefix`, resolved against that project's graph.
+fn project_routes<Q: GraphQueries + 'static>(prefix: &str) -> Router<Arc<AppState<Q>>> {
+    let p = |s: &str| format!("{prefix}{s}");
+    Router::new()
+        .route(&p("/graph"), get(graph::<Q>))
+        .route(&p("/nodes/{*id}"), get(node_detail::<Q>))
+        .route(&p("/source"), get(source::<Q>))
+        .route(&p("/search"), get(search::<Q>))
+        .route(&p("/entrypoints"), get(entrypoints::<Q>))
+        .route(&p("/flow"), get(flow::<Q>))
+        .route(&p("/impact"), get(impact::<Q>))
+        .route(&p("/story"), get(story::<Q>))
+        .route(&p("/dead"), get(dead::<Q>))
+        .route(&p("/effects"), get(effects::<Q>))
+        .route(&p("/insights"), get(insights::<Q>))
+        .route(&p("/runtime/stats"), get(runtime_stats::<Q>))
+        .route(&p("/runtime/traces"), get(runtime_traces::<Q>))
+        .route(&p("/runtime/traces/{trace_id}"), get(runtime_trace::<Q>))
 }
 
 /// Browser OTel exporters send credentials, which a wildcard origin would make the browser reject.
@@ -101,29 +155,110 @@ fn cors() -> CorsLayer {
         .allow_origin(AllowOrigin::mirror_request())
         .allow_credentials(true)
         .allow_headers(AllowHeaders::mirror_request())
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .max_age(Duration::from_secs(3600))
 }
 
-/// Emits a `Stats` live event every second while the server runs.
+/// Emits a `Stats` live event every second on every ready project while the server runs.
 pub fn spawn_stats_ticker<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
-            state.publish_stats();
+            for project in state.ready_states() {
+                project.publish_stats();
+            }
         }
     });
 }
 
-type AppError = (StatusCode, String);
-
-fn not_found(what: &str) -> AppError {
-    (StatusCode::NOT_FOUND, format!("{what} not found"))
+/// JSON error body `{ "error": ..., "status"?: project status }`.
+#[derive(Debug)]
+pub struct AppError {
+    pub status: StatusCode,
+    pub message: String,
+    pub project_status: Option<ProjectStatus>,
 }
 
-fn bad_request(msg: impl Into<String>) -> AppError {
-    (StatusCode::BAD_REQUEST, msg.into())
+impl AppError {
+    pub fn not_found(what: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: format!("{what} not found"),
+            project_status: None,
+        }
+    }
+
+    pub fn bad_request(msg: impl ToString) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.to_string(),
+            project_status: None,
+        }
+    }
+
+    pub fn not_ready(status: ProjectStatus, msg: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg.to_string(),
+            project_status: Some(status),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let mut body = serde_json::json!({ "error": self.message });
+        if let Some(status) = self.project_status {
+            body["status"] = serde_json::to_value(status).unwrap_or_default();
+        }
+        (self.status, Json(body)).into_response()
+    }
+}
+
+fn not_found(what: &str) -> AppError {
+    AppError::not_found(what)
+}
+
+fn bad_request(msg: impl ToString) -> AppError {
+    AppError::bad_request(msg)
+}
+
+async fn list_projects<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+) -> Json<Vec<Project>> {
+    Json(state.list())
+}
+
+async fn add_project<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+    Json(req): Json<AddProject>,
+) -> Result<(StatusCode, Json<Project>), AppError> {
+    state.add_git(req).map(|p| (StatusCode::ACCEPTED, Json(p)))
+}
+
+async fn get_project<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+    params: RawPathParams,
+) -> Result<Json<Project>, AppError> {
+    let id = path_param(&params, "project")?;
+    state.get(&id).map(Json).ok_or_else(|| not_found("project"))
+}
+
+async fn delete_project<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+    params: RawPathParams,
+) -> Result<StatusCode, AppError> {
+    let id = path_param(&params, "project")?;
+    state.remove(&id).map(|()| StatusCode::NO_CONTENT)
+}
+
+async fn reindex_project<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+    params: RawPathParams,
+) -> Result<(StatusCode, Json<Project>), AppError> {
+    let id = path_param(&params, "project")?;
+    state.reindex(&id).map(|p| (StatusCode::ACCEPTED, Json(p)))
 }
 
 #[derive(Deserialize)]
@@ -131,10 +266,7 @@ struct GraphParams {
     detail: Option<String>,
 }
 
-async fn graph<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
-    Query(p): Query<GraphParams>,
-) -> Response {
+async fn graph<Q: GraphQueries>(Proj(state): Proj<Q>, Query(p): Query<GraphParams>) -> Response {
     let body = match p.detail.as_deref() {
         Some("slim") => state.slim_graph_json.clone(),
         _ => state.graph_json.clone(),
@@ -184,10 +316,10 @@ pub fn slim_graph(graph: &Graph) -> Graph {
 }
 
 async fn node_detail<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    Proj(state): Proj<Q>,
+    params: RawPathParams,
 ) -> Result<Json<NodeDetail>, AppError> {
-    let id = decode_id(&id);
+    let id = decode_id(&path_param(&params, "id")?);
     let node = state
         .queries
         .node(&id)
@@ -229,7 +361,7 @@ struct SourceParams {
 }
 
 async fn source<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
+    Proj(state): Proj<Q>,
     Query(p): Query<SourceParams>,
 ) -> Result<Json<Source>, AppError> {
     let start = p.start.unwrap_or(1).max(1);
@@ -280,14 +412,11 @@ struct SearchParams {
     limit: Option<usize>,
 }
 
-async fn search<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
-    Query(p): Query<SearchParams>,
-) -> Response {
+async fn search<Q: GraphQueries>(Proj(state): Proj<Q>, Query(p): Query<SearchParams>) -> Response {
     Json(state.queries.search(&p.q, p.limit.unwrap_or(20))).into_response()
 }
 
-async fn entrypoints<Q: GraphQueries>(State(state): State<Arc<AppState<Q>>>) -> Json<Vec<Node>> {
+async fn entrypoints<Q: GraphQueries>(Proj(state): Proj<Q>) -> Json<Vec<Node>> {
     Json(state.queries.entrypoints())
 }
 
@@ -301,7 +430,7 @@ struct FlowParams {
 pub const DEFAULT_DEPTH: u32 = 8;
 
 async fn flow<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
+    Proj(state): Proj<Q>,
     Query(p): Query<FlowParams>,
 ) -> Result<Response, AppError> {
     let kinds = parse_edge_kinds(p.kinds.as_deref().unwrap_or_default())
@@ -320,7 +449,7 @@ struct ImpactParams {
 }
 
 async fn impact<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
+    Proj(state): Proj<Q>,
     Query(p): Query<ImpactParams>,
 ) -> Result<Response, AppError> {
     state
@@ -337,7 +466,7 @@ struct StoryParams {
 }
 
 async fn story<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
+    Proj(state): Proj<Q>,
     Query(p): Query<StoryParams>,
 ) -> Result<Response, AppError> {
     state
@@ -347,7 +476,7 @@ async fn story<Q: GraphQueries>(
         .ok_or_else(|| not_found("node"))
 }
 
-async fn dead<Q: GraphQueries>(State(state): State<Arc<AppState<Q>>>) -> Json<Vec<Node>> {
+async fn dead<Q: GraphQueries>(Proj(state): Proj<Q>) -> Json<Vec<Node>> {
     Json(state.queries.dead())
 }
 
@@ -358,28 +487,52 @@ struct EffectsParams {
 }
 
 async fn effects<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
+    Proj(state): Proj<Q>,
     Query(p): Query<EffectsParams>,
 ) -> Result<Json<Vec<Node>>, AppError> {
     let kind = parse_effect_kind(&p.kind).map_err(|e| bad_request(e.to_string()))?;
     Ok(Json(state.queries.with_effect(kind, p.target.as_deref())))
 }
 
-async fn insights<Q: GraphQueries>(State(state): State<Arc<AppState<Q>>>) -> Json<Insights> {
+async fn insights<Q: GraphQueries>(Proj(state): Proj<Q>) -> Json<Insights> {
     Json(Insights {
         insights: all_insights(&state),
     })
 }
 
-pub fn all_insights<Q: GraphQueries>(state: &AppState<Q>) -> Vec<Insight> {
+pub fn all_insights<Q: GraphQueries>(state: &ProjectState<Q>) -> Vec<Insight> {
     let statics = state.queries.static_insights();
     state
         .runtime()
         .insights(hoshizora_runtime::now_unix_nanos(), &statics)
 }
 
+struct Candidate<Q: GraphQueries> {
+    id: String,
+    services: Vec<String>,
+    state: Arc<ProjectState<Q>>,
+}
+
+impl<Q: GraphQueries> ProjectCandidate for Candidate<Q> {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn services(&self) -> &[String] {
+        &self.services
+    }
+    fn locates(&self, span: &RuntimeSpan) -> bool {
+        self.state.runtime().locates(span)
+    }
+}
+
+#[derive(Deserialize)]
+struct IngestParams {
+    project: Option<String>,
+}
+
 async fn traces_ingest<Q: GraphQueries>(
     State(state): State<Arc<AppState<Q>>>,
+    Query(q): Query<IngestParams>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -395,15 +548,42 @@ async fn traces_ingest<Q: GraphQueries>(
         Ok(spans) => spans,
         Err(e) => {
             tracing::warn!(error = %e, "rejected OTLP export");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            return AppError::bad_request(e).into_response();
         }
     };
+    let hint = headers
+        .get("x-hoshizora-project")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or(q.project);
+    let candidates: Vec<Candidate<Q>> = state
+        .candidates()
+        .into_iter()
+        .map(|(id, services, state)| Candidate {
+            id,
+            services,
+            state,
+        })
+        .collect();
     let count = spans.len();
-    let events = state
-        .runtime()
-        .ingest(spans, hoshizora_runtime::now_unix_nanos());
-    for event in events {
-        let _ = state.events.send(event);
+    let mut per_project: Vec<Vec<RuntimeSpan>> = vec![Vec::new(); candidates.len()];
+    for span in spans {
+        match project_for_span(&span, hint.as_deref(), &candidates) {
+            Ok(i) => per_project[i].push(span),
+            Err(e) => return AppError::not_found(&e.to_string()).into_response(),
+        }
+    }
+    for (candidate, spans) in candidates.iter().zip(per_project) {
+        if spans.is_empty() {
+            continue;
+        }
+        let events = candidate
+            .state
+            .runtime()
+            .ingest(spans, hoshizora_runtime::now_unix_nanos());
+        for event in events {
+            let _ = candidate.state.events.send(event);
+        }
     }
     tracing::debug!(spans = count, "ingested OTLP export");
     if content_type
@@ -420,9 +600,7 @@ async fn traces_ingest<Q: GraphQueries>(
     }
 }
 
-async fn runtime_stats<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
-) -> Json<Vec<NodeStats>> {
+async fn runtime_stats<Q: GraphQueries>(Proj(state): Proj<Q>) -> Json<Vec<NodeStats>> {
     Json(state.runtime().stats(hoshizora_runtime::now_unix_nanos()))
 }
 
@@ -432,16 +610,17 @@ struct TracesParams {
 }
 
 async fn runtime_traces<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
+    Proj(state): Proj<Q>,
     Query(p): Query<TracesParams>,
 ) -> Json<Vec<Trace>> {
     Json(state.runtime().traces(p.limit.unwrap_or(50)))
 }
 
 async fn runtime_trace<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
-    axum::extract::Path(trace_id): axum::extract::Path<String>,
+    Proj(state): Proj<Q>,
+    params: RawPathParams,
 ) -> Result<Json<Trace>, AppError> {
+    let trace_id = path_param(&params, "trace_id")?;
     state
         .runtime()
         .trace(&trace_id)
@@ -450,7 +629,7 @@ async fn runtime_trace<Q: GraphQueries>(
 }
 
 async fn stream<Q: GraphQueries>(
-    State(state): State<Arc<AppState<Q>>>,
+    Proj(state): Proj<Q>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|item| match item {
@@ -627,6 +806,9 @@ mod tests {
     }
 
     impl GraphQueries for Fake {
+        fn from_graph(graph: Graph) -> Self {
+            Self { graph }
+        }
         fn graph(&self) -> &Graph {
             &self.graph
         }
@@ -688,12 +870,18 @@ mod tests {
         }
     }
 
-    fn temp_root() -> PathBuf {
+    fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "hoshizora-test-{}-{}",
             std::process::id(),
             rand_suffix()
         ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn temp_root() -> PathBuf {
+        let dir = temp_dir();
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
             dir.join("src/lib.rs"),
@@ -710,9 +898,42 @@ mod tests {
             .as_nanos()
     }
 
-    fn app() -> (Router, Arc<AppState<Fake>>) {
-        let state = AppState::new(Fake::new(), temp_root(), RuntimeConfig::default());
-        (router(Arc::clone(&state)), state)
+    fn fake_indexer() -> crate::projects::Indexer {
+        Arc::new(|_root: &Path| Ok(Fake::new().graph))
+    }
+
+    fn app_state() -> Arc<AppState<Fake>> {
+        AppState::new(
+            temp_dir(),
+            fake_indexer(),
+            RuntimeConfig::default(),
+            Default::default(),
+        )
+    }
+
+    fn path_project(id: &str, root: &Path) -> Project {
+        Project {
+            id: id.into(),
+            name: id.into(),
+            source: hoshizora_model::api::ProjectSource::Path {
+                path: root.display().to_string(),
+            },
+            status: ProjectStatus::Indexing,
+            error: None,
+            commit: None,
+            indexed_at: None,
+            nodes: 0,
+            edges: 0,
+            services: vec![],
+        }
+    }
+
+    fn app() -> (Router, Arc<ProjectState<Fake>>) {
+        let app_state = app_state();
+        let root = temp_root();
+        app_state.insert_ready(path_project("fake", &root), Fake::new(), root, None);
+        let state = app_state.project_state(None).unwrap();
+        (router(app_state), state)
     }
 
     async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -1072,5 +1293,535 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn wait_ready(state: &AppState<Fake>, id: &str) -> Project {
+        for _ in 0..200 {
+            let p = state.get(id).unwrap();
+            if matches!(p.status, ProjectStatus::Ready | ProjectStatus::Failed) {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{id} never finished");
+    }
+
+    #[tokio::test]
+    async fn prefixed_routes_target_their_project_and_unprefixed_the_first() {
+        let app_state = app_state();
+        let root_a = temp_root();
+        let root_b = temp_root();
+        std::fs::write(root_b.join("src/lib.rs"), "b one\nb two\n").unwrap();
+        let mut b = Fake::new();
+        b.graph.nodes.push(node(
+            "fn:src/b.rs#only_in_b",
+            NodeKind::Function,
+            None,
+            None,
+        ));
+        app_state.insert_ready(path_project("a", &root_a), Fake::new(), root_a, None);
+        app_state.insert_ready(path_project("b", &root_b), b, root_b, None);
+        let app = router(Arc::clone(&app_state));
+
+        let (status, list) = get_json(&app, "/api/projects").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list[0]["id"], "a");
+        assert_eq!(list[1]["id"], "b");
+        assert_eq!(list[1]["nodes"], 3);
+        assert_eq!(list[1]["status"], "ready");
+
+        let (_, g) = get_json(&app, "/api/graph").await;
+        assert_eq!(g["nodes"].as_array().unwrap().len(), 2);
+        let (_, g) = get_json(&app, "/api/projects/a/graph").await;
+        assert_eq!(g["nodes"].as_array().unwrap().len(), 2);
+        let (_, g) = get_json(&app, "/api/projects/b/graph?detail=slim").await;
+        assert_eq!(g["nodes"].as_array().unwrap().len(), 3);
+
+        let (status, d) = get_json(&app, "/api/projects/b/nodes/fn:src/b.rs%23only_in_b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(d["node"]["id"], "fn:src/b.rs#only_in_b");
+        let (status, _) = get_json(&app, "/api/projects/a/nodes/fn:src/b.rs%23only_in_b").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_json(&app, "/api/projects/zz/graph").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (_, s) = get_json(&app, "/api/projects/b/source?file=src/lib.rs").await;
+        assert_eq!(s["text"], "b one\nb two");
+        let (_, s) = get_json(&app, "/api/source?file=src/lib.rs&end=1").await;
+        assert_eq!(s["text"], "line one");
+        let (status, _) = get_json(&app, "/api/projects/b/source?file=..%2Fx").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        for uri in [
+            "/api/projects/b/search?q=x",
+            "/api/projects/b/entrypoints",
+            "/api/projects/b/dead",
+            "/api/projects/b/effects?kind=db_write",
+            "/api/projects/b/insights",
+            "/api/projects/b/runtime/stats",
+            "/api/projects/b/runtime/traces",
+            "/api/projects/b/story?from=fn:src/b.rs%23only_in_b",
+            "/api/projects/b/flow?from=fn:src/b.rs%23only_in_b",
+            "/api/projects/b/impact?of=fn:src/b.rs%23only_in_b",
+        ] {
+            let (status, _) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+        }
+        let (status, _) = get_json(&app, "/api/projects/a/flow?from=fn:src/b.rs%23only_in_b").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete("/api/projects/a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let (_, g) = get_json(&app, "/api/graph").await;
+        assert_eq!(g["nodes"].as_array().unwrap().len(), 3, "b is now first");
+        let (status, _) = get_json(&app, "/api/projects/a").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_project_is_404_and_pending_project_is_409() {
+        let app_state = app_state();
+        let app = router(Arc::clone(&app_state));
+        let (status, body) = get_json(&app, "/api/graph").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "project not found");
+
+        let slow: crate::projects::Indexer = Arc::new(|_root: &Path| {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(Fake::new().graph)
+        });
+        let app_state = AppState::new(
+            temp_dir(),
+            slow,
+            RuntimeConfig::default(),
+            Default::default(),
+        );
+        let app = router(Arc::clone(&app_state));
+        let p = app_state.add_path(&temp_root(), None).unwrap();
+        assert_eq!(p.status, ProjectStatus::Indexing);
+        let (status, body) = get_json(&app, &format!("/api/projects/{}/graph", p.id)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], "indexing");
+        let (status, body) = get_json(&app, "/api/search?q=x").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], "indexing");
+        let ready = wait_ready(&app_state, &p.id).await;
+        assert_eq!(ready.status, ProjectStatus::Ready);
+        assert_eq!(ready.nodes, 2);
+        assert!(ready.indexed_at.unwrap().ends_with('Z'));
+        assert!(app_state.graph_path(&p.id).exists());
+        let (status, _) = get_json(&app, "/api/search?q=x").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn registry_round_trips_through_projects_json() {
+        let data_dir = temp_dir();
+        let root = temp_root();
+        let first = AppState::new(
+            data_dir.clone(),
+            fake_indexer(),
+            RuntimeConfig::default(),
+            Default::default(),
+        );
+        let mut p = path_project("fake", &root);
+        p.services = vec!["api".into()];
+        first.insert_ready(p, Fake::new(), root.clone(), None);
+        let mut git = AddProject {
+            url: "https://127.0.0.1:9/DorskFR/hoshizora".into(),
+            ..Default::default()
+        };
+        git.services = vec!["web".into()];
+        let added = first.add_git(git.clone()).unwrap();
+        assert_eq!(added.id, "dorskfr-hoshizora");
+        assert_eq!(added.status, ProjectStatus::Cloning);
+        assert_eq!(
+            first.add_git(git).unwrap().id,
+            added.id,
+            "same url → same project"
+        );
+        let other = first
+            .add_git(AddProject {
+                url: "https://127.0.0.1:9/dorskfr/hoshizora.git".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(other.id, "dorskfr-hoshizora-2");
+        wait_ready(&first, &added.id).await;
+        wait_ready(&first, &other.id).await;
+        assert_eq!(first.get(&added.id).unwrap().status, ProjectStatus::Failed);
+
+        let saved: Vec<Project> =
+            serde_json::from_str(&std::fs::read_to_string(data_dir.join("projects.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[0].id, "fake");
+        assert_eq!(saved[0].services, vec!["api".to_string()]);
+        assert_eq!(saved[1].services, vec!["web".to_string()]);
+        assert_eq!(saved[1].status, ProjectStatus::Failed);
+        assert!(
+            saved[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("git clone failed")
+        );
+
+        let second: Arc<AppState<Fake>> = AppState::new(
+            data_dir,
+            fake_indexer(),
+            RuntimeConfig::default(),
+            Default::default(),
+        );
+        assert_eq!(second.restore().unwrap(), 3);
+        let restored = second.list();
+        assert_eq!(restored[0].id, "fake");
+        assert_eq!(
+            restored[0].status,
+            ProjectStatus::Ready,
+            "graph file was loaded"
+        );
+        assert_eq!(
+            restored[1].status,
+            ProjectStatus::Cloning,
+            "clone missing → re-clone"
+        );
+        assert!(second.project_state(Some("fake")).is_ok());
+        let err = second
+            .project_state(Some("dorskfr-hoshizora"))
+            .err()
+            .unwrap();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn add_project_validates_url_and_returns_202() {
+        let app_state = app_state();
+        let app = router(Arc::clone(&app_state));
+        for bad in [
+            "file:///etc",
+            "/tmp/repo",
+            "../x",
+            "http://github.com/a/b",
+            "-c x",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::json!({ "url": bad }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "url": "https://github.com/Tokio-RS/mini-redis", "name": "redis", "ref": "--bad" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "url": "https://github.com/Tokio-RS/mini-redis", "name": "redis" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["id"], "tokio-rs-mini-redis");
+        assert_eq!(body["name"], "redis");
+        assert_eq!(body["source"]["kind"], "git");
+        assert_eq!(body["status"], "cloning");
+        let (status, p) = get_json(&app, "/api/projects/tokio-rs-mini-redis").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(p["id"], "tokio-rs-mini-redis");
+        wait_ready(&app_state, "tokio-rs-mini-redis").await;
+    }
+
+    fn export_for(service: &str, trace: u8, attrs: Vec<KeyValue>) -> Vec<u8> {
+        let mut req = export(trace, 1, None, span::SpanKind::Internal, 10, 20, attrs);
+        req.resource_spans[0].resource.as_mut().unwrap().attributes =
+            vec![kv("service.name", service)];
+        req.encode_to_vec()
+    }
+
+    async fn post_to(
+        app: &Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> StatusCode {
+        let mut req = Request::post(uri).header(header::CONTENT_TYPE, "application/x-protobuf");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        app.clone()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn otlp_routes_by_service_name_header_query_and_code_location() {
+        let app_state = app_state();
+        let root_a = temp_root();
+        let root_b = temp_root();
+        let mut pa = path_project("a", &root_a);
+        pa.services = vec!["svc-a".into()];
+        app_state.insert_ready(pa, Fake::new(), root_a, None);
+        let mut b = Fake::new();
+        b.graph.nodes[0].file = Some("src/b.rs".into());
+        b.graph.nodes[0].id = "fn:src/b.rs#B::go".into();
+        app_state.insert_ready(path_project("b", &root_b), b, root_b, None);
+        let app = router(Arc::clone(&app_state));
+        let a = app_state.project_state(Some("a")).unwrap();
+        let b = app_state.project_state(Some("b")).unwrap();
+        let mut rx_a = a.events.subscribe();
+        let mut rx_b = b.events.subscribe();
+
+        let loc_b = vec![
+            kv("code.file.path", "/x/src/b.rs"),
+            kv("code.line.number", "2"),
+        ];
+        assert_eq!(
+            post_to(
+                &app,
+                "/v1/traces",
+                &[],
+                export_for("svc-a", 1, loc_b.clone())
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_to(
+                &app,
+                "/v1/traces",
+                &[("x-hoshizora-project", "b")],
+                export_for("other", 2, vec![])
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_to(
+                &app,
+                "/v1/traces?project=b",
+                &[],
+                export_for("other", 3, vec![])
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_to(&app, "/v1/traces", &[], export_for("other", 4, loc_b)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_to(&app, "/v1/traces", &[], export_for("other", 5, vec![])).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_to(
+                &app,
+                "/v1/traces",
+                &[("x-hoshizora-project", "nope")],
+                export_for("other", 6, vec![])
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        let (_, ta) = get_json(&app, "/api/projects/a/runtime/traces").await;
+        let (_, tb) = get_json(&app, "/api/projects/b/runtime/traces").await;
+        let ids = |t: &serde_json::Value| -> Vec<String> {
+            let mut v: Vec<String> = t
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["trace_id"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&ta), vec!["01".repeat(16), "05".repeat(16)]);
+        assert_eq!(
+            ids(&tb),
+            vec!["02".repeat(16), "03".repeat(16), "04".repeat(16)]
+        );
+        let (_, unprefixed) = get_json(&app, "/api/runtime/traces").await;
+        assert_eq!(ids(&unprefixed), ids(&ta));
+
+        let mut seen_a = 0;
+        while rx_a.try_recv().is_ok() {
+            seen_a += 1;
+        }
+        let mut seen_b = 0;
+        while rx_b.try_recv().is_ok() {
+            seen_b += 1;
+        }
+        assert_eq!((seen_a, seen_b), (2, 3));
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn clones_indexes_reindexes_and_deletes_a_local_bare_repo() {
+        let dir = temp_dir();
+        let work = dir.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "one"]);
+        let first_commit = git(&work, &["rev-parse", "HEAD"]);
+        let bare = dir.join("origin.git");
+        git(
+            &dir,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        let indexer: crate::projects::Indexer =
+            Arc::new(|root: &Path| crate::build_graph(root, None));
+        let app_state: Arc<AppState<crate::queries::GraphIndex>> = AppState::new(
+            dir.join("data"),
+            indexer,
+            RuntimeConfig::default(),
+            crate::git::GitOptions {
+                allow_file_urls: true,
+                timeout: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        );
+        let app = router(Arc::clone(&app_state));
+        let url = format!("file://{}", bare.display());
+        let p = app_state
+            .add_git(AddProject {
+                url: url.clone(),
+                r#ref: Some("main".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(p.id.ends_with("-origin"), "{}", p.id);
+        let id = p.id.clone();
+        let wait = |id: String| {
+            let s = Arc::clone(&app_state);
+            async move {
+                for _ in 0..400 {
+                    let p = s.get(&id).unwrap();
+                    if matches!(p.status, ProjectStatus::Ready | ProjectStatus::Failed) {
+                        return p;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("never finished")
+            }
+        };
+        let ready = wait(p.id.clone()).await;
+        assert_eq!(ready.status, ProjectStatus::Ready, "{:?}", ready.error);
+        assert_eq!(ready.commit.as_deref(), Some(first_commit.as_str()));
+        assert!(ready.nodes > 0);
+        assert!(app_state.repo_dir(&p.id).join("src/lib.rs").exists());
+        let (status, hits) = get_json(&app, &format!("/api/projects/{id}/search?q=alpha")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            hits.as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["node"]["name"] == "alpha" || h["name"] == "alpha"),
+            "{hits}"
+        );
+        let (status, src) =
+            get_json(&app, &format!("/api/projects/{id}/source?file=src/lib.rs")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(src["text"], "pub fn alpha() {}");
+
+        std::fs::write(
+            work.join("src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )
+        .unwrap();
+        git(&work, &["commit", "-q", "-am", "two"]);
+        git(&work, &["push", "-q", bare.to_str().unwrap(), "main"]);
+        let second_commit = git(&work, &["rev-parse", "HEAD"]);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/projects/{id}/reindex"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let ready2 = wait(p.id.clone()).await;
+        assert_eq!(ready2.status, ProjectStatus::Ready, "{:?}", ready2.error);
+        assert_eq!(ready2.commit.as_deref(), Some(second_commit.as_str()));
+        assert!(ready2.nodes > ready.nodes);
+        let (_, g) = get_json(&app, &format!("/api/projects/{id}/graph?detail=slim")).await;
+        assert!(
+            g["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["name"] == "beta")
+        );
+
+        app_state.remove(&id).unwrap();
+        assert!(!app_state.repo_dir(&id).exists());
+        assert!(!app_state.graph_path(&id).exists());
+        assert!(app_state.list().is_empty());
     }
 }

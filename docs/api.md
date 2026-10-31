@@ -7,22 +7,28 @@ JSON; types live in `crates/hoshizora-model`.
 ## Projects
 
 One server holds several projects. Every `/api/...` endpoint below is also served under
-`/api/projects/{project}/...`; the unprefixed form targets the first registered project.
+`/api/projects/{project}/...`; the unprefixed form targets the first registered project
+(`404` when none is registered). Requests to a project that is still `cloning`/`indexing`
+or has `failed` get `409 {"error", "status"}`. Errors are JSON `{"error": "..."}`.
 
 | Method | Path | Response |
 | --- | --- | --- |
 | GET | `/api/projects` | `Project[]` |
 | POST | `/api/projects` | body `AddProject` (`{url, ref?, name?, services?}`) → `202 Project`. Shallow-clones the git URL into the data dir and indexes it in the background; poll until `status` is `ready` or `failed`. Adding a URL that is already registered returns the existing project. |
 | GET | `/api/projects/{project}` | `Project` |
-| POST | `/api/projects/{project}/reindex` | `202 Project`: fetch the latest commit and rebuild |
-| DELETE | `/api/projects/{project}` | `204` |
+| POST | `/api/projects/{project}/reindex` | `202 Project`: fetch the latest commit and rebuild; `409` while a rebuild is already running |
+| DELETE | `/api/projects/{project}` | `204`, removes the clone and the graph |
+
+`id` is `owner-repo` of the URL, lowercased (`dorskfr-hoshizora`); only `https://`, `ssh://`
+and `git@host:path` URLs are accepted. `ref` may be a branch or tag.
 
 Private GitHub repositories are cloned with `HOSHIZORA_GIT_TOKEN` when set. The project list
 persists in `<data-dir>/projects.json` and is restored on start.
 
 Spans go to the project whose `services` contains the resource's `service.name`; otherwise to
 the project named by the `x-hoshizora-project` header or `?project=` on `/v1/traces`; otherwise
-to the project their `code.filepath` resolves in.
+to the project their `code.filepath` resolves in; otherwise to the first project. Each project
+has its own runtime stats, traces, insights and `runtime/stream`.
 
 ## Graph
 
