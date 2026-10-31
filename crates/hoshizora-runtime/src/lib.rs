@@ -4,6 +4,7 @@ pub mod config;
 pub mod insights;
 pub mod join;
 pub mod otlp;
+pub mod route;
 pub mod stats;
 pub mod store;
 
@@ -92,6 +93,11 @@ impl<L: NodeLookup> Runtime<L> {
             events.push(LiveEvent::Span { span });
         }
         events
+    }
+
+    /// Whether `span`'s code location resolves to a function of this graph.
+    pub fn locates(&self, span: &RuntimeSpan) -> bool {
+        join::locates(span, &self.lookup, &self.cache)
     }
 
     pub fn stats(&self, now_unix_nanos: u64) -> Vec<NodeStats> {

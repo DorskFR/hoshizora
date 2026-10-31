@@ -70,6 +70,10 @@ pub(crate) struct Ctx<'a> {
     /// Per file: local name → type node.
     pub type_by_file_local: Vec<HashMap<String, usize>>,
     pub type_by_name: HashMap<String, Vec<usize>>,
+    /// Type node → field name → declared type or initialiser (`useX()`, `Store`).
+    pub type_fields: HashMap<usize, HashMap<String, String>>,
+    /// Package name (dashes as underscores) → package node.
+    pub package_names: HashMap<String, usize>,
     /// Normalised module key (`a/b/c`) → files.
     pub module_files: HashMap<String, Vec<usize>>,
     pub counters: BTreeMap<&'static str, u32>,
@@ -163,6 +167,8 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
         fn_by_type_method: HashMap::new(),
         type_by_file_local: vec![HashMap::new(); files.len()],
         type_by_name: HashMap::new(),
+        type_fields: HashMap::new(),
+        package_names: HashMap::new(),
         module_files: HashMap::new(),
         counters: BTreeMap::new(),
         warnings: Vec::new(),
@@ -245,7 +251,7 @@ fn build_files_and_symbols(ctx: &mut Ctx) {
             ctx.module_files.entry(key).or_default().push(fi);
         }
 
-        for (si, sym) in file.symbols.iter().enumerate() {
+        for sym in &file.symbols {
             if matches!(sym.kind, SymbolKind::Type | SymbolKind::Interface) {
                 let id = type_id(&file.path, &sym.local_name);
                 let n = ctx.add_node(Node {
@@ -268,8 +274,15 @@ fn build_files_and_symbols(ctx: &mut Ctx) {
                     .entry(sym.name.clone())
                     .or_default()
                     .push(n);
+                let fields: HashMap<String, String> = sym
+                    .params
+                    .iter()
+                    .filter_map(|p| Some((p.name.clone(), p.ty.clone()?)))
+                    .collect();
+                if !fields.is_empty() {
+                    ctx.type_fields.insert(n, fields);
+                }
                 ctx.simple_edge(file_node, n, EdgeKind::Contains, Confidence::Exact);
-                let _ = si;
             }
         }
 

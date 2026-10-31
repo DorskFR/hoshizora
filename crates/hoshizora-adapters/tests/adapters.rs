@@ -762,3 +762,108 @@ fn index_tree_walks_and_resolves_modules() {
         "pkg.mod"
     );
 }
+
+#[test]
+fn typescript_object_methods_fields_and_refs() {
+    let facts = TsAdapter(Flavor::TypeScript)
+        .parse(
+            "src/objects.ts",
+            include_str!("fixtures/objects.ts"),
+            "src/objects",
+        )
+        .unwrap();
+
+    let session = sym(&facts, "keys.session");
+    assert_eq!(session.kind, SymbolKind::Method);
+    assert_eq!(session.parent.as_deref(), Some("keys"));
+    assert_eq!(session.visibility, Visibility::Public);
+    assert_eq!(sym(&facts, "keys.all").parent.as_deref(), Some("keys"));
+    assert!(!facts.symbols.iter().any(|s| s.name == "<module>"));
+
+    let spawn = sym(&facts, "useSessionActions.spawn");
+    assert_eq!(spawn.parent.as_deref(), Some("useSessionActions"));
+    assert_eq!(call(spawn, "endpoints.spawn").line, 14);
+    let archive = sym(&facts, "useSessionActions.archive");
+    assert_eq!(
+        call(archive, "api.post").string_args,
+        vec!["/sessions/{}/archive"]
+    );
+    let factory = sym(&facts, "useSessionActions");
+    assert!(names(factory).contains(&"api.get"));
+    assert!(
+        !names(factory).contains(&"endpoints.spawn"),
+        "{:?}",
+        names(factory)
+    );
+    assert!(!names(factory).contains(&"api.post"));
+
+    let form = sym(&facts, "SpawnForm");
+    let fields: Vec<(&str, Option<&str>)> = form
+        .params
+        .iter()
+        .map(|p| (p.name.as_str(), p.ty.as_deref()))
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            ("actions", Some("useSessionActions()")),
+            ("store", Some("Store")),
+            ("files", Some("File[]")),
+            ("client", Some("Client")),
+        ]
+    );
+
+    let submit = sym(&facts, "SpawnForm.submit");
+    let spawn_call = call(submit, "this.actions.spawn");
+    assert_eq!(spawn_call.receiver.as_deref(), Some("this.actions"));
+    assert!(spawn_call.awaited);
+    assert!(names(submit).contains(&"show"), "{:?}", names(submit));
+    assert!(!names(submit).contains(&"body"), "{:?}", names(submit));
+    assert!(names(submit).contains(&"this.files"));
+}
+
+#[test]
+fn rust_message_sites() {
+    let facts = RustAdapter
+        .parse(
+            "src/launch.rs",
+            include_str!("fixtures/messages.rs"),
+            "app::launch",
+        )
+        .unwrap();
+    let launch = sym(&facts, "launch");
+    let sent: Vec<(&str, u32, Option<&str>)> = launch
+        .body
+        .as_ref()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| c.callee == "<message>")
+        .map(|c| (c.string_args[0].as_str(), c.line, c.receiver.as_deref()))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            ("FrameDown::Command", 5, Some("bus")),
+            ("FrameDown::Reconcile", 6, Some("bus")),
+        ]
+    );
+    let handle = sym(&facts, "handle");
+    let matched: Vec<(&str, u32)> = handle
+        .body
+        .as_ref()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| c.callee == "<match>")
+        .map(|c| (c.string_args[0].as_str(), c.line))
+        .collect();
+    assert_eq!(
+        matched,
+        vec![
+            ("FrameDown::Command", 13),
+            ("FrameDown::Reconcile", 14),
+            ("FrameDown::Ack", 20),
+        ]
+    );
+}

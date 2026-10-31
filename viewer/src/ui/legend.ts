@@ -48,19 +48,42 @@ export class Legend {
         this.store.emit("view", undefined);
       },
     });
+    const tests = h("input", {
+      type: "checkbox",
+      id: "lg-tests",
+      onchange: () => {
+        this.store.hideTests = !tests.checked;
+        this.store.emit("view", undefined);
+      },
+    });
+    const routes = h("input", {
+      type: "checkbox",
+      id: "lg-routes",
+      onchange: () => {
+        this.store.foldRoutes = !routes.checked;
+        this.store.emit("view", undefined);
+      },
+    });
     const colorBy = h(
       "select",
       { "aria-label": "Colour nodes by", onchange: () => onColorBy(colorBy.value as ColorBy) },
       h("option", { value: "effect" }, "Colour: effect"),
       h("option", { value: "package" }, "Colour: package"),
     );
-    this.el = h(
-      "aside",
-      { class: "legend", "aria-label": "Legend" },
+    const details = h(
+      "details",
+      { class: "legend-details" },
+      h("summary", null, "Map options & legend"),
       h(
         "div",
         { class: "legend-row" },
         colorBy,
+        h("label", { class: "check" }, tests, " tests"),
+        h("label", { class: "check" }, routes, " routes as nodes"),
+      ),
+      h(
+        "div",
+        { class: "legend-row" },
         h("label", { class: "check" }, transitive, " transitive effects"),
         h("label", { class: "check" }, deps, " dependencies"),
       ),
@@ -96,6 +119,7 @@ export class Legend {
         h("span", { class: "legend-item" }, h("i", { class: "dim-swatch" }), "name/heuristic edge"),
       ),
     );
+    this.el = h("aside", { class: "legend", "aria-label": "Map options and legend" }, details);
   }
 
   private effectToggle(kind: EffectKind): HTMLElement {

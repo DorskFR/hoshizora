@@ -1,16 +1,20 @@
 //! Graph access the server and CLI need, so handlers can be tested against a fake.
 
 use hoshizora_core::Index;
-use hoshizora_model::api::{Impact, SearchHit, Subgraph};
+use hoshizora_model::api::{Impact, SearchHit, Story, Subgraph};
 use hoshizora_model::{Edge, EdgeKind, EffectKind, Graph, Insight, Node};
 use hoshizora_runtime::NodeLookup;
 
 pub trait GraphQueries: NodeLookup + 'static {
+    fn from_graph(graph: Graph) -> Self
+    where
+        Self: Sized;
     fn graph(&self) -> &Graph;
     fn incoming(&self, id: &str) -> Vec<Edge>;
     fn outgoing(&self, id: &str) -> Vec<Edge>;
     fn flow(&self, from: &str, depth: u32, kinds: &[EdgeKind]) -> Option<Subgraph>;
     fn impact(&self, of: &str, depth: u32) -> Option<Impact>;
+    fn story(&self, from: &str, depth: u32) -> Option<Story>;
     fn dead(&self) -> Vec<Node>;
     fn entrypoints(&self) -> Vec<Node>;
     fn with_effect(&self, kind: EffectKind, target: Option<&str>) -> Vec<Node>;
@@ -42,6 +46,9 @@ impl NodeLookup for GraphIndex {
 }
 
 impl GraphQueries for GraphIndex {
+    fn from_graph(graph: Graph) -> Self {
+        Self::new(graph)
+    }
     fn graph(&self) -> &Graph {
         self.0.graph()
     }
@@ -56,6 +63,9 @@ impl GraphQueries for GraphIndex {
     }
     fn impact(&self, of: &str, depth: u32) -> Option<Impact> {
         self.0.impact(of, depth)
+    }
+    fn story(&self, from: &str, depth: u32) -> Option<Story> {
+        self.0.story(from, depth)
     }
     fn dead(&self) -> Vec<Node> {
         self.0.dead().into_iter().cloned().collect()

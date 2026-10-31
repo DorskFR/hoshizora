@@ -5,11 +5,11 @@
 //! names on a pack stoplist (`map`, `expect`, `push`...) are left unresolved unless an import
 //! or the receiver type pins them down.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use hoshizora_model::{CallSite, Confidence, Edge, EdgeKind, FileFacts, Language, NodeKind};
 
-use super::packages::normalise;
+use super::packages::{self, normalise};
 use super::{Ctx, FileScope, ImportTarget, effects};
 
 /// Names matching more candidates than this are dropped rather than guessed.
@@ -33,7 +33,7 @@ pub(crate) fn family(language: Language) -> Family {
 }
 
 pub(crate) fn build_scopes(ctx: &mut Ctx) {
-    let package_names: HashMap<String, usize> = ctx
+    ctx.package_names = ctx
         .nodes
         .iter()
         .enumerate()
@@ -53,7 +53,7 @@ pub(crate) fn build_scopes(ctx: &mut Ctx) {
                 Some(base) => (base.to_owned(), true),
                 None => (imp.path.clone(), imp.names.iter().any(|n| n == "*")),
             };
-            let files = resolve_import(ctx, fi, &path, &package_names);
+            let files = resolve_import(ctx, fi, &path);
             let dependency = if files.is_empty() {
                 dependency_name(file, &path)
             } else {
@@ -92,7 +92,7 @@ pub(crate) fn build_scopes(ctx: &mut Ctx) {
                     || file.language == Language::Python
                     || name.contains("::")
                 {
-                    resolve_import(ctx, fi, &sub, &package_names)
+                    resolve_import(ctx, fi, &sub)
                 } else {
                     Vec::new()
                 };
@@ -233,12 +233,8 @@ fn probe(ctx: &Ctx, key: &str, restrict: Option<usize>) -> Vec<usize> {
 }
 
 /// Files an import path refers to, empty when it points outside the repo.
-fn resolve_import(
-    ctx: &Ctx,
-    fi: usize,
-    path: &str,
-    package_names: &HashMap<String, usize>,
-) -> Vec<usize> {
+fn resolve_import(ctx: &Ctx, fi: usize, path: &str) -> Vec<usize> {
+    let package_names = &ctx.package_names;
     let file = &ctx.files[fi];
     let own_pkg = ctx.package_of_file[fi];
     let dir = file.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -571,6 +567,28 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
         }
     }
 
+    // `routes::spawn::handler` / `crate::spawn::handler`: the leading segments name a module.
+    if language == Language::Rust
+        && segments.len() >= 3
+        && let Some(cands) = module_path_call(ctx, fi, &segments, &name)
+    {
+        return limited(ctx, &scope, cands, Confidence::Exact, false);
+    }
+
+    // `this.field.method()` / `param.field.method()` through the field's declared type.
+    if let Some(receiver) = &call.receiver
+        && let Some((base, field)) = receiver.rsplit_once('.')
+        && !base.contains('.')
+        && let Some(cands) = field_typed_call(ctx, f, base, field, &name)
+    {
+        let confidence = if cands.len() == 1 {
+            Confidence::Exact
+        } else {
+            Confidence::Name
+        };
+        return limited(ctx, &scope, cands, confidence, true);
+    }
+
     // `self.method()` / `Self::method()` / `Type::method()` on the enclosing type.
     let sym = ctx.symbol(f);
     if let Some(parent) = ctx.fns[f].parent_type {
@@ -663,6 +681,125 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
         }
     }
     Vec::new()
+}
+
+/// Functions named `name` in the module spelled by `segments[..n-1]`, resolved like a `use`.
+fn module_path_call(ctx: &Ctx, fi: usize, segments: &[String], name: &str) -> Option<Vec<usize>> {
+    let n = segments.len();
+    let first = segments[0].as_str();
+    let module = if matches!(first, "crate" | "self" | "super") {
+        segments[..n - 1].join("::")
+    } else {
+        let imp = ctx.files[fi].imports.iter().find(|i| {
+            i.names.iter().any(|x| x == first)
+                || i.alias.as_deref() == Some(first)
+                || i.path.rsplit("::").next() == Some(first)
+        })?;
+        let mut path = imp.path.clone();
+        if imp.names.iter().any(|x| x == first) {
+            if !path.is_empty() {
+                path.push_str("::");
+            }
+            path.push_str(first);
+        }
+        for seg in &segments[1..n - 1] {
+            path.push_str("::");
+            path.push_str(seg);
+        }
+        path
+    };
+    let files = resolve_import(ctx, fi, &module);
+    // The module's own path below the crate root; a prefix hit (`a/b` for `a/b/c`) is not it.
+    let tail = module
+        .split("::")
+        .skip_while(|s| matches!(*s, "crate" | "self" | "super"))
+        .collect::<Vec<_>>()
+        .join("/");
+    let relative = matches!(first, "self" | "super");
+    let mut cands = Vec::new();
+    for tf in files {
+        let exact = relative
+            || packages::module_keys(&ctx.files[tf])
+                .iter()
+                .any(|k| *k == tail || k.ends_with(&format!("/{tail}")));
+        if !exact {
+            continue;
+        }
+        if let Some(&c) = ctx.fn_by_file_local[tf].get(name) {
+            cands.push(c);
+        } else if let Some(v) = ctx.fn_by_file_name[tf].get(name) {
+            cands.extend(v.iter().copied());
+        }
+    }
+    (!cands.is_empty()).then_some(cands)
+}
+
+/// Methods named `name` on the type of `base.field`, where `base` is `self`/`this` or a typed
+/// parameter and the field's type is declared or inferred from its initialiser.
+fn field_typed_call(
+    ctx: &Ctx,
+    f: usize,
+    base: &str,
+    field: &str,
+    name: &str,
+) -> Option<Vec<usize>> {
+    let fi = ctx.fns[f].file;
+    let base_types: Vec<usize> = if is_self(base) {
+        ctx.fns[f].parent_type.into_iter().collect()
+    } else {
+        let ty = ctx
+            .symbol(f)
+            .params
+            .iter()
+            .find(|p| p.name == base)?
+            .ty
+            .as_deref()
+            .map(type_short_name)?;
+        types_named(ctx, fi, &ty)
+    };
+    let mut cands = Vec::new();
+    for t in base_types {
+        let Some(ty) = ctx.type_fields.get(&t).and_then(|m| m.get(field)) else {
+            continue;
+        };
+        let key = type_short_name(ty.strip_suffix("()").unwrap_or(ty));
+        if let Some(v) = type_methods(ctx, &key, name) {
+            cands.extend(v);
+        }
+    }
+    cands.sort_unstable();
+    cands.dedup();
+    (!cands.is_empty()).then_some(cands)
+}
+
+/// Type nodes a name refers to from `fi`: through an import, in the file, else by name
+/// within the file's package.
+fn types_named(ctx: &Ctx, fi: usize, name: &str) -> Vec<usize> {
+    if let Some(&imp) = ctx.scopes[fi].bindings.get(name)
+        && let Some(tf) = ctx.scopes[fi].imports[imp].file
+        && let Some(&t) = ctx.type_by_file_local[tf].get(name)
+    {
+        return vec![t];
+    }
+    if let Some(&t) = ctx.type_by_file_local[fi].get(name) {
+        return vec![t];
+    }
+    let pkg = ctx.package_of_file[fi];
+    ctx.type_by_name
+        .get(name)
+        .map(|v| {
+            v.iter()
+                .copied()
+                .filter(|&t| {
+                    ctx.nodes[t]
+                        .file
+                        .as_deref()
+                        .and_then(|p| ctx.files.iter().position(|f| f.path == p))
+                        .is_some_and(|tf| ctx.package_of_file[tf] == pkg)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn prefer_sibling(ctx: &Ctx, f: usize, cands: Vec<usize>) -> Vec<usize> {

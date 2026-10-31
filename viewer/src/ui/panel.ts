@@ -5,9 +5,46 @@ import { clear, fmtNanos, fmtRate, h, shortId } from "./dom";
 import { highlight, shikiLang } from "./highlight";
 
 export interface PanelActions {
-  flow(id: string): void;
+  story(id: string): void;
   impact(id: string): void;
+  browseFlows(): void;
 }
+
+const SECTIONS_KEY = "hoshizora.sections";
+const DEFAULT_OPEN: Record<string, boolean> = {
+  effects: true,
+  source: true,
+  signature: false,
+  runtime: false,
+  edges: false,
+};
+
+function sectionState(): Record<string, boolean> {
+  try {
+    return { ...DEFAULT_OPEN, ...JSON.parse(localStorage.getItem(SECTIONS_KEY) ?? "{}") };
+  } catch {
+    return { ...DEFAULT_OPEN };
+  }
+}
+
+/** A collapsible panel section whose open state is remembered across nodes and reloads. */
+function section(key: string, title: string | Node, ...body: (Node | false | null)[]): HTMLElement {
+  const details = h(
+    "details",
+    { class: `section section-${key}` },
+    h("summary", null, title),
+    ...body,
+  );
+  details.open = sectionState()[key] ?? true;
+  details.addEventListener("toggle", () => {
+    const state = sectionState();
+    state[key] = details.open;
+    localStorage.setItem(SECTIONS_KEY, JSON.stringify(state));
+  });
+  return details;
+}
+
+const STORY_KINDS = new Set(["function", "route", "type"]);
 
 export class NodePanel {
   readonly el: HTMLElement;
@@ -32,11 +69,21 @@ export class NodePanel {
       h(
         "div",
         { class: "empty" },
-        h("p", null, "Click a node to inspect it."),
+        h("p", { class: "lead" }, "What happens when someone clicks a button?"),
+        h(
+          "button",
+          { class: "primary big", onclick: () => this.actions.browseFlows() },
+          "▶ Browse flows",
+        ),
         h(
           "p",
           { class: "muted" },
-          "Double-click a package or file to expand it. Keys: / search, f flow, i impact, Esc clear.",
+          "Pick a UI action, HTTP route or command to see its story: a step-by-step diagram across the UI, services, workers and databases.",
+        ),
+        h(
+          "p",
+          { class: "muted small" },
+          "Or search ( / ) for a symbol, or click a star in the map. Double-click a package to open it.",
         ),
       ),
     );
@@ -88,7 +135,7 @@ export class NodePanel {
         h(
           "button",
           { onclick: () => this.store.toggleExpanded(id) },
-          this.store.expanded.has(id) ? "Collapse" : "Expand",
+          this.store.expanded.has(id) ? "Collapse in map" : "Expand in map",
         ),
       ),
       h("h3", null, `${children.length} children`),
@@ -118,6 +165,7 @@ export class NodePanel {
     const root = this.store.graph.meta.root.replace(/\/$/, "");
     const editorHref = n.file ? `vscode://file/${root}/${n.file}:${n.span?.start_line ?? 1}` : null;
     const stats = d.stats ?? this.store.stats.get(n.id) ?? null;
+    const route = this.store.index.in.get(n.id)?.find((e) => e.kind === "handles");
 
     this.body.append(
       h(
@@ -130,184 +178,224 @@ export class NodePanel {
           n.entrypoint &&
             h("span", { class: "chip entry" }, `entrypoint · ${n.entrypoint.replace("_", " ")}`),
           n.dead && h("span", { class: "chip dead" }, "dead"),
+          route && h("span", { class: "chip mono" }, this.store.index.node(route.from)?.name ?? ""),
         ),
         h("h2", null, n.name),
-        h("div", { class: "muted mono wrap" }, n.qualified_name),
         n.file &&
           h(
             "div",
-            { class: "muted mono" },
+            { class: "muted mono wrap small" },
             `${n.file}${n.span ? `:${n.span.start_line}–${n.span.end_line}` : ""}`,
           ),
       ),
       h(
         "div",
         { class: "actions" },
-        h("button", { onclick: () => this.actions.flow(n.id), title: "f" }, "Flow from here"),
+        STORY_KINDS.has(n.kind) &&
+          h(
+            "button",
+            {
+              class: "primary",
+              onclick: () => this.actions.story(n.id),
+              title: "Step-by-step diagram of what this triggers (s)",
+            },
+            "▶ Story",
+          ),
         h(
           "button",
           { onclick: () => this.actions.impact(n.id), title: "i" },
           "Impact of changing this",
         ),
-        h("button", { onclick: () => this.copyQuery(n.id) }, "Copy as agent query"),
+        h("button", { onclick: () => this.copyQuery(n.id) }, "Copy agent query"),
         editorHref && h("a", { class: "button", href: editorHref }, "Open in editor"),
       ),
     );
+    if (f?.doc) this.body.append(h("p", { class: "doc" }, f.doc));
 
-    if (f) {
-      this.body.append(h("pre", { class: "signature mono" }, f.signature));
-      if (f.doc) this.body.append(h("p", { class: "doc" }, f.doc));
-      if (f.params.length) {
-        this.body.append(
-          h("h3", null, "Parameters"),
-          h(
-            "table",
-            { class: "params" },
-            h(
-              "thead",
-              null,
-              h("tr", null, h("th", null, "name"), h("th", null, "type"), h("th", null, "default")),
-            ),
-            h(
-              "tbody",
-              null,
-              ...f.params.map((p) =>
-                h(
-                  "tr",
-                  null,
-                  h("td", { class: "mono" }, p.name),
-                  h("td", { class: "mono muted" }, p.ty ?? "—"),
-                  h("td", { class: "mono muted" }, p.default ?? "—"),
-                ),
-              ),
-            ),
-          ),
-        );
-      }
+    this.body.append(this.renderEffects(n));
+
+    if (d.source) {
+      const text = dedent(d.source.text);
+      const code = h("div", { class: "code" }, h("pre", { class: "plain-code mono" }, text));
       this.body.append(
-        h(
-          "dl",
-          { class: "facts" },
-          h("dt", null, "returns"),
-          h("dd", { class: "mono" }, f.returns ?? "—"),
-          h("dt", null, "flags"),
+        section(
+          "source",
           h(
-            "dd",
+            "span",
             null,
-            [
-              f.is_async && "async",
-              f.is_method && "method",
-              f.recursive && "recursive",
-              f.visibility,
-            ]
-              .filter(Boolean)
-              .join(" · "),
+            "Source ",
+            h(
+              "span",
+              { class: "muted mono small" },
+              `${d.source.file.split("/").pop()}:${d.source.start_line}`,
+            ),
           ),
-          f.attributes.length > 0 && h("dt", null, "attributes"),
-          f.attributes.length > 0 &&
-            h("dd", { class: "mono" }, f.attributes.map((a) => `@${a}`).join(" ")),
-          h("dt", null, "complexity"),
-          h(
-            "dd",
-            null,
-            h("span", { class: "mono" }, `${f.complexity.time} time · ${f.complexity.space} space`),
-            h("div", { class: "muted small" }, f.complexity.basis.join("; ")),
-          ),
-          h("dt", null, "cyclomatic"),
-          h(
-            "dd",
-            null,
-            `${f.cyclomatic} · ${f.branches} branches · ${f.loops} loops (depth ${f.max_loop_depth})`,
-          ),
-          h("dt", null, "fan"),
-          h("dd", null, `in ${f.fan_in} · out ${f.fan_out}`),
+          code,
         ),
       );
-    }
-
-    this.body.append(h("h3", null, "Effects"));
-    if (n.effects.direct.length === 0 && n.effects.transitive.length === 0) {
-      this.body.append(h("p", { class: "muted" }, "none"));
-    } else {
-      if (n.effects.direct.length) {
-        this.body.append(
-          h(
-            "ul",
-            { class: "effects" },
-            ...n.effects.direct.map((e) =>
-              h(
-                "li",
-                null,
-                h(
-                  "span",
-                  { class: "fx", style: { color: EFFECT_COLORS[e.kind] } },
-                  `${EFFECT_ICONS[e.kind]} ${e.kind}`,
-                ),
-                e.target && h("span", { class: "mono" }, ` ${e.target}`),
-                h(
-                  "span",
-                  { class: "muted" },
-                  ` via ${e.via} · L${e.line}${e.loop_depth > 0 ? ` · in loop ×${e.loop_depth}` : ""}${e.awaited ? " · awaited" : ""}`,
-                ),
-              ),
-            ),
-          ),
-        );
-      }
-      const transitiveOnly = n.effects.transitive.filter(
-        (k) => !n.effects.direct.some((e) => e.kind === k),
-      );
-      if (transitiveOnly.length) {
-        this.body.append(
-          h(
-            "div",
-            { class: "chips" },
-            h("span", { class: "muted small" }, "transitive: "),
-            ...transitiveOnly.map((k) =>
-              h(
-                "span",
-                { class: "chip", style: { borderColor: EFFECT_COLORS[k] } },
-                `${EFFECT_ICONS[k]} ${k}`,
-              ),
-            ),
-          ),
-        );
-      }
-    }
-
-    this.body.append(this.renderStats(stats));
-    if (d.source) {
-      const code = h(
-        "div",
-        { class: "code" },
-        h("pre", { class: "plain-code mono" }, d.source.text),
-      );
-      this.body.append(h("h3", null, `Source · ${d.source.file}:${d.source.start_line}`), code);
       const token = this.token;
-      highlight(d.source.text, shikiLang(n.language, n.file), d.source.start_line)
+      highlight(text, shikiLang(n.language, n.file), d.source.start_line)
         .then((html) => {
           if (token !== this.token) return;
           code.innerHTML = html;
         })
         .catch(() => undefined);
     }
+
+    if (f) {
+      this.body.append(
+        section(
+          "signature",
+          "Signature & complexity",
+          h("pre", { class: "signature mono" }, f.signature || n.qualified_name),
+          f.params.length > 0 &&
+            h(
+              "table",
+              { class: "params" },
+              h(
+                "thead",
+                null,
+                h(
+                  "tr",
+                  null,
+                  h("th", null, "name"),
+                  h("th", null, "type"),
+                  h("th", null, "default"),
+                ),
+              ),
+              h(
+                "tbody",
+                null,
+                ...f.params.map((p) =>
+                  h(
+                    "tr",
+                    null,
+                    h("td", { class: "mono" }, p.name),
+                    h("td", { class: "mono muted" }, p.ty ?? "—"),
+                    h("td", { class: "mono muted" }, p.default ?? "—"),
+                  ),
+                ),
+              ),
+            ),
+          h(
+            "dl",
+            { class: "facts" },
+            h("dt", null, "returns"),
+            h("dd", { class: "mono" }, f.returns ?? "—"),
+            h("dt", null, "flags"),
+            h(
+              "dd",
+              null,
+              [
+                f.is_async && "async",
+                f.is_method && "method",
+                f.recursive && "recursive",
+                f.visibility,
+              ]
+                .filter(Boolean)
+                .join(" · "),
+            ),
+            f.attributes.length > 0 && h("dt", null, "attributes"),
+            f.attributes.length > 0 &&
+              h("dd", { class: "mono" }, f.attributes.map((a) => `@${a}`).join(" ")),
+            h("dt", null, "complexity"),
+            h(
+              "dd",
+              null,
+              h(
+                "span",
+                { class: "mono" },
+                `${f.complexity.time} time · ${f.complexity.space} space`,
+              ),
+              f.complexity.basis.length > 0 &&
+                h("div", { class: "muted small" }, f.complexity.basis.join("; ")),
+            ),
+            h("dt", null, "cyclomatic"),
+            h(
+              "dd",
+              null,
+              `${f.cyclomatic} · ${f.branches} branches · ${f.loops} loops (depth ${f.max_loop_depth})`,
+            ),
+            h("dt", null, "fan"),
+            h("dd", null, `in ${f.fan_in} · out ${f.fan_out}`),
+          ),
+        ),
+      );
+    }
+
     this.body.append(
-      this.renderEdges("Incoming", d.incoming, (e) => e.from),
-      this.renderEdges("Outgoing", d.outgoing, (e) => e.to),
+      section("runtime", "Runtime", this.renderStats(stats)),
+      section(
+        "edges",
+        `Callers & callees (${d.incoming.filter((e) => e.kind !== "contains").length} / ${d.outgoing.filter((e) => e.kind !== "contains").length})`,
+        this.renderEdges("Called by", d.incoming, (e) => e.from),
+        this.renderEdges("Calls", d.outgoing, (e) => e.to),
+      ),
     );
+  }
+
+  private renderEffects(n: NodeDetail["node"]): HTMLElement {
+    const body: HTMLElement[] = [];
+    if (n.effects.direct.length === 0 && n.effects.transitive.length === 0) {
+      body.push(h("p", { class: "muted small" }, "Pure: no I/O, processes or locks detected."));
+    }
+    if (n.effects.direct.length) {
+      body.push(
+        h(
+          "ul",
+          { class: "effects" },
+          ...n.effects.direct.map((e) =>
+            h(
+              "li",
+              null,
+              h(
+                "span",
+                { class: "fx", style: { color: EFFECT_COLORS[e.kind] } },
+                `${EFFECT_ICONS[e.kind]} ${e.kind.replace("_", " ")}`,
+              ),
+              e.target && h("span", { class: "mono" }, ` ${e.target}`),
+              h(
+                "span",
+                { class: "muted small" },
+                ` via ${e.via} · L${e.line}${e.loop_depth > 0 ? ` · in loop ×${e.loop_depth}` : ""}${e.awaited ? " · awaited" : ""}`,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    const transitiveOnly = n.effects.transitive.filter(
+      (k) => !n.effects.direct.some((e) => e.kind === k),
+    );
+    if (transitiveOnly.length) {
+      body.push(
+        h(
+          "div",
+          { class: "chips" },
+          h("span", { class: "muted small" }, "through callees: "),
+          ...transitiveOnly.map((k) =>
+            h(
+              "span",
+              { class: "chip", style: { borderColor: EFFECT_COLORS[k] } },
+              `${EFFECT_ICONS[k]} ${k.replace("_", " ")}`,
+            ),
+          ),
+        ),
+      );
+    }
+    return section("effects", "Effects", ...body);
   }
 
   private renderStats(stats: NodeStats | null): HTMLElement {
     const box = h("div", { class: "stats-box" });
     if (!stats) {
-      box.append(h("h3", null, "Runtime"), h("p", { class: "muted" }, "no spans observed"));
+      box.append(h("p", { class: "muted small" }, "No spans observed yet."));
       return box;
     }
     const waitPct = stats.total_nanos
       ? Math.round((stats.wait_nanos / stats.total_nanos) * 100)
       : 0;
     box.append(
-      h("h3", null, "Runtime"),
       h(
         "div",
         { class: "stat-grid" },
@@ -338,7 +426,7 @@ export class NodePanel {
     return h(
       "div",
       null,
-      h("h3", null, `${title} (${shown.length})`),
+      h("h4", null, `${title} (${shown.length})`),
       h(
         "ul",
         { class: "edges" },
@@ -367,11 +455,9 @@ export class NodePanel {
 
   private async copyQuery(id: string): Promise<void> {
     const cmd =
-      this.store.mode === "flow"
-        ? `hoshizora query flow --from ${shellQuote(id)}`
-        : this.store.mode === "impact"
-          ? `hoshizora query impact --of ${shellQuote(id)}`
-          : `hoshizora query node ${shellQuote(id)}`;
+      this.store.mode === "impact"
+        ? `hoshizora query impact --of ${shellQuote(id)}`
+        : `hoshizora query node ${shellQuote(id)}`;
     try {
       await navigator.clipboard.writeText(cmd);
       this.store.status(`Copied: ${cmd}`);
@@ -388,6 +474,18 @@ function stat(label: string, value: string): HTMLElement {
     h("span", { class: "muted small" }, label),
     h("b", null, value),
   );
+}
+
+/** Strips the indentation shared by every non-blank line, so nested code starts at column 0. */
+export function dedent(text: string): string {
+  const lines = text.split("\n");
+  let min = Number.POSITIVE_INFINITY;
+  for (const l of lines) {
+    if (!l.trim()) continue;
+    min = Math.min(min, l.length - l.trimStart().length);
+  }
+  if (!Number.isFinite(min) || min === 0) return text;
+  return lines.map((l) => l.slice(Math.min(min, l.length - l.trimStart().length))).join("\n");
 }
 
 function shellQuote(s: string): string {

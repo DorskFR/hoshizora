@@ -213,6 +213,11 @@ pub fn join(span: &mut RuntimeSpan, lookup: &dyn NodeLookup, cache: &JoinCache) 
     }
 }
 
+/// Whether the span's `code.filepath` + line lands on a function of this graph.
+pub fn locates(span: &RuntimeSpan, lookup: &dyn NodeLookup, cache: &JoinCache) -> bool {
+    by_code_location(span, lookup, cache).is_some()
+}
+
 fn by_code_location(
     span: &RuntimeSpan,
     lookup: &dyn NodeLookup,

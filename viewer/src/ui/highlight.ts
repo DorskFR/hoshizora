@@ -27,6 +27,7 @@ function load(): Promise<Highlighter> {
 
 export function shikiLang(lang: Language | null, file: string | null): string {
   if (file?.endsWith(".tsx") || file?.endsWith(".jsx")) return "tsx";
+  if (file?.endsWith(".svelte") || file?.endsWith(".vue")) return "typescript";
   switch (lang) {
     case "rust":
       return "rust";

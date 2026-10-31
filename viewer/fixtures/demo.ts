@@ -41,7 +41,7 @@ interface FnOpts {
   fanOut?: number;
 }
 
-function fn(o: FnOpts): GraphNode {
+export function fn(o: FnOpts): GraphNode {
   const direct: Effect[] = (o.effects ?? []).map((e) => ({
     kind: e.kind ?? "network",
     target: e.target ?? null,
@@ -99,7 +99,7 @@ function fn(o: FnOpts): GraphNode {
   };
 }
 
-function container(
+export function container(
   kind: NodeKind,
   id: string,
   name: string,
@@ -126,11 +126,11 @@ function container(
   };
 }
 
-function synthetic(kind: NodeKind, id: string, name: string): GraphNode {
+export function synthetic(kind: NodeKind, id: string, name: string): GraphNode {
   return container(kind, id, name, name, null, null, 0);
 }
 
-function edge(
+export function edge(
   from: string,
   to: string,
   kind: EdgeKind,

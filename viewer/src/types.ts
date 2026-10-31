@@ -289,3 +289,65 @@ export interface TraceSummary {
 }
 
 export type LiveEvent = { type: "span"; span: RuntimeSpan } | { type: "stats"; stats: NodeStats[] };
+
+export type LaneKind = "ui" | "service" | "worker" | "database" | "queue" | "external";
+
+export interface StoryLane {
+  id: string;
+  label: string;
+  kind: LaneKind;
+}
+
+export interface StoryStep {
+  node: string;
+  lane: string;
+  label: string;
+  kind: NodeKind;
+  seq: number;
+  effects: Effect[];
+  folded: string[];
+}
+
+export interface StoryLink {
+  from: string;
+  to: string;
+  kind: EdgeKind;
+  label: string | null;
+  seq: number;
+  detached: boolean;
+  confidence: Confidence;
+}
+
+export interface Story {
+  root: string;
+  lanes: StoryLane[];
+  steps: StoryStep[];
+  links: StoryLink[];
+  truncated: boolean;
+}
+
+export type ProjectSource =
+  | { kind: "git"; url: string; ref: string | null }
+  | { kind: "path"; path: string };
+
+export type ProjectStatus = "cloning" | "indexing" | "ready" | "failed";
+
+export interface Project {
+  id: string;
+  name: string;
+  source: ProjectSource;
+  status: ProjectStatus;
+  error: string | null;
+  commit: string | null;
+  indexed_at: string | null;
+  nodes: number;
+  edges: number;
+  services: string[];
+}
+
+export interface AddProject {
+  url: string;
+  ref?: string | null;
+  name?: string | null;
+  services?: string[];
+}

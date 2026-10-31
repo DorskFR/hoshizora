@@ -7,7 +7,7 @@ export default defineConfig(() => {
     build: {
       outDir: "dist",
       target: "es2022",
-      chunkSizeWarningLimit: 1500,
+      chunkSizeWarningLimit: 1600,
     },
     server: {
       port: 5173,

@@ -1,4 +1,6 @@
-use hoshizora_model::{FileFacts, Import, Language, Param, Symbol, SymbolKind, Visibility};
+use std::collections::HashSet;
+
+use hoshizora_model::{Body, FileFacts, Import, Language, Param, Symbol, SymbolKind, Visibility};
 use tree_sitter::Node;
 
 use crate::Adapter;
@@ -165,6 +167,112 @@ fn params(func: Node, source: &str) -> Vec<Param> {
         .collect()
 }
 
+fn has_method(object: Node) -> bool {
+    named_children(object).iter().any(|p| {
+        p.kind() == "method_definition"
+            || (p.kind() == "pair"
+                && p.child_by_field_name("value")
+                    .is_some_and(|v| FUNCS.contains(&v.kind())))
+    })
+}
+
+/// A class field as a `Param`: its declared type, else the callee or constructor that
+/// initialises it (`useX()` → `useX()`, `new Store()` → `Store`).
+fn field(member: Node, source: &str) -> Option<Param> {
+    if member.kind() != "public_field_definition" {
+        return None;
+    }
+    let value = member.child_by_field_name("value");
+    if value.is_some_and(|v| FUNCS.contains(&v.kind())) {
+        return None;
+    }
+    let name = field_text(member, "name", source)?;
+    let ty = type_text(member, "type", source).or_else(|| {
+        let v = value?;
+        match v.kind() {
+            "call_expression" => Some(format!(
+                "{}()",
+                strip_ws(&field_text(v, "function", source)?)
+            )),
+            "new_expression" => field_text(v, "constructor", source),
+            _ => None,
+        }
+    });
+    Some(Param {
+        name,
+        ty,
+        default: None,
+    })
+}
+
+/// Names bound to functions anywhere in the file: declarations, methods, object-literal
+/// methods, function-valued bindings (including `wrap(fn)` of a known function) and imports.
+fn known_functions(root: Node, source: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut wrapped: Vec<(String, Vec<String>)> = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "function_declaration" | "generator_function_declaration" | "method_definition" => {
+                out.extend(field_text(node, "name", source));
+            }
+            "variable_declarator" | "public_field_definition" | "pair" => {
+                let value = node.child_by_field_name("value");
+                let args = value
+                    .filter(|v| v.kind() == "call_expression")
+                    .and_then(|v| v.child_by_field_name("arguments"))
+                    .map(named_children)
+                    .unwrap_or_default();
+                let callable = value.is_some_and(|v| FUNCS.contains(&v.kind()))
+                    || args.iter().any(|x| FUNCS.contains(&x.kind()));
+                let idents: Vec<String> = args
+                    .iter()
+                    .filter(|x| x.kind() == "identifier")
+                    .map(|x| text(*x, source).to_owned())
+                    .collect();
+                if !callable
+                    && !idents.is_empty()
+                    && node.kind() == "variable_declarator"
+                    && let Some(name) = field_text(node, "name", source)
+                {
+                    wrapped.push((name, idents));
+                }
+                if callable {
+                    let key = if node.kind() == "pair" { "key" } else { "name" };
+                    out.extend(
+                        field_text(node, key, source)
+                            .map(|k| k.trim_matches(['"', '\'']).to_owned()),
+                    );
+                }
+            }
+            "import_specifier" => {
+                out.extend(
+                    field_text(node, "alias", source).or_else(|| field_text(node, "name", source)),
+                );
+            }
+            "import_clause" => {
+                for c in named_children(node) {
+                    match c.kind() {
+                        "identifier" => out.insert(text(c, source).to_owned()),
+                        "namespace_import" => named_children(c)
+                            .first()
+                            .is_some_and(|n| out.insert(text(*n, source).to_owned())),
+                        _ => false,
+                    };
+                }
+            }
+            _ => {}
+        }
+        pending.extend(named_children(node));
+    }
+    for (name, idents) in wrapped {
+        if idents.iter().any(|i| out.contains(i)) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
 fn exported(node: Node) -> bool {
     node.parent()
         .is_some_and(|p| p.kind() == "export_statement")
@@ -179,6 +287,9 @@ struct Ctx<'a> {
     candidates: Vec<(Node<'a>, Node<'a>, Node<'a>, String, bool)>,
     /// Declarators emitted as symbols, excluded from `<module>`.
     bound: Vec<usize>,
+    /// Names that denote functions in this file (declared, imported, object-literal methods):
+    /// only these count as callbacks when passed bare as arguments.
+    known: HashSet<String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -193,6 +304,10 @@ impl<'a> Ctx<'a> {
     ) {
         let body = func.child_by_field_name("body");
         let local_name = parent.map_or_else(|| name.clone(), |p| format!("{p}.{name}"));
+        let returned = body
+            .filter(|b| b.kind() == "statement_block")
+            .map(|b| self.returned_methods(b, &local_name, public))
+            .unwrap_or_default();
         self.symbols.push(Symbol {
             kind: if parent.is_some() {
                 SymbolKind::Method
@@ -221,14 +336,72 @@ impl<'a> Ctx<'a> {
             attributes,
             implements: vec![],
             body: body.map(|b| {
-                if b.kind() == "statement_block" {
-                    common::analyze_body(b, self.source, &SPEC)
+                let mut body = if b.kind() == "statement_block" {
+                    self.body(&named_children(b))
                 } else {
-                    common::analyze_body(func, self.source, &SPEC)
-                }
+                    self.body(&named_children(func))
+                };
+                body.calls.retain(|c| {
+                    !returned
+                        .iter()
+                        .any(|(start, end)| *start <= c.line && c.line <= *end)
+                });
+                body
             }),
             name,
         });
+    }
+
+    fn body(&self, nodes: &[Node]) -> Body {
+        let known = &self.known;
+        common::analyze_nodes_with(nodes, self.source, &SPEC, &|t| {
+            t.contains('.') || known.contains(t)
+        })
+    }
+
+    /// Methods of an object literal: `{ spawn: (b) => ..., run() {...} }`.
+    fn object_methods(&mut self, object: Node, parent: &str, public: bool) -> Vec<(u32, u32)> {
+        let src = self.source;
+        let mut spans = Vec::new();
+        for prop in named_children(object) {
+            match prop.kind() {
+                "pair" => {
+                    if let Some(v) = prop
+                        .child_by_field_name("value")
+                        .filter(|v| FUNCS.contains(&v.kind()))
+                        && let Some(key) = field_text(prop, "key", src)
+                    {
+                        let key = key.trim_matches(['"', '\'']).to_owned();
+                        let sp = span(prop);
+                        spans.push((sp.start_line, sp.end_line));
+                        self.function(prop, v, key, Some(parent), public, vec![]);
+                    }
+                }
+                "method_definition" => {
+                    let key = field_text(prop, "name", src).unwrap_or_default();
+                    let sp = span(prop);
+                    spans.push((sp.start_line, sp.end_line));
+                    self.function(prop, prop, key, Some(parent), public, vec![]);
+                }
+                _ => {}
+            }
+        }
+        spans
+    }
+
+    /// Object literals returned by a function become its methods (`useX()` factories).
+    fn returned_methods(&mut self, block: Node, parent: &str, public: bool) -> Vec<(u32, u32)> {
+        let mut spans = Vec::new();
+        for stmt in named_children(block) {
+            if stmt.kind() == "return_statement"
+                && let Some(obj) = named_children(stmt)
+                    .into_iter()
+                    .find(|n| n.kind() == "object")
+            {
+                spans.extend(self.object_methods(obj, parent, public));
+            }
+        }
+        spans
     }
 
     fn plain(
@@ -305,6 +478,10 @@ impl<'a> Ctx<'a> {
                         Some(v) if v.kind() == "call_expression" => {
                             self.candidates.push((outer, d, v, name, public));
                         }
+                        Some(v) if v.kind() == "object" && has_method(v) => {
+                            self.bound.push(d.id());
+                            self.object_methods(v, &name, public);
+                        }
                         _ if name
                             .chars()
                             .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
@@ -339,6 +516,13 @@ impl<'a> Ctx<'a> {
                     implements,
                 );
                 if let Some(body) = node.child_by_field_name("body") {
+                    let fields: Vec<Param> = named_children(body)
+                        .into_iter()
+                        .filter_map(|m| field(m, src))
+                        .collect();
+                    if let Some(class) = self.symbols.last_mut() {
+                        class.params = fields;
+                    }
                     for m in named_children(body) {
                         self.member(m, &name);
                     }
@@ -457,7 +641,7 @@ impl<'a> Ctx<'a> {
                 .map_or(decl.end_byte(), |b| b.start_byte());
             let signature = collapse_ws(&src[outer.start_byte()..end]);
             let signature = signature.trim_end_matches([' ', '{', '=', '>']).to_string();
-            let body = common::analyze_nodes(&[call], src, &SPEC);
+            let body = self.body(&[call]);
             self.symbols.push(Symbol {
                 kind: SymbolKind::Function,
                 local_name: name.clone(),
@@ -531,12 +715,13 @@ impl TsAdapter {
             imports: vec![],
             candidates: vec![],
             bound: vec![],
+            known: known_functions(tree.root_node(), source),
         };
         for stmt in all_children(tree.root_node()) {
             ctx.statement(stmt);
         }
         ctx.callable_bindings();
-        let module = common::analyze_nodes(&ctx.module_nodes(tree.root_node()), source, &SPEC);
+        let module = ctx.body(&ctx.module_nodes(tree.root_node()));
         let mut handlers = vec![];
         ui_handlers(tree.root_node(), source, &mut handlers);
         common::apply_ui_handlers(&mut ctx.symbols, &handlers);

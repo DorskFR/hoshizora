@@ -1,0 +1,478 @@
+use std::path::Path;
+
+use hoshizora_core::{Index, Packs, build_graph};
+use hoshizora_model::{
+    Body, CallSite, Confidence, EdgeKind, EffectKind, EntrypointKind, FileFacts, Import, Language,
+    NodeKind, Param, Span, Symbol, SymbolKind, Visibility,
+};
+
+fn call(callee: &str, line: u32) -> CallSite {
+    CallSite {
+        callee: callee.into(),
+        name: callee.rsplit(['.', ':']).next().unwrap_or(callee).into(),
+        receiver: None,
+        string_args: vec![],
+        line,
+        loop_depth: 0,
+        awaited: true,
+        conditional: false,
+        in_closure: false,
+    }
+}
+
+fn args(mut c: CallSite, a: &[&str]) -> CallSite {
+    c.string_args = a.iter().map(|s| (*s).to_owned()).collect();
+    c
+}
+
+fn recv(mut c: CallSite, r: &str) -> CallSite {
+    c.receiver = Some(r.into());
+    c
+}
+
+fn import(path: &str, names: &[&str]) -> Import {
+    Import {
+        path: path.into(),
+        alias: None,
+        names: names.iter().map(|s| (*s).to_owned()).collect(),
+        line: 1,
+    }
+}
+
+fn symbol(kind: SymbolKind, local: &str, start: u32, calls: Option<Vec<CallSite>>) -> Symbol {
+    let (parent, name) = match local.rsplit_once("::").or_else(|| local.rsplit_once('.')) {
+        Some((p, n)) => (Some(p.to_owned()), n.to_owned()),
+        None => (None, local.to_owned()),
+    };
+    Symbol {
+        kind,
+        name,
+        local_name: local.into(),
+        parent,
+        signature: local.into(),
+        params: vec![],
+        returns: None,
+        doc: None,
+        span: Span {
+            start_line: start,
+            end_line: start + 20,
+        },
+        is_async: true,
+        visibility: Visibility::Public,
+        attributes: vec![],
+        implements: vec![],
+        body: calls.map(|calls| Body {
+            calls,
+            cyclomatic: 1,
+            ..Body::default()
+        }),
+    }
+}
+
+fn func(local: &str, start: u32, calls: Vec<CallSite>) -> Symbol {
+    let kind = if local.contains(['.', ':']) {
+        SymbolKind::Method
+    } else {
+        SymbolKind::Function
+    };
+    symbol(kind, local, start, Some(calls))
+}
+
+fn sync(mut s: Symbol) -> Symbol {
+    s.is_async = false;
+    s
+}
+
+fn with_params(mut s: Symbol, params: &[(&str, &str)]) -> Symbol {
+    s.params = params
+        .iter()
+        .map(|(n, t)| Param {
+            name: (*n).into(),
+            ty: Some((*t).into()),
+            default: None,
+        })
+        .collect();
+    s
+}
+
+fn file(
+    path: &str,
+    language: Language,
+    module: &str,
+    imports: Vec<Import>,
+    symbols: Vec<Symbol>,
+) -> FileFacts {
+    FileFacts {
+        path: path.into(),
+        language,
+        module: module.into(),
+        lines: 100,
+        imports,
+        symbols,
+    }
+}
+
+fn build(files: Vec<FileFacts>) -> Index {
+    Index::new(build_graph(Path::new("/repo"), files, &Packs::builtin()))
+}
+
+fn edge<'a>(idx: &'a Index, from: &str, to: &str) -> Option<&'a hoshizora_model::Edge> {
+    idx.outgoing(from).into_iter().find(|e| e.to == to)
+}
+
+/// Frontend: `sf.actions.spawn()` through a class field initialised by a factory, and
+/// `api.postForm("/sessions/spawn")` as a client call of the route.
+fn frontend() -> Vec<FileFacts> {
+    let ts = Language::TypeScript;
+    let form_type = with_params(
+        symbol(SymbolKind::Type, "SpawnForm", 1, None),
+        &[("actions", "useSessionActions()"), ("client", "Client")],
+    );
+    vec![
+        file(
+            "webui/src/spawnForm.ts",
+            ts,
+            "webui/src/spawnForm",
+            vec![],
+            vec![
+                form_type,
+                func(
+                    "SpawnForm.submit",
+                    10,
+                    vec![recv(call("this.actions.spawn", 12), "this.actions")],
+                ),
+            ],
+        ),
+        file(
+            "webui/src/spawnSubmit.ts",
+            ts,
+            "webui/src/spawnSubmit",
+            vec![import("./spawnForm", &["SpawnForm"])],
+            vec![with_params(
+                func(
+                    "spawnOnMachine",
+                    5,
+                    vec![recv(call("sf.actions.spawn", 7), "sf.actions")],
+                ),
+                &[("sf", "SpawnForm")],
+            )],
+        ),
+        file(
+            "webui/src/sessionActions.ts",
+            ts,
+            "webui/src/sessionActions",
+            vec![import("./endpoints", &["endpoints"])],
+            vec![
+                func("useSessionActions", 1, vec![]),
+                func(
+                    "useSessionActions.spawn",
+                    3,
+                    vec![call("endpoints.spawn", 3)],
+                ),
+            ],
+        ),
+        file(
+            "webui/src/endpoints.ts",
+            ts,
+            "webui/src/endpoints",
+            vec![import("./api", &["api"])],
+            vec![func(
+                "endpoints.spawn",
+                20,
+                vec![recv(
+                    args(call("api.postForm", 24), &["/sessions/spawn"]),
+                    "api",
+                )],
+            )],
+        ),
+        file(
+            "webui/src/api.ts",
+            ts,
+            "webui/src/api",
+            vec![],
+            vec![func("postForm", 1, vec![])],
+        ),
+    ]
+}
+
+/// Backend: a project-specific registration wrapper spanning several lines, handlers named
+/// through module paths, sqlx used fully qualified without a `use`.
+fn backend() -> Vec<FileFacts> {
+    let rs = Language::Rust;
+    vec![
+        file(
+            "crates/server/src/lib.rs",
+            rs,
+            "server",
+            vec![],
+            vec![func("main", 1, vec![])],
+        ),
+        file(
+            "crates/server/src/api_routes.rs",
+            rs,
+            "server::api_routes",
+            vec![
+                import("crate", &["routes"]),
+                import("axum::routing::post", &[]),
+            ],
+            vec![
+                func(
+                    "register",
+                    10,
+                    vec![
+                        args(
+                            recv(call("r.add", 11), "r"),
+                            &["/sessions/spawn", "Spawn a session."],
+                        ),
+                        call("post", 15),
+                        call("routes::spawn::spawn_session", 15),
+                        call("body_limit", 15),
+                        args(call("add", 20), &["/sessions/{id}/kill", "Kill it."]),
+                        call("post", 24),
+                        call("crate::routes::spawn::kill_session", 24),
+                    ],
+                ),
+                sync(func("body_limit", 40, vec![])),
+            ],
+        ),
+        file(
+            "crates/server/src/routes/mod.rs",
+            rs,
+            "server::routes",
+            vec![],
+            vec![],
+        ),
+        file(
+            "crates/server/src/routes/spawn.rs",
+            rs,
+            "server::routes::spawn",
+            vec![],
+            vec![
+                func("spawn_session", 1, vec![call("save_draft", 5)]),
+                func("kill_session", 30, vec![]),
+                func(
+                    "save_draft",
+                    50,
+                    vec![
+                        args(
+                            call("sqlx::query", 52),
+                            &["INSERT INTO sessions (id) VALUES ($1)"],
+                        ),
+                        awaited_exec(),
+                    ],
+                ),
+            ],
+        ),
+    ]
+}
+
+fn awaited_exec() -> CallSite {
+    call("sqlx::query(..).execute", 53)
+}
+
+/// Messaging: an enum variant handed to a method call in one crate, matched on in another.
+fn messaging() -> Vec<FileFacts> {
+    let rs = Language::Rust;
+    let message_site =
+        |variant: &str, line: u32| recv(args(call("<message>", line), &[variant]), "bus");
+    let match_site = |variant: &str, line: u32| args(call("<match>", line), &[variant]);
+    vec![
+        file(
+            "crates/proto/src/lib.rs",
+            rs,
+            "proto",
+            vec![],
+            vec![symbol(SymbolKind::Type, "FrameDown", 1, None)],
+        ),
+        file(
+            "crates/server/src/launch.rs",
+            rs,
+            "server::launch",
+            vec![],
+            vec![func(
+                "launch_machine",
+                1,
+                vec![
+                    call("bus.command_daemon", 5),
+                    message_site("FrameDown::Command", 5),
+                    message_site("Value::Object", 6),
+                    message_site("FrameDown::Unmatched", 7),
+                ],
+            )],
+        ),
+        file(
+            "crates/daemon/src/supervisor.rs",
+            rs,
+            "daemon::supervisor",
+            vec![],
+            vec![func(
+                "handle_frame",
+                1,
+                vec![
+                    match_site("FrameDown::Command", 4),
+                    match_site("Value::Object", 5),
+                ],
+            )],
+        ),
+    ]
+}
+
+#[test]
+fn field_typed_receivers_resolve_through_factories_and_imports() {
+    let idx = build(frontend());
+    let via_param = edge(
+        &idx,
+        "fn:webui/src/spawnSubmit.ts#spawnOnMachine",
+        "fn:webui/src/sessionActions.ts#useSessionActions.spawn",
+    )
+    .expect("sf.actions.spawn resolves through the field's factory");
+    assert_eq!(via_param.confidence, Confidence::Exact);
+    let via_this = edge(
+        &idx,
+        "fn:webui/src/spawnForm.ts#SpawnForm.submit",
+        "fn:webui/src/sessionActions.ts#useSessionActions.spawn",
+    )
+    .expect("this.actions.spawn resolves the same way");
+    assert_eq!(via_this.kind, EdgeKind::Calls);
+    assert!(
+        edge(
+            &idx,
+            "fn:webui/src/sessionActions.ts#useSessionActions.spawn",
+            "fn:webui/src/endpoints.ts#endpoints.spawn"
+        )
+        .is_some(),
+        "object-literal method reached through its import"
+    );
+}
+
+#[test]
+fn camel_case_client_methods_request_routes() {
+    let mut files = frontend();
+    files.extend(backend());
+    let idx = build(files);
+    let req = edge(
+        &idx,
+        "fn:webui/src/endpoints.ts#endpoints.spawn",
+        "route:POST /sessions/spawn",
+    )
+    .expect("api.postForm issues a POST request");
+    assert_eq!(req.kind, EdgeKind::Requests);
+    let node = idx
+        .node("fn:webui/src/endpoints.ts#endpoints.spawn")
+        .unwrap();
+    assert!(
+        node.effects.direct.iter().any(
+            |e| e.kind == EffectKind::Network && e.target.as_deref() == Some("/sessions/spawn")
+        )
+    );
+}
+
+#[test]
+fn wrapper_registrations_resolve_module_path_handlers() {
+    let idx = build(backend());
+    let handles = edge(
+        &idx,
+        "route:POST /sessions/spawn",
+        "fn:crates/server/src/routes/spawn.rs#spawn_session",
+    )
+    .expect("multi-line r.add(..., post(routes::spawn::spawn_session)) registers the route");
+    assert_eq!(handles.kind, EdgeKind::Handles);
+    assert!(
+        edge(
+            &idx,
+            "route:POST /sessions/spawn",
+            "fn:crates/server/src/api_routes.rs#body_limit"
+        )
+        .is_none(),
+        "a sync config call alongside is not a handler"
+    );
+    assert!(
+        edge(
+            &idx,
+            "route:POST /sessions/{}/kill",
+            "fn:crates/server/src/routes/spawn.rs#kill_session"
+        )
+        .is_some(),
+        "crate::routes::spawn::kill_session resolves through the module path"
+    );
+    let handler = idx
+        .node("fn:crates/server/src/routes/spawn.rs#spawn_session")
+        .unwrap();
+    assert_eq!(handler.entrypoint, Some(EntrypointKind::HttpHandler));
+    let call = edge(
+        &idx,
+        "fn:crates/server/src/api_routes.rs#register",
+        "fn:crates/server/src/routes/spawn.rs#spawn_session",
+    )
+    .unwrap();
+    assert_eq!(call.confidence, Confidence::Exact);
+}
+
+#[test]
+fn qualified_callee_satisfies_requires_import() {
+    let idx = build(backend());
+    let draft = idx
+        .node("fn:crates/server/src/routes/spawn.rs#save_draft")
+        .unwrap();
+    assert!(
+        draft
+            .effects
+            .direct
+            .iter()
+            .any(|e| e.kind == EffectKind::DbWrite && e.target.as_deref() == Some("sessions")),
+        "{:?}",
+        draft.effects.direct
+    );
+    assert!(
+        edge(
+            &idx,
+            "fn:crates/server/src/routes/spawn.rs#save_draft",
+            "table:sessions"
+        )
+        .is_some_and(|e| e.kind == EdgeKind::Writes)
+    );
+}
+
+#[test]
+fn enum_messages_become_topics_when_sent_and_matched() {
+    let idx = build(messaging());
+    let topic = idx
+        .node("topic:FrameDown::Command")
+        .expect("sent and matched");
+    assert_eq!(topic.kind, NodeKind::Topic);
+    assert!(
+        edge(
+            &idx,
+            "fn:crates/server/src/launch.rs#launch_machine",
+            "topic:FrameDown::Command"
+        )
+        .is_some_and(|e| e.kind == EdgeKind::Publishes)
+    );
+    assert!(
+        edge(
+            &idx,
+            "fn:crates/daemon/src/supervisor.rs#handle_frame",
+            "topic:FrameDown::Command"
+        )
+        .is_some_and(|e| e.kind == EdgeKind::Subscribes)
+    );
+    assert!(
+        idx.node("topic:FrameDown::Unmatched").is_none(),
+        "one-sided"
+    );
+    assert!(
+        idx.node("topic:Value::Object").is_none(),
+        "third-party enum"
+    );
+    let publisher = idx
+        .node("fn:crates/server/src/launch.rs#launch_machine")
+        .unwrap();
+    let published: Vec<_> = publisher
+        .effects
+        .direct
+        .iter()
+        .filter(|e| e.kind == EffectKind::Publish)
+        .map(|e| e.target.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(published, vec!["FrameDown::Command"]);
+}
