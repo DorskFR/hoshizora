@@ -3,11 +3,13 @@
   "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
   "linter": {
     "enabled": true,
+    "domains": { "playwright": "none" },
     "rules": {
       "recommended": true,
       "style": { "noNonNullAssertion": "off" },
       "suspicious": { "noExplicitAny": "warn" }
     }
   },
+  "overrides": [{ "includes": ["e2e/**"], "linter": { "domains": { "playwright": "recommended" } } }],
   "javascript": { "formatter": { "quoteStyle": "double" } }
 }

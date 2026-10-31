@@ -57,7 +57,12 @@ export class NodePanel {
     private readonly actions: PanelActions,
   ) {
     this.body = h("div", { class: "panel-body" });
-    this.el = h("section", { class: "node-panel", "aria-label": "Node details" }, this.body);
+    const close = h(
+      "button",
+      { class: "ghost panel-close", "aria-label": "Close", onclick: () => store.select(null) },
+      "×",
+    );
+    this.el = h("section", { class: "node-panel", "aria-label": "Node details" }, close, this.body);
     this.renderEmpty();
     store.on("selection", (id) => this.load(id));
     store.on("stats", () => this.refreshStats());
