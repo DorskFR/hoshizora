@@ -10,6 +10,11 @@ hoshizora-model.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }
+prost = "0.14.4"
+flate2 = "1.1.10"
+hdrhistogram = { version = "7.6.0", default-features = false }
 
 [lints]
 workspace = true
