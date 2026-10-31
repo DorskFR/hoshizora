@@ -8,7 +8,7 @@ JSON; types live in `crates/hoshizora-model`.
 
 | Method | Path | Response |
 | --- | --- | --- |
-| GET | `/api/graph` | `Graph` |
+| GET | `/api/graph?detail=full\|slim` | `Graph`. `slim` (for the viewer) keeps the same shape but empties `function.doc/signature/params/attributes`, `function.complexity.basis` and edge `attrs` other than `candidates`, and drops `contains`, `imports` and `uses` edges (rebuild hierarchy from `node.parent`). Both are serialised once per process; all `/api` responses are gzip/br compressed when `Accept-Encoding` allows. |
 | GET | `/api/nodes/{id}` | `NodeDetail` (id URL-encoded) |
 | GET | `/api/source?file=&start=&end=` | `Source` |
 | GET | `/api/search?q=&limit=` | `SearchHit[]` |

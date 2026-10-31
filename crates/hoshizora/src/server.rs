@@ -15,12 +15,13 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use futures::Stream;
 use hoshizora_model::api::{Insights, NodeDetail, Source};
-use hoshizora_model::{Insight, LiveEvent, Node, NodeStats};
+use hoshizora_model::{EdgeKind, Graph, Insight, LiveEvent, Node, NodeStats};
 use hoshizora_runtime::{NodeLookup, Runtime, RuntimeConfig, Trace, otlp};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 use crate::assets;
@@ -31,6 +32,9 @@ pub struct AppState<Q: GraphQueries> {
     pub runtime: Mutex<Runtime<Arc<Q>>>,
     pub events: broadcast::Sender<LiveEvent>,
     pub root: PathBuf,
+    /// `/api/graph` bodies, serialised once: the graph is immutable per process.
+    graph_json: Bytes,
+    slim_graph_json: Bytes,
 }
 
 impl<Q: GraphQueries + 'static> AppState<Q> {
@@ -38,11 +42,16 @@ impl<Q: GraphQueries + 'static> AppState<Q> {
         let queries = Arc::new(queries);
         let runtime = Runtime::new(config, Arc::clone(&queries));
         let (events, _) = broadcast::channel(4096);
+        let graph_json = Bytes::from(serde_json::to_vec(queries.graph()).unwrap_or_default());
+        let slim_graph_json =
+            Bytes::from(serde_json::to_vec(&slim_graph(queries.graph())).unwrap_or_default());
         Arc::new(Self {
             queries,
             runtime: Mutex::new(runtime),
             events,
             root,
+            graph_json,
+            slim_graph_json,
         })
     }
 
@@ -61,7 +70,7 @@ impl<Q: GraphQueries + 'static> AppState<Q> {
 }
 
 pub fn router<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/graph", get(graph::<Q>))
         .route("/api/nodes/{*id}", get(node_detail::<Q>))
         .route("/api/source", get(source::<Q>))
@@ -72,11 +81,14 @@ pub fn router<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) -> Router {
         .route("/api/dead", get(dead::<Q>))
         .route("/api/effects", get(effects::<Q>))
         .route("/api/insights", get(insights::<Q>))
-        .route("/v1/traces", post(traces_ingest::<Q>))
         .route("/api/runtime/stats", get(runtime_stats::<Q>))
         .route("/api/runtime/traces", get(runtime_traces::<Q>))
         .route("/api/runtime/traces/{trace_id}", get(runtime_trace::<Q>))
+        .layer(CompressionLayer::new());
+    Router::new()
+        .merge(api)
         .route("/api/runtime/stream", get(stream::<Q>))
+        .route("/v1/traces", post(traces_ingest::<Q>))
         .fallback(static_assets)
         .layer(cors())
         .with_state(state)
@@ -113,8 +125,61 @@ fn bad_request(msg: impl Into<String>) -> AppError {
     (StatusCode::BAD_REQUEST, msg.into())
 }
 
-async fn graph<Q: GraphQueries>(State(state): State<Arc<AppState<Q>>>) -> Response {
-    Json(state.queries.graph()).into_response()
+#[derive(Deserialize)]
+struct GraphParams {
+    detail: Option<String>,
+}
+
+async fn graph<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+    Query(p): Query<GraphParams>,
+) -> Response {
+    let body = match p.detail.as_deref() {
+        Some("slim") => state.slim_graph_json.clone(),
+        _ => state.graph_json.clone(),
+    };
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Same `Graph` shape with the fields the 3D view never reads stripped: docs, signatures,
+/// direct effects, edge attrs (except `candidates`) and structural `contains`/`imports`/`uses`
+/// edges, which the viewer rebuilds from `Node.parent`.
+pub fn slim_graph(graph: &Graph) -> Graph {
+    let nodes = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut n = n.clone();
+            if let Some(f) = n.function.as_mut() {
+                f.doc = None;
+                f.signature = String::new();
+                f.params = Vec::new();
+                f.attributes = Vec::new();
+                f.complexity.basis = Vec::new();
+            }
+            n
+        })
+        .collect();
+    let edges = graph
+        .edges
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e.kind,
+                EdgeKind::Contains | EdgeKind::Imports | EdgeKind::Uses
+            )
+        })
+        .map(|e| {
+            let mut e = e.clone();
+            e.attrs.retain(|k, _| k == "candidates");
+            e
+        })
+        .collect();
+    Graph {
+        meta: graph.meta.clone(),
+        nodes,
+        edges,
+    }
 }
 
 async fn node_detail<Q: GraphQueries>(
@@ -410,9 +475,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use hoshizora_model::api::{Impact, SearchHit, Subgraph};
-    use hoshizora_model::{
-        Confidence, Edge, EdgeKind, EffectKind, Effects, Graph, Insight, Node, NodeKind, Span,
-    };
+    use hoshizora_model::{Confidence, Edge, EffectKind, Effects, NodeKind, Span};
     use http_body_util::BodyExt;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
@@ -456,16 +519,74 @@ mod tests {
         fn new() -> Self {
             let mut graph = Graph::default();
             graph.meta.root = "/tmp/fake".into();
+            let mut function = node(FN_ID, NodeKind::Function, Some("src/lib.rs"), Some((2, 3)));
+            function.function = Some(hoshizora_model::FunctionInfo {
+                signature: "fn create(&self) -> Session".into(),
+                params: vec![hoshizora_model::Param {
+                    name: "self".into(),
+                    ty: None,
+                    default: None,
+                }],
+                returns: Some("Session".into()),
+                doc: Some("Creates a session.".into()),
+                is_async: true,
+                is_method: true,
+                visibility: hoshizora_model::Visibility::Public,
+                attributes: vec!["instrument".into()],
+                cyclomatic: 2,
+                branches: 1,
+                loops: 1,
+                max_loop_depth: 1,
+                recursive: false,
+                complexity: hoshizora_model::Complexity {
+                    time: "O(n)".into(),
+                    space: "O(1)".into(),
+                    basis: vec!["one loop".into()],
+                },
+                fan_in: 1,
+                fan_out: 0,
+            });
+            function.effects = Effects {
+                direct: vec![hoshizora_model::Effect {
+                    kind: EffectKind::DbRead,
+                    target: Some("sessions".into()),
+                    via: "sqlx::query".into(),
+                    line: 3,
+                    loop_depth: 1,
+                    awaited: true,
+                    rule: "rust.sqlx.query".into(),
+                }],
+                transitive: vec![EffectKind::DbRead],
+            };
             graph.nodes = vec![
-                node(FN_ID, NodeKind::Function, Some("src/lib.rs"), Some((2, 3))),
+                function,
                 node("route:POST /api/sessions", NodeKind::Route, None, None),
             ];
-            graph.edges = vec![Edge::new(
+            let mut handles = Edge::new(
                 "route:POST /api/sessions",
                 FN_ID,
                 EdgeKind::Handles,
                 Confidence::Exact,
-            )];
+            );
+            handles.attrs.insert("candidates".into(), "2".into());
+            handles
+                .attrs
+                .insert("matched".into(), "/api/sessions".into());
+            graph.edges = vec![
+                handles,
+                Edge::new(
+                    "file:src/lib.rs",
+                    FN_ID,
+                    EdgeKind::Contains,
+                    Confidence::Exact,
+                ),
+                Edge::new(
+                    "file:src/lib.rs",
+                    "file:src/other.rs",
+                    EdgeKind::Imports,
+                    Confidence::Exact,
+                ),
+            ];
             Self { graph }
         }
     }
@@ -599,7 +720,7 @@ mod tests {
         let (status, detail) = get_json(&app, &format!("/api/nodes/{encoded}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(detail["node"]["id"], FN_ID);
-        assert_eq!(detail["incoming"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["incoming"].as_array().unwrap().len(), 2);
         assert_eq!(detail["source"]["text"], "line two\nline three");
         assert!(detail["stats"].is_null());
 
@@ -609,6 +730,49 @@ mod tests {
 
         let (status, _) = get_json(&app, "/api/nodes/fn:nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn slim_graph_strips_heavy_fields_and_compresses() {
+        let (app, state) = app();
+        let (status, slim) = get_json(&app, "/api/graph?detail=slim").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(slim["nodes"].as_array().unwrap().len(), 2);
+        let edges = slim["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1, "handles kept, contains/imports dropped");
+        assert_eq!(edges[0]["kind"], "handles");
+        assert_eq!(edges[0]["attrs"], serde_json::json!({ "candidates": "2" }));
+        let f = &slim["nodes"][0]["function"];
+        assert_eq!(f["doc"], serde_json::Value::Null);
+        assert_eq!(f["signature"], "");
+        assert_eq!(f["params"], serde_json::json!([]));
+        assert_eq!(f["complexity"]["basis"], serde_json::json!([]));
+        assert_eq!(f["complexity"]["time"], "O(n)");
+        assert_eq!(
+            slim["nodes"][0]["effects"]["direct"],
+            serde_json::json!([{
+                "kind": "db_read", "target": "sessions", "via": "sqlx::query",
+                "line": 3, "loop_depth": 1, "awaited": true, "rule": "rust.sqlx.query"
+            }])
+        );
+        assert_eq!(
+            slim["nodes"][0]["effects"]["transitive"],
+            serde_json::json!(["db_read"])
+        );
+        assert!(state.slim_graph_json.len() < state.graph_json.len());
+
+        let res = app
+            .oneshot(
+                Request::get("/api/graph")
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let enc = res.headers()[header::CONTENT_ENCODING].to_str().unwrap();
+        assert!(enc == "gzip" || enc == "br", "{enc}");
     }
 
     #[tokio::test]

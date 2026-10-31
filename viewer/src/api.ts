@@ -35,7 +35,7 @@ export class HttpBackend implements Backend {
   constructor(private readonly base = "") {}
 
   graph() {
-    return getJson<Graph>(`${this.base}/api/graph`);
+    return getJson<Graph>(`${this.base}/api/graph?detail=slim`);
   }
   node(id: string) {
     return getJson<NodeDetail>(`${this.base}/api/nodes/${encodeURIComponent(id)}`);
