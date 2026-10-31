@@ -7,6 +7,7 @@ pub mod packs;
 pub mod pattern;
 pub mod sql;
 mod store;
+mod story;
 pub mod url;
 
 use std::path::Path;

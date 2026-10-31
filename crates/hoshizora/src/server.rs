@@ -78,6 +78,7 @@ pub fn router<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) -> Router {
         .route("/api/entrypoints", get(entrypoints::<Q>))
         .route("/api/flow", get(flow::<Q>))
         .route("/api/impact", get(impact::<Q>))
+        .route("/api/story", get(story::<Q>))
         .route("/api/dead", get(dead::<Q>))
         .route("/api/effects", get(effects::<Q>))
         .route("/api/insights", get(insights::<Q>))
@@ -329,6 +330,23 @@ async fn impact<Q: GraphQueries>(
         .ok_or_else(|| not_found("node"))
 }
 
+#[derive(Deserialize)]
+struct StoryParams {
+    from: String,
+    depth: Option<u32>,
+}
+
+async fn story<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+    Query(p): Query<StoryParams>,
+) -> Result<Response, AppError> {
+    state
+        .queries
+        .story(&p.from, p.depth.unwrap_or(DEFAULT_DEPTH))
+        .map(|s| Json(s).into_response())
+        .ok_or_else(|| not_found("node"))
+}
+
 async fn dead<Q: GraphQueries>(State(state): State<Arc<AppState<Q>>>) -> Json<Vec<Node>> {
     Json(state.queries.dead())
 }
@@ -468,7 +486,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
-    use hoshizora_model::api::{Impact, SearchHit, Subgraph};
+    use hoshizora_model::api::{Impact, SearchHit, Story, Subgraph};
     use hoshizora_model::{Confidence, Edge, EffectKind, Effects, NodeKind, Span};
     use http_body_util::BodyExt;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -632,6 +650,12 @@ mod tests {
             self.node(from).map(|_| Subgraph {
                 root: from.into(),
                 ..Default::default()
+            })
+        }
+        fn story(&self, from: &str, _depth: u32) -> Option<Story> {
+            self.node(from).map(|_| Story {
+                root: from.into(),
+                ..Story::default()
             })
         }
         fn impact(&self, of: &str, _depth: u32) -> Option<Impact> {
