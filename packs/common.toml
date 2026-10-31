@@ -1,0 +1,16 @@
+# Language-neutral rules. Client rules only fire when the call carries a URL-looking string
+# argument or goes through a client-like receiver (see RuleSet::matching).
+
+[[effect]]
+id = "common.http.client_call"
+match = ["*.get", "*.post", "*.put", "*.delete", "*.patch", "*.head", "*.request", "*.fetch", "*.Get", "*.Post", "*.Put", "*.Delete", "*.Do"]
+kind = "network"
+target = "url"
+client = true
+
+# Functions named like publishers are publishers; the first string argument is the topic.
+[[effect]]
+id = "common.messaging.publish"
+match = ["publish", "publish_*", "*.publish", "*.publish_*", "publish*Event", "emit_event", "*.emit_event"]
+kind = "publish"
+target = "arg0"

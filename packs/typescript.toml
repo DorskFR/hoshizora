@@ -1,0 +1,268 @@
+# TypeScript / JavaScript effect, route and client rules. See crates/hoshizora-core/src/packs.rs.
+
+[[effect]]
+id = "ts.fetch"
+language = "typescript"
+match = ["fetch", "window.fetch", "globalThis.fetch", "node-fetch", "undici.fetch", "undici.request", "$fetch", "useFetch", "ofetch"]
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "js.fetch"
+language = "javascript"
+match = ["fetch", "window.fetch", "globalThis.fetch", "node-fetch", "undici.fetch", "undici.request", "$fetch", "useFetch", "ofetch"]
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "ts.axios"
+match = ["axios", "axios.get", "axios.post", "axios.put", "axios.delete", "axios.patch", "axios.head", "axios.request", "api.get", "api.post", "api.put", "api.delete", "api.patch", "http.get", "http.post", "http.put", "http.delete", "http.patch", "client.get", "client.post", "client.put", "client.delete", "client.patch", "this.http.get", "this.http.post", "this.http.put", "this.http.delete", "this.client.get", "this.client.post"]
+requires_import = "axios"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "ts.ky"
+match = ["ky", "ky.get", "ky.post", "ky.put", "ky.delete", "ky.patch", "ky.head"]
+requires_import = "ky"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "ts.prisma.read"
+match = ["*.findMany", "*.findUnique", "*.findFirst", "*.findUniqueOrThrow", "*.findFirstOrThrow", "*.count", "*.aggregate", "*.groupBy", "*.$queryRaw", "*.$queryRawUnsafe"]
+requires_import = "prisma"
+kind = "db_read"
+
+[[effect]]
+id = "ts.prisma.write"
+match = ["*.create", "*.createMany", "*.update", "*.updateMany", "*.upsert", "*.delete", "*.deleteMany", "*.$executeRaw", "*.$executeRawUnsafe", "*.$transaction"]
+requires_import = "prisma"
+kind = "db_write"
+
+[[effect]]
+id = "ts.knex"
+match = ["knex", "knex.raw", "*.raw", "*.select", "*.first", "*.where", "*.insert", "*.update", "*.del", "*.delete", "*.truncate", "*.returning"]
+requires_import = "knex"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "ts.knex.write"
+match = ["*.insert", "*.update", "*.del", "*.delete", "*.truncate", "*.increment", "*.decrement"]
+requires_import = "knex"
+kind = "db_write"
+
+[[effect]]
+id = "ts.drizzle.read"
+match = ["db.select", "db.query.*", "*.select", "*.findMany", "*.findFirst", "db.execute", "*.execute"]
+requires_import = "drizzle-orm"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "ts.drizzle.write"
+match = ["db.insert", "db.update", "db.delete", "*.insert", "*.update", "*.delete", "db.transaction"]
+requires_import = "drizzle-orm"
+kind = "db_write"
+
+[[effect]]
+id = "ts.pg"
+match = ["pool.query", "client.query", "*.query", "this.pool.query", "this.client.query", "sql", "sql.unsafe", "postgres"]
+requires_import = "pg"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "ts.postgres_js"
+match = ["sql", "sql.unsafe", "sql.begin"]
+requires_import = "postgres"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "ts.typeorm.read"
+match = ["*.find", "*.findOne", "*.findOneBy", "*.findBy", "*.findAndCount", "*.count", "*.getMany", "*.getOne", "*.getRawMany", "*.getRawOne", "*.createQueryBuilder"]
+requires_import = "typeorm"
+kind = "db_read"
+
+[[effect]]
+id = "ts.typeorm.write"
+match = ["*.save", "*.insert", "*.update", "*.delete", "*.remove", "*.upsert", "*.softDelete", "*.increment", "*.decrement"]
+requires_import = "typeorm"
+kind = "db_write"
+
+[[effect]]
+id = "ts.mongoose.read"
+match = ["*.find", "*.findOne", "*.findById", "*.countDocuments", "*.aggregate", "*.exists", "*.distinct"]
+requires_import = "mongoose"
+kind = "db_read"
+
+[[effect]]
+id = "ts.mongoose.write"
+match = ["*.save", "*.create", "*.insertMany", "*.updateOne", "*.updateMany", "*.findByIdAndUpdate", "*.findOneAndUpdate", "*.deleteOne", "*.deleteMany", "*.findByIdAndDelete"]
+requires_import = "mongoose"
+kind = "db_write"
+
+[[effect]]
+id = "ts.redis.read"
+match = ["*.get", "*.hGet", "*.hget", "*.hGetAll", "*.hgetall", "*.lRange", "*.lrange", "*.sMembers", "*.exists", "*.keys", "*.mGet", "*.mget"]
+requires_import = "redis"
+kind = "db_read"
+target = "arg0"
+
+[[effect]]
+id = "ts.redis.write"
+match = ["*.set", "*.setEx", "*.setex", "*.hSet", "*.hset", "*.del", "*.incr", "*.decr", "*.lPush", "*.lpush", "*.rPush", "*.rpush", "*.sAdd", "*.sadd", "*.expire"]
+requires_import = "redis"
+kind = "db_write"
+target = "arg0"
+
+[[effect]]
+id = "ts.ioredis.read"
+match = ["*.get", "*.hget", "*.hgetall", "*.lrange", "*.smembers", "*.exists", "*.keys", "*.mget"]
+requires_import = "ioredis"
+kind = "db_read"
+target = "arg0"
+
+[[effect]]
+id = "ts.ioredis.write"
+match = ["*.set", "*.setex", "*.hset", "*.del", "*.incr", "*.decr", "*.lpush", "*.rpush", "*.sadd", "*.expire"]
+requires_import = "ioredis"
+kind = "db_write"
+target = "arg0"
+
+[[effect]]
+id = "ts.fs.read"
+match = ["fs.readFile", "fs.readFileSync", "fs.readdir", "fs.readdirSync", "fs.stat", "fs.statSync", "fs.existsSync", "fs.access", "fs.createReadStream", "fs.promises.readFile", "fs.promises.readdir", "fs.promises.stat", "fs/promises.readFile", "fs/promises.readdir", "fs/promises.stat", "readFile", "readFileSync", "readdir", "readdirSync", "stat", "existsSync", "Bun.file", "Deno.readTextFile", "Deno.readFile"]
+kind = "fs_read"
+target = "arg0"
+
+[[effect]]
+id = "ts.fs.write"
+match = ["fs.writeFile", "fs.writeFileSync", "fs.appendFile", "fs.appendFileSync", "fs.mkdir", "fs.mkdirSync", "fs.unlink", "fs.unlinkSync", "fs.rm", "fs.rmSync", "fs.rename", "fs.renameSync", "fs.copyFile", "fs.createWriteStream", "fs.promises.writeFile", "fs.promises.mkdir", "fs.promises.unlink", "fs.promises.rm", "fs.promises.rename", "fs/promises.writeFile", "fs/promises.mkdir", "fs/promises.unlink", "fs/promises.rm", "writeFile", "writeFileSync", "mkdir", "mkdirSync", "unlink", "rm", "Bun.write", "Deno.writeTextFile", "Deno.writeFile"]
+kind = "fs_write"
+target = "arg0"
+
+[[effect]]
+id = "ts.child_process"
+match = ["child_process.exec", "child_process.execSync", "child_process.spawn", "child_process.spawnSync", "child_process.execFile", "child_process.execFileSync", "child_process.fork", "exec", "execSync", "spawn", "spawnSync", "execFile", "execFileSync", "fork", "execa", "Bun.spawn", "Deno.Command"]
+requires_import = "child_process"
+kind = "process"
+target = "arg0"
+
+[[effect]]
+id = "ts.execa"
+match = ["execa", "$", "execaCommand", "execaSync"]
+requires_import = "execa"
+kind = "process"
+target = "arg0"
+
+[[effect]]
+id = "ts.promise.all"
+match = ["Promise.all", "Promise.allSettled", "Promise.race", "Promise.any"]
+kind = "join"
+spawn = true
+
+[[effect]]
+id = "ts.timers"
+match = ["setTimeout", "setInterval", "setImmediate", "queueMicrotask", "process.nextTick", "requestAnimationFrame", "requestIdleCallback", "timers/promises.setTimeout", "sleep", "delay"]
+kind = "sleep"
+spawn = true
+
+[[effect]]
+id = "ts.worker"
+match = ["Worker", "worker_threads.Worker", "SharedWorker", "navigator.serviceWorker.register"]
+kind = "spawn"
+target = "arg0"
+
+[[effect]]
+id = "ts.websocket.send"
+match = ["WebSocket", "ws.send", "socket.send", "this.ws.send", "this.socket.send", "*.ws.send", "*.socket.send"]
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "ts.eventsource"
+match = ["EventSource", "*.addEventListener", "*.onmessage", "source.onmessage"]
+requires_import = "EventSource"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "ts.eventsource.ctor"
+match = ["EventSource"]
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "ts.socketio.emit"
+match = ["socket.emit", "io.emit", "io.to", "*.emit", "*.broadcast.emit", "this.socket.emit", "this.io.emit"]
+requires_import = "socket.io"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "ts.socketio.on"
+match = ["socket.on", "io.on", "this.socket.on", "this.io.on"]
+requires_import = "socket.io"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "ts.kafkajs.produce"
+match = ["*.send", "*.sendBatch"]
+requires_import = "kafkajs"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "ts.kafkajs.consume"
+match = ["*.subscribe", "*.run"]
+requires_import = "kafkajs"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "ts.nats.publish"
+match = ["*.publish", "*.request"]
+requires_import = "nats"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "ts.nats.subscribe"
+match = ["*.subscribe"]
+requires_import = "nats"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "ts.amqplib.publish"
+match = ["*.publish", "*.sendToQueue"]
+requires_import = "amqplib"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "ts.amqplib.consume"
+match = ["*.consume"]
+requires_import = "amqplib"
+kind = "subscribe"
+target = "arg0"
+
+# Routes
+
+[[route]]
+id = "ts.express.builder"
+style = "builder"
+match = ["app.get", "app.post", "app.put", "app.delete", "app.patch", "app.head", "app.options", "app.all", "app.use", "router.get", "router.post", "router.put", "router.delete", "router.patch", "router.all", "router.use", "*Router.get", "*Router.post", "*Router.put", "*Router.delete", "*Router.patch", "server.get", "server.post", "server.put", "server.delete", "server.patch", "fastify.get", "fastify.post", "fastify.put", "fastify.delete", "fastify.patch", "fastify.route", "app.route", "hono.get", "hono.post", "app.openapi", "server.route"]
+
+[[route]]
+id = "ts.nest.decorator"
+style = "attribute"
+match = ["Get", "Post", "Put", "Delete", "Patch", "Head", "Options", "All"]

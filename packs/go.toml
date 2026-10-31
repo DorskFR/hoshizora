@@ -1,0 +1,189 @@
+# Go effect, route and client rules. See crates/hoshizora-core/src/packs.rs for the format.
+
+[[effect]]
+id = "go.net_http.client"
+language = "go"
+match = ["http.Get", "http.Post", "http.PostForm", "http.Head", "http.NewRequest", "http.NewRequestWithContext", "*.Do", "client.Get", "client.Post", "*.Client.Get", "*.Client.Post", "*.Client.Do", "resty.*", "req.Get", "req.Post"]
+requires_import = "net/http"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "go.database_sql"
+language = "go"
+match = ["*.Query", "*.QueryRow", "*.QueryContext", "*.QueryRowContext", "*.Exec", "*.ExecContext", "*.Prepare", "*.PrepareContext"]
+requires_import = "database/sql"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "go.sqlx"
+language = "go"
+match = ["*.Select", "*.Get", "*.SelectContext", "*.GetContext", "*.Queryx", "*.QueryRowx", "*.NamedExec", "*.NamedQuery", "*.MustExec", "*.Exec", "*.ExecContext", "*.Query", "*.QueryRow"]
+requires_import = "sqlx"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "go.pgx"
+language = "go"
+match = ["*.Query", "*.QueryRow", "*.Exec", "*.SendBatch", "*.CopyFrom", "*.Begin"]
+requires_import = "pgx"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "go.gorm.read"
+language = "go"
+match = ["*.Find", "*.First", "*.Last", "*.Take", "*.Scan", "*.Count", "*.Pluck", "*.Rows", "*.Raw", "*.Preload", "*.Joins"]
+requires_import = "gorm"
+kind = "db_read"
+target = "sql"
+
+[[effect]]
+id = "go.gorm.write"
+language = "go"
+match = ["*.Create", "*.Save", "*.Update", "*.Updates", "*.UpdateColumn", "*.UpdateColumns", "*.Delete", "*.FirstOrCreate", "*.Exec", "*.AutoMigrate", "*.Transaction"]
+requires_import = "gorm"
+kind = "db_write"
+target = "sql"
+
+[[effect]]
+id = "go.redis.read"
+language = "go"
+match = ["*.Get", "*.HGet", "*.HGetAll", "*.LRange", "*.SMembers", "*.Exists", "*.Keys", "*.MGet"]
+requires_import = "redis"
+kind = "db_read"
+target = "arg0"
+
+[[effect]]
+id = "go.redis.write"
+language = "go"
+match = ["*.Set", "*.SetEx", "*.SetNX", "*.HSet", "*.Del", "*.Incr", "*.Decr", "*.LPush", "*.RPush", "*.SAdd", "*.Expire"]
+requires_import = "redis"
+kind = "db_write"
+target = "arg0"
+
+[[effect]]
+id = "go.os.fs_read"
+language = "go"
+match = ["os.Open", "os.ReadFile", "os.ReadDir", "os.Stat", "os.Lstat", "ioutil.ReadFile", "ioutil.ReadDir", "ioutil.ReadAll", "io.ReadAll", "filepath.Walk", "filepath.WalkDir", "filepath.Glob", "*.Readdir", "*.ReadDir", "bufio.NewScanner"]
+kind = "fs_read"
+target = "arg0"
+
+[[effect]]
+id = "go.os.fs_write"
+language = "go"
+match = ["os.Create", "os.WriteFile", "os.Mkdir", "os.MkdirAll", "os.Remove", "os.RemoveAll", "os.Rename", "os.OpenFile", "os.Truncate", "os.Chmod", "ioutil.WriteFile", "*.WriteString", "*.WriteFile", "io.Copy"]
+kind = "fs_write"
+target = "arg0"
+
+[[effect]]
+id = "go.os.exec"
+language = "go"
+match = ["exec.Command", "exec.CommandContext", "*.Run", "*.Start", "*.Output", "*.CombinedOutput", "syscall.Exec", "os.StartProcess"]
+requires_import = "os/exec"
+kind = "process"
+target = "arg0"
+
+[[effect]]
+id = "go.goroutine"
+language = "go"
+match = ["go"]
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "go.errgroup"
+language = "go"
+match = ["*.Go", "*.TryGo", "errgroup.WithContext", "*.SetLimit"]
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "go.sync.lock"
+language = "go"
+match = ["*.Lock", "*.RLock", "*.TryLock", "*.TryRLock", "*.Acquire"]
+kind = "lock"
+
+[[effect]]
+id = "go.sync.wait"
+language = "go"
+match = ["*.Wait", "*.Wait()", "wg.Wait", "g.Wait"]
+kind = "join"
+
+[[effect]]
+id = "go.time.sleep"
+language = "go"
+match = ["time.Sleep", "time.After", "time.Tick", "time.NewTicker", "time.NewTimer", "<-time.After"]
+kind = "sleep"
+
+[[effect]]
+id = "go.channel"
+language = "go"
+match = ["<-", "chan.send", "chan.recv", "*.Send", "*.Recv"]
+kind = "publish"
+
+[[effect]]
+id = "go.nats.publish"
+language = "go"
+match = ["*.Publish", "*.PublishMsg", "*.Request", "*.RequestWithContext", "*.PublishAsync"]
+requires_import = "nats"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "go.nats.subscribe"
+language = "go"
+match = ["*.Subscribe", "*.QueueSubscribe", "*.SubscribeSync", "*.ChanSubscribe", "*.Consume", "*.Fetch"]
+requires_import = "nats"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "go.kafka.produce"
+language = "go"
+match = ["*.WriteMessages", "*.Produce", "*.SendMessage", "*.SendMessages", "*.ProduceSync", "*.ProduceAsync"]
+requires_import = "kafka"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "go.kafka.consume"
+language = "go"
+match = ["*.ReadMessage", "*.FetchMessage", "*.ConsumePartition", "*.Consume", "*.PollFetches", "*.Poll", "*.SubscribeTopics", "*.Subscribe"]
+requires_import = "kafka"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "go.amqp.publish"
+language = "go"
+match = ["*.Publish", "*.PublishWithContext"]
+requires_import = "amqp"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "go.amqp.consume"
+language = "go"
+match = ["*.Consume"]
+requires_import = "amqp"
+kind = "subscribe"
+target = "arg0"
+
+# Routes
+
+[[route]]
+id = "go.net_http.builder"
+language = "go"
+style = "builder"
+match = ["http.HandleFunc", "http.Handle", "mux.HandleFunc", "mux.Handle", "*.HandleFunc", "*.Handle", "*.Handler", "*.HandlerFunc"]
+method = "ANY"
+
+[[route]]
+id = "go.router.builder"
+language = "go"
+style = "builder"
+match = ["r.GET", "r.POST", "r.PUT", "r.DELETE", "r.PATCH", "r.HEAD", "r.OPTIONS", "r.Any", "*.GET", "*.POST", "*.PUT", "*.DELETE", "*.PATCH", "*.HEAD", "*.OPTIONS", "*.Any", "*.Get", "*.Post", "*.Put", "*.Delete", "*.Patch", "*.Head", "*.Options", "*.Method", "*.MethodFunc", "*.Path", "*.PathPrefix", "*.Mount", "*.Group", "*.Route"]
