@@ -354,16 +354,10 @@ async fn insights<Q: GraphQueries>(State(state): State<Arc<AppState<Q>>>) -> Jso
 }
 
 pub fn all_insights<Q: GraphQueries>(state: &AppState<Q>) -> Vec<Insight> {
-    let runtime = state
+    let statics = state.queries.static_insights();
+    state
         .runtime()
-        .insights(hoshizora_runtime::now_unix_nanos());
-    let mut out = state.queries.static_insights();
-    let (never, rest): (Vec<Insight>, Vec<Insight>) = runtime
-        .into_iter()
-        .partition(|i| matches!(i, Insight::NeverObserved { .. }));
-    out.extend(rest);
-    out.extend(never);
-    out
+        .insights(hoshizora_runtime::now_unix_nanos(), &statics)
 }
 
 async fn traces_ingest<Q: GraphQueries>(

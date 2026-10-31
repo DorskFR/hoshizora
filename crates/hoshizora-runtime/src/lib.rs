@@ -117,12 +117,14 @@ impl<L: NodeLookup> Runtime<L> {
         self.store.get(trace_id)
     }
 
-    pub fn insights(&self, now_unix_nanos: u64) -> Vec<Insight> {
+    /// Runtime findings merged with `static_insights` (from `Index::static_insights`).
+    pub fn insights(&self, now_unix_nanos: u64, static_insights: &[Insight]) -> Vec<Insight> {
         insights::runtime_insights(
             &self.config,
             &self.lookup,
             &self.store,
             &self.stats,
+            static_insights,
             self.first_ingest_unix_nanos,
             now_unix_nanos,
         )

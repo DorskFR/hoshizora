@@ -101,10 +101,18 @@ impl JoinCache {
         if let Some(id) = self.routes.get(&(String::new(), path.clone())) {
             return Some(id);
         }
-        match self.route_paths.get(&path).map(Vec::as_slice) {
-            Some([only]) => Some(only),
-            _ => None,
+        if let Some([only]) = self.route_paths.get(&path).map(Vec::as_slice) {
+            return Some(only);
         }
+        let method = method.map(str::to_ascii_uppercase);
+        let mut matches = self.routes.iter().filter(|((m, pattern), _)| {
+            method
+                .as_ref()
+                .is_none_or(|wanted| m.is_empty() || m == wanted)
+                && pattern_matches(pattern, &path)
+        });
+        let (_, first) = matches.next()?;
+        matches.next().is_none().then_some(first)
     }
 
     pub fn table(&self, name: &str) -> Option<&NodeId> {
@@ -126,6 +134,13 @@ impl JoinCache {
             .get(&host)
             .or_else(|| host.rsplit_once(':').and_then(|(h, _)| self.hosts.get(h)))
     }
+}
+
+/// `/stars/{}` matches `/stars/42`; a `{}` segment stands for exactly one concrete segment.
+fn pattern_matches(pattern: &str, concrete: &str) -> bool {
+    let p: Vec<&str> = pattern.split('/').collect();
+    let c: Vec<&str> = concrete.split('/').collect();
+    p.len() == c.len() && p.iter().zip(&c).all(|(a, b)| *a == "{}" || a == b)
 }
 
 fn synthetic_name(node: &Node) -> &str {
@@ -181,7 +196,11 @@ fn attr<'a>(span: &'a RuntimeSpan, keys: &[&str]) -> Option<&'a str> {
 
 /// Sets `span.node` and `span.join` to the first method that matches.
 pub fn join(span: &mut RuntimeSpan, lookup: &dyn NodeLookup, cache: &JoinCache) {
-    let found = by_code_location(span, lookup, cache)
+    let server_route = (span.kind == SpanKind::Server && attr(span, &["http.route"]).is_some())
+        .then(|| by_http_route(span, cache))
+        .flatten();
+    let found = server_route
+        .or_else(|| by_code_location(span, lookup, cache))
         .or_else(|| by_code_function(span, lookup))
         .or_else(|| by_http_route(span, cache))
         .or_else(|| by_db_table(span, cache))
@@ -291,15 +310,52 @@ fn namespace_score(node: &Node, segments: &[String]) -> usize {
     segments.iter().filter(|s| haystack.contains(s)).count()
 }
 
+/// Server spans match on `http.route`. Client spans whose URL path matches a route node
+/// (browser `fetch` to our own API) match too, unless the host is a known `host:` node.
 fn by_http_route(span: &RuntimeSpan, cache: &JoinCache) -> Option<(NodeId, JoinMethod)> {
-    if span.kind != SpanKind::Server {
-        return None;
-    }
-    let route = attr(span, &["http.route"])?;
     let method = attr(span, &["http.request.method", "http.method"]);
+    let path = match span.kind {
+        SpanKind::Server => attr(span, &["http.route"])?.to_string(),
+        SpanKind::Client => {
+            let url = attr(span, &["url.full", "http.url"])?;
+            let host = attr(span, &["server.address", "net.peer.name"])
+                .map(str::to_string)
+                .or_else(|| url_host(url));
+            if host.is_some_and(|h| !is_local_host(&h) && cache.host(&h).is_some()) {
+                return None;
+            }
+            url_path(url)?
+        }
+        _ => return None,
+    };
     cache
-        .route(method, route)
+        .route(method, &path)
         .map(|id| (id.clone(), JoinMethod::HttpRoute))
+}
+
+fn is_local_host(host: &str) -> bool {
+    let h = host.rsplit_once(':').map_or(host, |(h, port)| {
+        if port.chars().all(|c| c.is_ascii_digit()) {
+            h
+        } else {
+            host
+        }
+    });
+    let h = h
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    h == "localhost"
+        || h == "::1"
+        || h == "0.0.0.0"
+        || h.starts_with("127.")
+        || h.ends_with(".localhost")
+}
+
+pub fn url_path(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let path_start = rest.find('/')?;
+    let path = &rest[path_start..];
+    Some(path.split(['?', '#']).next().unwrap_or(path).to_string())
 }
 
 fn by_db_table(span: &RuntimeSpan, cache: &JoinCache) -> Option<(NodeId, JoinMethod)> {
@@ -509,6 +565,7 @@ pub(crate) mod tests {
                 node("table:sessions", NodeKind::Table, None, None),
                 node("topic:session.spawn", NodeKind::Topic, None, None),
                 node("host:api.github.com", NodeKind::Host, None, None),
+                node("host:localhost", NodeKind::Host, None, None),
             ],
         }
     }
@@ -800,10 +857,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stronger_method_wins() {
+    fn stronger_method_wins_except_server_spans_with_a_route() {
         let mut s = span(
             "main",
-            SpanKind::Server,
+            SpanKind::Internal,
             &[
                 ("http.route", "/api/sessions"),
                 ("http.request.method", "POST"),
@@ -818,6 +875,117 @@ pub(crate) mod tests {
                 Some(JoinMethod::CodeFunction)
             )
         );
+        let mut s = span(
+            "POST /api/sessions",
+            SpanKind::Server,
+            &[
+                ("http.route", "/api/sessions"),
+                ("http.request.method", "POST"),
+                ("code.file.path", "crates/api/src/main.rs"),
+                ("code.line.number", "10"),
+                ("code.function.name", "main"),
+            ],
+        );
+        assert_eq!(
+            joined(&mut s),
+            (
+                Some("route:POST /api/sessions".into()),
+                Some(JoinMethod::HttpRoute)
+            )
+        );
+        let mut s = span(
+            "POST /nope",
+            SpanKind::Server,
+            &[("http.route", "/nope"), ("code.function.name", "main")],
+        );
+        assert_eq!(
+            joined(&mut s),
+            (
+                Some("fn:crates/api/src/main.rs#main".into()),
+                Some(JoinMethod::CodeFunction)
+            )
+        );
+    }
+
+    #[test]
+    fn client_spans_to_own_routes_join_the_route_not_the_host() {
+        let mut s = span(
+            "HTTP POST",
+            SpanKind::Client,
+            &[
+                ("http.method", "POST"),
+                ("http.url", "http://localhost:8080/api/sessions"),
+            ],
+        );
+        assert_eq!(
+            joined(&mut s),
+            (
+                Some("route:POST /api/sessions".into()),
+                Some(JoinMethod::HttpRoute)
+            )
+        );
+        let mut s = span(
+            "GET",
+            SpanKind::Client,
+            &[
+                ("http.request.method", "GET"),
+                ("url.full", "http://api:8080/api/sessions/42?x=1"),
+            ],
+        );
+        assert_eq!(
+            joined(&mut s),
+            (
+                Some("route:GET /api/sessions/{id}".into()),
+                Some(JoinMethod::HttpRoute)
+            )
+        );
+        let mut s = span(
+            "POST",
+            SpanKind::Client,
+            &[
+                ("http.method", "POST"),
+                ("url.full", "https://api.github.com/api/sessions"),
+            ],
+        );
+        assert_eq!(
+            joined(&mut s),
+            (Some("host:api.github.com".into()), Some(JoinMethod::Host))
+        );
+        let mut s = span(
+            "GET",
+            SpanKind::Client,
+            &[
+                ("http.method", "GET"),
+                ("url.full", "http://localhost/unknown"),
+            ],
+        );
+        assert_eq!(
+            joined(&mut s),
+            (Some("host:localhost".into()), Some(JoinMethod::Host))
+        );
+        let mut s = span(
+            "GET",
+            SpanKind::Client,
+            &[
+                ("http.method", "GET"),
+                ("url.full", "http://127.0.0.1:8081/api/sessions/7"),
+                ("server.address", "127.0.0.1"),
+            ],
+        );
+        assert_eq!(
+            joined(&mut s),
+            (
+                Some("route:GET /api/sessions/{id}".into()),
+                Some(JoinMethod::HttpRoute)
+            )
+        );
+        assert!(
+            is_local_host("[::1]:8080")
+                && is_local_host("LOCALHOST")
+                && !is_local_host("api.github.com:443")
+        );
+        assert_eq!(url_path("http://h:1/a/b?q#f").as_deref(), Some("/a/b"));
+        assert_eq!(url_path("http://h"), None);
     }
 
     #[test]

@@ -1,8 +1,12 @@
-//! Insights that need runtime data. Static ones come from `Index::static_insights`.
+//! Runtime insights, merged with the static ones from `Index::static_insights`.
+//!
+//! Runtime data confirms and measures static candidates (Parallelisable, IoInLoop, Inefficient)
+//! and adds what only traces can show (HotPath, Waiting, NeverObserved). Output order: entries
+//! with runtime evidence, then static-only ones, then NeverObserved.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use hoshizora_model::{Insight, NodeId, NodeKind};
+use hoshizora_model::{EffectKind, Insight, NodeId, NodeKind, RuntimeSpan};
 
 use crate::NodeLookup;
 use crate::config::RuntimeConfig;
@@ -14,15 +18,94 @@ pub fn runtime_insights(
     lookup: &dyn NodeLookup,
     store: &TraceStore,
     stats: &StatsTable,
+    static_insights: &[Insight],
     first_ingest_unix_nanos: Option<u64>,
     now_unix_nanos: u64,
 ) -> Vec<Insight> {
     let all = stats.all(now_unix_nanos, config.rate_window_secs);
-    let mut out = Vec::new();
+    let p50_by_node: HashMap<&NodeId, u64> = all.iter().map(|s| (&s.node, s.p50_nanos)).collect();
+    let self_p95 = self_p95_per_node(store);
+    let io_calls = io_calls_per_parent(store, lookup, config.io_in_loop_calls);
+
+    let mut strong: Vec<Insight> = Vec::new();
+    let mut weak: Vec<Insight> = Vec::new();
+    let mut static_only: Vec<Insight> = Vec::new();
+    let mut merged: HashSet<(&'static str, NodeId)> = HashSet::new();
+
+    for insight in static_insights {
+        match insight {
+            Insight::Parallelisable { node, children, .. } => {
+                match confirm_parallelisable(store, lookup, node, children) {
+                    Some(saved) => {
+                        let parent_p50 = p50_by_node.get(node).copied().unwrap_or(0);
+                        let out = Insight::Parallelisable {
+                            node: node.clone(),
+                            children: children.clone(),
+                            saved_nanos: saved,
+                        };
+                        merged.insert(("parallelisable", node.clone()));
+                        if saved > 1_000_000 && saved as f64 > 0.05 * parent_p50 as f64 {
+                            strong.push(out);
+                        } else {
+                            weak.push(out);
+                        }
+                    }
+                    None => static_only.push(insight.clone()),
+                }
+            }
+            Insight::IoInLoop {
+                node, effect, line, ..
+            } => {
+                let observed = io_calls.get(node).and_then(|children| {
+                    children
+                        .iter()
+                        .find(|(child, _)| {
+                            lookup
+                                .node(child)
+                                .is_some_and(|n| effect.contains(n.name.as_str()))
+                        })
+                        .or_else(|| children.iter().max_by(|a, b| a.1.total_cmp(&b.1)))
+                        .map(|(_, per_parent)| *per_parent)
+                });
+                let out = Insight::IoInLoop {
+                    node: node.clone(),
+                    effect: effect.clone(),
+                    line: *line,
+                    observed_calls_per_parent: observed,
+                };
+                if observed.is_some() {
+                    merged.insert(("io_in_loop", node.clone()));
+                    strong.push(out);
+                } else {
+                    static_only.push(out);
+                }
+            }
+            Insight::Inefficient {
+                node,
+                complexity,
+                reasons,
+                ..
+            } => {
+                let out = Insight::Inefficient {
+                    node: node.clone(),
+                    self_p95_nanos: self_p95.get(node).copied().unwrap_or(0),
+                    complexity: complexity.clone(),
+                    reasons: reasons.clone(),
+                };
+                merged.insert(("inefficient", node.clone()));
+                if self_p95.contains_key(node) {
+                    strong.push(out);
+                } else {
+                    static_only.push(out);
+                }
+            }
+            other => static_only.push(other.clone()),
+        }
+    }
 
     for s in &all {
         if s.rate_per_sec >= config.hot_rate_per_sec && s.p95_nanos <= config.hot_p95_nanos {
-            out.push(Insight::HotPath {
+            strong.push(Insight::HotPath {
                 node: s.node.clone(),
                 rate_per_sec: s.rate_per_sec,
                 p95_nanos: s.p95_nanos,
@@ -30,7 +113,6 @@ pub fn runtime_insights(
         }
     }
 
-    let self_p95 = self_p95_per_node(store);
     let mut sorted: Vec<u64> = self_p95.values().copied().collect();
     sorted.sort_unstable();
     let median = sorted
@@ -38,6 +120,9 @@ pub fn runtime_insights(
         .copied()
         .unwrap_or(0);
     for (node, p95) in &self_p95 {
+        if merged.contains(&("inefficient", node.clone())) {
+            continue;
+        }
         let Some(function) = lookup.node(node).and_then(|n| n.function.as_ref()) else {
             continue;
         };
@@ -57,7 +142,7 @@ pub fn runtime_insights(
                 reasons.push(format!("loop depth {}", function.max_loop_depth));
             }
             reasons.extend(function.complexity.basis.iter().cloned());
-            out.push(Insight::Inefficient {
+            strong.push(Insight::Inefficient {
                 node: node.clone(),
                 self_p95_nanos: *p95,
                 complexity: function.complexity.time.clone(),
@@ -73,7 +158,7 @@ pub fn runtime_insights(
         }
         let ratio = s.wait_nanos as f64 / s.total_nanos as f64;
         if ratio > config.waiting_ratio {
-            out.push(Insight::Waiting {
+            strong.push(Insight::Waiting {
                 node: s.node.clone(),
                 wait_ratio: ratio,
                 on: waits_on.get(&s.node).cloned().unwrap_or_default(),
@@ -81,8 +166,23 @@ pub fn runtime_insights(
         }
     }
 
-    out.extend(parallelisable(store));
-    out.extend(io_in_loop(store, config.io_in_loop_calls));
+    for (parent, children) in &io_calls {
+        if merged.contains(&("io_in_loop", parent.clone())) {
+            continue;
+        }
+        for (child, per_parent) in children {
+            strong.push(Insight::IoInLoop {
+                node: parent.clone(),
+                effect: child.clone(),
+                line: 0,
+                observed_calls_per_parent: Some(*per_parent),
+            });
+        }
+    }
+
+    let mut out = strong;
+    out.extend(weak);
+    out.extend(static_only);
 
     let old_enough = first_ingest_unix_nanos.is_some_and(|t| {
         now_unix_nanos.saturating_sub(t) >= config.never_observed_after_secs * 1_000_000_000
@@ -134,61 +234,106 @@ fn wait_targets(store: &TraceStore) -> HashMap<NodeId, Vec<NodeId>> {
     out
 }
 
-/// Under one parent span, ≥2 children (joined to distinct nodes) that never overlap in time.
-/// Running them concurrently would save the sum of all but the longest.
-fn parallelisable(store: &TraceStore) -> Vec<Insight> {
-    let mut best: BTreeMap<NodeId, (Vec<NodeId>, u64)> = BTreeMap::new();
+/// Static candidate children are `callee:line` labels; they match an observed child span when
+/// the span's node is named like the callee.
+fn child_matches_label(lookup: &dyn NodeLookup, child: &RuntimeSpan, label: &str) -> bool {
+    let Some(node_id) = &child.node else {
+        return false;
+    };
+    let callee = label.rsplit_once(':').map_or(label, |(c, line)| {
+        if line.chars().all(|ch| ch.is_ascii_digit()) {
+            c
+        } else {
+            label
+        }
+    });
+    let short = callee.rsplit(['.', ':']).next().unwrap_or(callee);
+    if node_id == label || node_id == callee {
+        return true;
+    }
+    lookup
+        .node(node_id)
+        .is_some_and(|n| n.name == short || n.qualified_name == callee)
+}
+
+/// Median over observed parent spans of the time the static candidate's children would save
+/// when run concurrently: their union minus the longest one.
+fn confirm_parallelisable(
+    store: &TraceStore,
+    lookup: &dyn NodeLookup,
+    parent_node: &str,
+    labels: &[String],
+) -> Option<u64> {
+    let mut savings = Vec::new();
     for (parent, children) in store.parents_with_children() {
-        let Some(pn) = &parent.node else { continue };
-        let mut joined: Vec<_> = children.iter().filter(|c| c.node.is_some()).collect();
-        if joined.len() < 2 {
+        if parent.node.as_deref() != Some(parent_node) {
             continue;
         }
-        joined.sort_by_key(|c| c.start_unix_nanos);
-        let overlaps = joined
-            .windows(2)
-            .any(|w| w[1].start_unix_nanos < w[0].end_unix_nanos);
-        if overlaps {
+        let mut matched: Vec<&RuntimeSpan> = Vec::new();
+        let mut matched_labels: HashSet<&str> = HashSet::new();
+        for child in children {
+            if let Some(label) = labels
+                .iter()
+                .find(|l| child_matches_label(lookup, child, l))
+            {
+                matched.push(child);
+                matched_labels.insert(label.as_str());
+            }
+        }
+        if matched_labels.len() < 2 {
             continue;
         }
-        let mut nodes: Vec<NodeId> = joined.iter().filter_map(|c| c.node.clone()).collect();
-        nodes.dedup();
-        let distinct: HashSet<&NodeId> = nodes.iter().collect();
-        if distinct.len() < 2 {
-            continue;
-        }
-        let intervals: Vec<(u64, u64)> = joined
+        let intervals: Vec<(u64, u64)> = matched
             .iter()
             .map(|c| (c.start_unix_nanos, c.end_unix_nanos))
             .collect();
-        let total = union_within(&intervals, (parent.start_unix_nanos, parent.end_unix_nanos));
-        let longest = joined.iter().map(|c| c.duration_nanos()).max().unwrap_or(0);
-        let saved = total.saturating_sub(longest);
-        if saved == 0 {
-            continue;
-        }
-        let entry = best.entry(pn.clone()).or_insert((nodes.clone(), saved));
-        if saved > entry.1 {
-            *entry = (nodes, saved);
-        }
+        let union = union_within(&intervals, (parent.start_unix_nanos, parent.end_unix_nanos));
+        let longest = matched
+            .iter()
+            .map(|c| c.duration_nanos())
+            .max()
+            .unwrap_or(0);
+        savings.push(union.saturating_sub(longest));
     }
-    best.into_iter()
-        .map(|(node, (children, saved_nanos))| Insight::Parallelisable {
-            node,
-            children,
-            saved_nanos,
-        })
-        .collect()
+    if savings.is_empty() {
+        return None;
+    }
+    savings.sort_unstable();
+    Some(savings[savings.len() / 2])
 }
 
-/// The same child node called more than `threshold` times under one parent span.
-/// `observed_calls_per_parent` averages over every parent span that called it at all.
-fn io_in_loop(store: &TraceStore, threshold: usize) -> Vec<Insight> {
+fn is_io_child(lookup: &dyn NodeLookup, child: &RuntimeSpan) -> bool {
+    if is_wait(child) {
+        return true;
+    }
+    child.node.as_deref().is_some_and(|id| {
+        lookup.node(id).is_some_and(|n| {
+            let io = |k: &EffectKind| {
+                matches!(
+                    k,
+                    EffectKind::Network
+                        | EffectKind::DbRead
+                        | EffectKind::DbWrite
+                        | EffectKind::Publish
+                )
+            };
+            n.effects.direct.iter().any(|e| io(&e.kind)) || n.effects.transitive.iter().any(io)
+        })
+    })
+}
+
+/// Per parent node: I/O child nodes called more than `threshold` times under one parent span,
+/// with the average calls per parent span that called them at all.
+fn io_calls_per_parent(
+    store: &TraceStore,
+    lookup: &dyn NodeLookup,
+    threshold: usize,
+) -> BTreeMap<NodeId, Vec<(NodeId, f64)>> {
     let mut per_pair: HashMap<(NodeId, NodeId), (u64, u64, usize)> = HashMap::new();
     for (parent, children) in store.parents_with_children() {
         let Some(pn) = &parent.node else { continue };
         let mut counts: HashMap<&NodeId, usize> = HashMap::new();
-        for c in &children {
+        for c in children.iter().filter(|c| is_io_child(lookup, c)) {
             if let Some(cn) = &c.node {
                 *counts.entry(cn).or_default() += 1;
             }
@@ -200,25 +345,23 @@ fn io_in_loop(store: &TraceStore, threshold: usize) -> Vec<Insight> {
             e.2 = e.2.max(n);
         }
     }
-    let mut out: Vec<Insight> = per_pair
-        .into_iter()
-        .filter_map(|((parent, child), (calls, parents, max_in_one))| {
-            let per_parent = calls as f64 / parents as f64;
-            (max_in_one > threshold).then_some(Insight::IoInLoop {
-                node: parent,
-                effect: child,
-                line: 0,
-                observed_calls_per_parent: Some(per_parent),
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    let mut out: BTreeMap<NodeId, Vec<(NodeId, f64)>> = BTreeMap::new();
+    for ((parent, child), (calls, parents, max_in_one)) in per_pair {
+        if max_in_one > threshold {
+            out.entry(parent)
+                .or_default()
+                .push((child, calls as f64 / parents as f64));
+        }
+    }
+    for v in out.values_mut() {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use hoshizora_model::{Complexity, FunctionInfo, SpanKind, Visibility};
+    use hoshizora_model::{Complexity, Effect, FunctionInfo, SpanKind, Visibility};
 
     use super::*;
     use crate::join::tests::{FakeLookup, node, span};
@@ -232,7 +375,7 @@ mod tests {
         start: u64,
         end: u64,
         attrs: &[(&str, &str)],
-    ) -> hoshizora_model::RuntimeSpan {
+    ) -> RuntimeSpan {
         let mut sp = span(id, kind, attrs);
         sp.trace_id = trace.into();
         sp.span_id = id.into();
@@ -242,14 +385,8 @@ mod tests {
         sp
     }
 
-    fn lookup() -> FakeLookup {
-        let mut heavy = node(
-            "fn:a.rs#heavy",
-            NodeKind::Function,
-            Some("a.rs"),
-            Some((1, 50)),
-        );
-        heavy.function = Some(FunctionInfo {
+    fn function_info(cyclomatic: u32, depth: u32, time: &str) -> FunctionInfo {
+        FunctionInfo {
             signature: String::new(),
             params: vec![],
             returns: None,
@@ -258,19 +395,45 @@ mod tests {
             is_method: false,
             visibility: Visibility::Public,
             attributes: vec![],
-            cyclomatic: 15,
+            cyclomatic,
             branches: 0,
-            loops: 2,
-            max_loop_depth: 2,
+            loops: depth,
+            max_loop_depth: depth,
             recursive: false,
             complexity: Complexity {
-                time: "O(n^2)".into(),
+                time: time.into(),
                 space: "O(1)".into(),
                 basis: vec!["nested loops".into()],
             },
             fan_in: 0,
             fan_out: 0,
+        }
+    }
+
+    fn lookup() -> FakeLookup {
+        let mut heavy = node(
+            "fn:a.rs#heavy",
+            NodeKind::Function,
+            Some("a.rs"),
+            Some((1, 50)),
+        );
+        heavy.function = Some(function_info(15, 2, "O(n^2)"));
+        let mut db_call = node(
+            "fn:db.rs#count_rows",
+            NodeKind::Function,
+            Some("db.rs"),
+            Some((1, 5)),
+        );
+        db_call.effects.direct.push(Effect {
+            kind: EffectKind::DbRead,
+            target: Some("t".into()),
+            via: "sqlx::query".into(),
+            line: 2,
+            loop_depth: 0,
+            awaited: true,
+            rule: "rust.sqlx.query".into(),
         });
+        db_call.effects.transitive.push(EffectKind::DbRead);
         FakeLookup {
             nodes: vec![
                 heavy,
@@ -286,6 +449,13 @@ mod tests {
                     Some("a.rs"),
                     Some((80, 90)),
                 ),
+                node(
+                    "fn:a.rs#pure",
+                    NodeKind::Function,
+                    Some("a.rs"),
+                    Some((91, 95)),
+                ),
+                db_call,
                 node("host:api", NodeKind::Host, None, None),
                 node("table:t", NodeKind::Table, None, None),
             ],
@@ -294,143 +464,259 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
-    #[test]
-    fn parallelisable_waiting_and_io_in_loop() {
-        let mut rt = Runtime::new(RuntimeConfig::default(), lookup());
-        let spans = vec![
-            s(
-                "t1",
-                "p",
-                None,
-                SpanKind::Server,
-                0,
-                100 * MS,
-                &[("code.function.name", "light")],
-            ),
-            s(
-                "t1",
-                "c1",
-                Some("p"),
-                SpanKind::Client,
-                0,
-                40 * MS,
-                &[("server.address", "api")],
-            ),
-            s(
-                "t1",
-                "c2",
-                Some("p"),
-                SpanKind::Client,
-                40 * MS,
-                80 * MS,
-                &[("db.collection.name", "t")],
-            ),
-            s(
-                "t2",
-                "p",
-                None,
-                SpanKind::Server,
-                0,
-                100 * MS,
-                &[("code.function.name", "light")],
-            ),
-            s(
-                "t2",
-                "c1",
-                Some("p"),
-                SpanKind::Client,
-                0,
-                40 * MS,
-                &[("server.address", "api")],
-            ),
-            s(
-                "t2",
-                "c2",
-                Some("p"),
-                SpanKind::Client,
-                10 * MS,
-                80 * MS,
-                &[("db.collection.name", "t")],
-            ),
-        ];
-        let events = rt.ingest(spans, 1);
-        assert_eq!(events.len(), 6);
-        let insights = rt.insights(1);
-        let par: Vec<_> = insights
-            .iter()
-            .filter(|i| matches!(i, Insight::Parallelisable { .. }))
-            .collect();
-        assert_eq!(
-            par,
-            vec![&Insight::Parallelisable {
-                node: "fn:a.rs#light".into(),
-                children: vec!["host:api".into(), "table:t".into()],
-                saved_nanos: 40 * MS,
-            }]
-        );
-        let waiting: Vec<_> = insights
-            .iter()
-            .filter(|i| matches!(i, Insight::Waiting { .. }))
-            .collect();
-        assert_eq!(waiting.len(), 1);
-        match waiting[0] {
-            Insight::Waiting {
-                node,
-                wait_ratio,
-                on,
-            } => {
-                assert_eq!(node, "fn:a.rs#light");
-                assert!((wait_ratio - 0.8).abs() < 1e-9, "{wait_ratio}");
-                assert_eq!(on, &vec!["host:api".to_string(), "table:t".to_string()]);
-            }
-            _ => unreachable!(),
-        }
-        assert!(
-            !insights
-                .iter()
-                .any(|i| matches!(i, Insight::NeverObserved { .. }))
-        );
-
-        let mut spans = vec![s(
-            "t3",
+    fn parent(trace: &str, start: u64, end: u64) -> RuntimeSpan {
+        s(
+            trace,
             "p",
             None,
             SpanKind::Server,
-            0,
-            100 * MS,
+            start,
+            end,
             &[("code.function.name", "light")],
-        )];
-        for i in 0..5u64 {
+        )
+    }
+
+    #[test]
+    fn parallelisable_only_confirms_static_candidates() {
+        let mut rt = Runtime::new(RuntimeConfig::default(), lookup());
+        let mut spans = Vec::new();
+        for (i, (c1, c2)) in [
+            ((0, 40), (40, 80)),
+            ((0, 40), (10, 80)),
+            ((0, 30), (30, 70)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let t = format!("t{i}");
+            spans.push(parent(&t, 0, 100 * MS));
             spans.push(s(
-                "t3",
-                &format!("q{i}"),
+                &t,
+                "c1",
                 Some("p"),
                 SpanKind::Client,
-                i * MS,
-                i * MS + 1,
+                c1.0 * MS,
+                c1.1 * MS,
+                &[("server.address", "api")],
+            ));
+            spans.push(s(
+                &t,
+                "c2",
+                Some("p"),
+                SpanKind::Client,
+                c2.0 * MS,
+                c2.1 * MS,
                 &[("db.collection.name", "t")],
             ));
         }
         rt.ingest(spans, 1);
+
+        let none: Vec<_> = rt
+            .insights(1, &[])
+            .into_iter()
+            .filter(|i| matches!(i, Insight::Parallelisable { .. }))
+            .collect();
+        assert!(none.is_empty(), "no runtime-only parallelisable: {none:?}");
+
+        let static_candidate = Insight::Parallelisable {
+            node: "fn:a.rs#light".into(),
+            children: vec!["host:api".into(), "t:12".into()],
+            saved_nanos: 0,
+        };
+        let insights = rt.insights(1, std::slice::from_ref(&static_candidate));
+        assert_eq!(
+            insights[0],
+            Insight::Parallelisable {
+                node: "fn:a.rs#light".into(),
+                children: vec!["host:api".into(), "t:12".into()],
+                saved_nanos: 30 * MS,
+            },
+            "{insights:?}"
+        );
+
+        let unmatched = Insight::Parallelisable {
+            node: "fn:a.rs#light".into(),
+            children: vec!["foo:1".into(), "bar:2".into()],
+            saved_nanos: 0,
+        };
+        let insights = rt.insights(1, std::slice::from_ref(&unmatched));
+        let pos = insights.iter().position(|i| i == &unmatched).unwrap();
+        assert!(
+            insights[..pos]
+                .iter()
+                .all(|i| matches!(i, Insight::Waiting { .. })),
+            "static-only ranks after runtime evidence: {insights:?}"
+        );
+    }
+
+    #[test]
+    fn weak_savings_rank_after_other_runtime_evidence() {
+        let mut rt = Runtime::new(RuntimeConfig::default(), lookup());
+        let spans = vec![
+            parent("t", 0, 100 * MS),
+            s(
+                "t",
+                "c1",
+                Some("p"),
+                SpanKind::Client,
+                0,
+                100_000,
+                &[("server.address", "api")],
+            ),
+            s(
+                "t",
+                "c2",
+                Some("p"),
+                SpanKind::Client,
+                100_000,
+                200_000,
+                &[("db.collection.name", "t")],
+            ),
+            s(
+                "u",
+                "p",
+                None,
+                SpanKind::Server,
+                0,
+                100 * MS,
+                &[("code.function.name", "heavy")],
+            ),
+            s(
+                "u",
+                "c",
+                Some("p"),
+                SpanKind::Client,
+                0,
+                90 * MS,
+                &[("server.address", "api")],
+            ),
+        ];
+        rt.ingest(spans, 1);
+        let candidate = Insight::Parallelisable {
+            node: "fn:a.rs#light".into(),
+            children: vec!["api:1".into(), "t:2".into()],
+            saved_nanos: 0,
+        };
+        let insights = rt.insights(1, std::slice::from_ref(&candidate));
+        assert_eq!(insights.len(), 2, "{insights:?}");
+        assert!(
+            matches!(&insights[0], Insight::Waiting { node, .. } if node == "fn:a.rs#heavy"),
+            "{insights:?}"
+        );
+        assert_eq!(
+            insights[1],
+            Insight::Parallelisable {
+                node: "fn:a.rs#light".into(),
+                children: vec!["api:1".into(), "t:2".into()],
+                saved_nanos: 100_000
+            }
+        );
+    }
+
+    #[test]
+    fn waiting_names_wait_children() {
+        let mut rt = Runtime::new(RuntimeConfig::default(), lookup());
+        let spans = vec![
+            parent("t", 0, 100 * MS),
+            s(
+                "t",
+                "c1",
+                Some("p"),
+                SpanKind::Client,
+                0,
+                40 * MS,
+                &[("server.address", "api")],
+            ),
+            s(
+                "t",
+                "c2",
+                Some("p"),
+                SpanKind::Client,
+                40 * MS,
+                80 * MS,
+                &[("db.collection.name", "t")],
+            ),
+        ];
+        rt.ingest(spans, 1);
+        let insights = rt.insights(1, &[]);
+        match insights
+            .iter()
+            .find(|i| matches!(i, Insight::Waiting { .. }))
+        {
+            Some(Insight::Waiting {
+                node,
+                wait_ratio,
+                on,
+            }) => {
+                assert_eq!(node, "fn:a.rs#light");
+                assert!((wait_ratio - 0.8).abs() < 1e-9, "{wait_ratio}");
+                assert_eq!(on, &vec!["host:api".to_string(), "table:t".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn io_in_loop_counts_only_io_children_and_merges_static() {
+        let mut rt = Runtime::new(RuntimeConfig::default(), lookup());
+        let mut spans = vec![parent("t", 0, 100 * MS)];
+        for i in 0..5u64 {
+            spans.push(s(
+                "t",
+                &format!("q{i}"),
+                Some("p"),
+                SpanKind::Internal,
+                i * MS,
+                i * MS + 1,
+                &[("code.function.name", "count_rows")],
+            ));
+            spans.push(s(
+                "t",
+                &format!("c{i}"),
+                Some("p"),
+                SpanKind::Internal,
+                i * MS,
+                i * MS + 1,
+                &[("code.function.name", "pure")],
+            ));
+        }
+        rt.ingest(spans, 1);
+
         let io: Vec<_> = rt
-            .insights(1)
+            .insights(1, &[])
             .into_iter()
             .filter(|i| matches!(i, Insight::IoInLoop { .. }))
             .collect();
-        assert_eq!(io.len(), 1);
-        match &io[0] {
-            Insight::IoInLoop {
-                node,
-                effect,
-                observed_calls_per_parent,
-                ..
-            } => {
-                assert_eq!(node, "fn:a.rs#light");
-                assert_eq!(effect, "table:t");
-                assert!((observed_calls_per_parent.unwrap() - 7.0 / 3.0).abs() < 1e-9);
-            }
-            _ => unreachable!(),
-        }
+        assert_eq!(
+            io,
+            vec![Insight::IoInLoop {
+                node: "fn:a.rs#light".into(),
+                effect: "fn:db.rs#count_rows".into(),
+                line: 0,
+                observed_calls_per_parent: Some(5.0),
+            }]
+        );
+
+        let static_io = Insight::IoInLoop {
+            node: "fn:a.rs#light".into(),
+            effect: "db_read via count_rows".into(),
+            line: 39,
+            observed_calls_per_parent: None,
+        };
+        let insights = rt.insights(1, std::slice::from_ref(&static_io));
+        let io: Vec<_> = insights
+            .iter()
+            .filter(|i| matches!(i, Insight::IoInLoop { .. }))
+            .collect();
+        assert_eq!(
+            io,
+            vec![&Insight::IoInLoop {
+                node: "fn:a.rs#light".into(),
+                effect: "db_read via count_rows".into(),
+                line: 39,
+                observed_calls_per_parent: Some(5.0),
+            }]
+        );
     }
 
     #[test]
@@ -466,7 +752,7 @@ mod tests {
         }
         rt.ingest(spans, 0);
         let now = 120 * sec;
-        let insights = rt.insights(now);
+        let insights = rt.insights(now, &[]);
         assert!(
             insights
                 .iter()
@@ -501,20 +787,37 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, Insight::NeverObserved { .. }))
             .collect();
-        assert_eq!(
-            never,
-            vec![&Insight::NeverObserved {
-                node: "fn:a.rs#never".into()
-            }]
-        );
+        assert_eq!(never.len(), 3);
         assert!(matches!(
             insights.last(),
             Some(Insight::NeverObserved { .. })
         ));
         assert!(
-            !rt.insights(30 * sec)
+            !rt.insights(30 * sec, &[])
                 .iter()
                 .any(|i| matches!(i, Insight::NeverObserved { .. }))
+        );
+
+        let static_ineff = Insight::Inefficient {
+            node: "fn:a.rs#heavy".into(),
+            self_p95_nanos: 0,
+            complexity: "O(n^2)".into(),
+            reasons: vec!["nested loops (depth 2)".into()],
+        };
+        let insights = rt.insights(now, std::slice::from_ref(&static_ineff));
+        let ineff: Vec<_> = insights
+            .iter()
+            .filter(|i| matches!(i, Insight::Inefficient { .. }))
+            .collect();
+        assert_eq!(
+            ineff,
+            vec![&Insight::Inefficient {
+                node: "fn:a.rs#heavy".into(),
+                self_p95_nanos: 50 * MS,
+                complexity: "O(n^2)".into(),
+                reasons: vec!["nested loops (depth 2)".into()],
+            }],
+            "static entry enriched, not duplicated"
         );
     }
 }
