@@ -1,0 +1,85 @@
+x-otel: &otel
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://hoshizora:7317}
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+
+services:
+  hoshizora:
+    build:
+      context: ../..
+    volumes:
+      - ./:/src:ro
+    ports:
+      - "7317:7317"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7317/api/graph", "-o", "/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  postgres:
+    image: pgautoupgrade/pgautoupgrade:17-alpine
+    environment:
+      POSTGRES_USER: observatory
+      POSTGRES_PASSWORD: observatory
+      POSTGRES_DB: observatory
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U observatory -d observatory"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  worker:
+    build: ./worker
+    environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: observatory-worker
+      DATABASE_URL: postgres://observatory:observatory@postgres:5432/observatory
+    ports:
+      - "8001:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  api:
+    build: ./api
+    environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: observatory-api
+      DATABASE_URL: postgres://observatory:observatory@postgres:5432/observatory
+      WORKER_URL: http://worker:8001
+      RUST_LOG: info
+    ports:
+      - "8081:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_API_URL: ${WEB_API_URL:-http://localhost:8081}
+        VITE_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${WEB_OTLP_TRACES_URL:-http://localhost:7317/v1/traces}
+    ports:
+      - "5180:80"
+    depends_on:
+      api:
+        condition: service_healthy
