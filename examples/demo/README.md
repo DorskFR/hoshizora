@@ -22,24 +22,17 @@ statically from the graph and dynamically from the trace overlay.
 ## Run
 
 ```sh
-# 1. index the demo source and serve the graph + OTLP receiver (from the repo root)
-cargo run -p hoshizora -- index examples/demo -o examples/demo/.hoshizora
-cargo run -p hoshizora -- serve examples/demo/.hoshizora          # http://127.0.0.1:7317
-
-# 2. start the app; services export to host.docker.internal:7317, the browser to localhost:7317
 cd examples/demo
-docker compose up --build -d
-
-# 3. generate traffic on every flow
-./load.sh                        # ./load.sh http://localhost:8081 0.5 for more
-
-# 4. open the app and the viewer
-xdg-open http://localhost:5180   # click the buttons: each click is a browser span
-xdg-open http://127.0.0.1:7317   # hoshizora viewer with the live overlay
-
-# 5. tear down
+docker compose up --build -d     # app + hoshizora, which indexes this directory on start
+./load.sh                        # traffic on every flow; ./load.sh http://localhost:8081 0.5 for more
+xdg-open http://localhost:5180   # the app: each click is a browser span
+xdg-open http://localhost:7317   # hoshizora viewer with the live overlay
 docker compose down -v
 ```
+
+To run hoshizora on the host instead, stop its container and point the services at the host:
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:7317 docker compose up -d`, then
+`hoshizora serve --root examples/demo --reindex --host 0.0.0.0`.
 
 Overrides: `OTEL_EXPORTER_OTLP_ENDPOINT` (containers), `WEB_API_URL` / `WEB_OTLP_TRACES_URL`
 (baked into the web build, so pass them to `docker compose build`).
