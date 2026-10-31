@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use hoshizora_model::api::{AffectedEntrypoint, FlowStep, Impact, SearchHit, Subgraph};
-use hoshizora_model::{Edge, EdgeKind, EffectKind, Graph, Insight, Node, NodeKind};
+use hoshizora_model::{Edge, EdgeKind, EffectKind, EntrypointKind, Graph, Insight, Node, NodeKind};
 
 /// Edge kinds followed by `flow` and `impact` when none are given.
 pub const DEFAULT_FLOW_KINDS: &[EdgeKind] = &[
@@ -426,6 +426,8 @@ impl Index {
     fn io_in_loop(&self, i: usize, out: &mut Vec<Insight>) {
         let n = &self.graph.nodes[i];
         let mut seen: HashSet<(u32, String)> = HashSet::new();
+        // Module-level loops register handlers rather than call them.
+        let registration_code = n.name == "<module>";
         for e in &n.effects.direct {
             if e.loop_depth > 0
                 && LOOP_IO_KINDS.contains(&e.kind)
@@ -446,7 +448,8 @@ impl Index {
         }
         for &ei in &self.outgoing[i] {
             let e = &self.graph.edges[ei];
-            if e.loop_depth == 0
+            if registration_code
+                || e.loop_depth == 0
                 || !matches!(
                     e.kind,
                     EdgeKind::Calls | EdgeKind::Spawns | EdgeKind::Requests
@@ -456,6 +459,11 @@ impl Index {
             }
             let Some(t) = self.idx(&e.to) else { continue };
             let target = &self.graph.nodes[t];
+            if target.entrypoint.is_some_and(|k| {
+                matches!(k, EntrypointKind::UiHandler | EntrypointKind::HttpHandler)
+            }) {
+                continue;
+            }
             let kinds: Vec<&str> = target
                 .effects
                 .transitive
@@ -547,7 +555,11 @@ impl Index {
                 )
             })
             .collect();
-        if info.is_async {
+        let js = matches!(
+            n.language,
+            Some(hoshizora_model::Language::TypeScript | hoshizora_model::Language::JavaScript)
+        );
+        if info.is_async && !js {
             for &ei in &self.outgoing[i] {
                 let e = &self.graph.edges[ei];
                 if e.kind != EdgeKind::Calls {

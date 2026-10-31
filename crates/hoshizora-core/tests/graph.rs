@@ -318,9 +318,9 @@ fn fixture() -> Vec<FileFacts> {
     let mut files = vec![api_lib, api_store, webui_api, app];
     for i in 0..4 {
         files.push(file(
-            &format!("webui/src/h{i}.ts"),
-            Language::TypeScript,
-            &format!("src/h{i}"),
+            &format!("crates/api/src/h{i}.rs"),
+            Language::Rust,
+            &format!("crate::h{i}"),
             vec![],
             vec![func("helper", 1, 3, vec![])],
         ));
@@ -1203,6 +1203,9 @@ fn demo_fixture() -> Vec<FileFacts> {
         vec![
             import("./api.ts", &["listStars", "launchObservation"]),
             import("./otel.js", &["initTelemetry"]),
+            import("./drawer.fixture", &["openDrawer"]),
+            import("$lib/toast.svelte", &["toast"]),
+            import("./promptAttachments.svelte", &["attach"]),
         ],
         vec![
             attrs(
@@ -1210,11 +1213,46 @@ fn demo_fixture() -> Vec<FileFacts> {
                 &["ui:click"],
             ),
             attrs(
-                func("onLaunch", 26, 30, vec![call("launchObservation", 29)]),
+                func(
+                    "onLaunch",
+                    26,
+                    30,
+                    vec![call("launchObservation", 29), call("toast", 30)],
+                ),
                 &["ui:click"],
+            ),
+            func(
+                "<module>",
+                40,
+                60,
+                vec![
+                    in_loop(call("onListStars", 49), 1),
+                    in_loop(call("addEventListener", 49), 1),
+                ],
             ),
             func("show", 9, 11, vec![]),
         ],
+    );
+    let web_fixture_ts = file(
+        "web/src/drawer.fixture.ts",
+        Language::TypeScript,
+        "src/drawer.fixture",
+        vec![],
+        vec![func("openDrawer", 1, 3, vec![])],
+    );
+    let web_lib_toast = file(
+        "web/src/lib/toast.svelte.ts",
+        Language::TypeScript,
+        "src/lib/toast.svelte",
+        vec![],
+        vec![func("toast", 1, 3, vec![call("setTimeout", 2)])],
+    );
+    let web_prompt = file(
+        "web/src/promptAttachments.svelte.ts",
+        Language::TypeScript,
+        "src/promptAttachments.svelte",
+        vec![],
+        vec![func("attach", 1, 3, vec![])],
     );
     let web_otel_ts = file(
         "web/src/otel.ts",
@@ -1241,6 +1279,9 @@ fn demo_fixture() -> Vec<FileFacts> {
         worker_db_py,
         web_api_ts,
         web_main_ts,
+        web_fixture_ts,
+        web_lib_toast,
+        web_prompt,
         web_otel_ts,
         web_config_ts,
     ]
@@ -1262,6 +1303,33 @@ fn demo_crate_imports_resolve_to_crate_named_modules() {
     assert!(!edges_between(&idx, "file:api/src/catalog.rs", "file:api/src/db.rs").is_empty());
     assert!(!edges_between(&idx, "file:web/src/main.ts", "file:web/src/api.ts").is_empty());
     assert!(!edges_between(&idx, "file:web/src/main.ts", "file:web/src/otel.ts").is_empty());
+    assert!(
+        !edges_between(
+            &idx,
+            "file:web/src/main.ts",
+            "file:web/src/drawer.fixture.ts"
+        )
+        .is_empty(),
+        "dotted file names keep their stem"
+    );
+    assert!(
+        !edges_between(
+            &idx,
+            "file:web/src/main.ts",
+            "file:web/src/lib/toast.svelte.ts"
+        )
+        .is_empty(),
+        "$lib alias"
+    );
+    assert!(
+        !edges_between(
+            &idx,
+            "file:web/src/main.ts",
+            "file:web/src/promptAttachments.svelte.ts"
+        )
+        .is_empty(),
+        "./x.svelte resolves x.svelte.ts"
+    );
     assert!(!edges_between(&idx, "file:web/src/api.ts", "file:web/src/config.ts").is_empty());
     let unresolved: Vec<&String> = idx
         .graph()
@@ -1498,7 +1566,28 @@ fn demo_client_wrappers_link_callers_to_routes() {
         "{:?}",
         launch.effects.transitive
     );
-    assert!(launch.effects.transitive.contains(&EffectKind::Blocking));
+    assert!(
+        !launch.effects.transitive.contains(&EffectKind::Blocking),
+        "server-side blocking does not cross Requests edges: {:?}",
+        launch.effects.transitive
+    );
+    let insights = idx.static_insights();
+    assert!(
+        !insights
+            .iter()
+            .any(|i| matches!(i, Insight::Inefficient { node, .. } if node == &launch.id)),
+        "setTimeout in a sync TS helper is not blocking: {insights:?}"
+    );
+    assert!(
+        !insights
+            .iter()
+            .any(|i| matches!(i, Insight::IoInLoop { node, .. } if node.ends_with("#<module>"))),
+        "handler registration loops are not I/O loops: {insights:?}"
+    );
+    assert_eq!(
+        idx.node("fn:web/src/main.ts#<module>").unwrap().entrypoint,
+        Some(EntrypointKind::Main)
+    );
     let list = idx.node("fn:web/src/api.ts#listStars").unwrap();
     assert!(
         list.effects
@@ -1549,4 +1638,236 @@ fn demo_publish_topic_and_cross_service_effects() {
     );
     let insights = idx.static_insights();
     assert!(insights.iter().any(|i| matches!(i, Insight::IoInLoop { node, line, .. } if node == &recompute.id && *line == 112)));
+}
+
+/// The failure modes seen on a 20k-function Rust + Svelte repo: every `.expect()` resolving
+/// to one `fn expect`, `format!` resolving to `fn format`, Rust calling into TS test files.
+fn loose_fixture() -> Vec<FileFacts> {
+    let mut journeys = func("Run::expect", 380, 390, vec![]);
+    journeys.kind = SymbolKind::Method;
+    let tui = file(
+        "crates/cctui-tui/src/journeys.rs",
+        Language::Rust,
+        "cctui_tui::journeys",
+        vec![],
+        vec![ty("Run", 370, &[]), journeys, func("map", 400, 402, vec![])],
+    );
+    let invite = file(
+        "crates/cctui-server/src/invite.rs",
+        Language::Rust,
+        "cctui_server::invite",
+        vec![],
+        vec![
+            func("format", 10, 12, vec![]),
+            func("render", 20, 22, vec![]),
+        ],
+    );
+    let daemon = file(
+        "crates/cctui-daemon/src/main.rs",
+        Language::Rust,
+        "cctui_daemon",
+        vec![import("cctui_core::render", &[]), import("super::*", &[])],
+        vec![
+            asyncf(func(
+                "main",
+                1,
+                30,
+                vec![
+                    CallSite {
+                        receiver: Some("cfg".into()),
+                        ..call("cfg.expect", 5)
+                    },
+                    call("format!", 6),
+                    CallSite {
+                        receiver: Some("items".into()),
+                        ..call("items.map", 7)
+                    },
+                    call("helper", 8),
+                    call("render", 9),
+                    call("bind", 10),
+                    call("escapeRegExp", 11),
+                    call("local_only", 12),
+                ],
+            )),
+            func("local_only", 40, 42, vec![call("std::thread::sleep", 41)]),
+        ],
+    );
+    let daemon_tests = file(
+        "crates/cctui-daemon/src/tests.rs",
+        Language::Rust,
+        "cctui_daemon::tests",
+        vec![import("super::*", &[])],
+        vec![attrs(
+            func("test_main_runs", 1, 5, vec![call("local_only", 3)]),
+            &["test"],
+        )],
+    );
+    let core = file(
+        "crates/cctui-core/src/lib.rs",
+        Language::Rust,
+        "cctui_core",
+        vec![import("sqlx", &[])],
+        vec![
+            func("render", 1, 3, vec![]),
+            func(
+                "bind",
+                5,
+                7,
+                vec![args(call("sqlx::query", 6), &["SELECT 1 FROM users"])],
+            ),
+        ],
+    );
+    let other = file(
+        "crates/cctui-other/src/lib.rs",
+        Language::Rust,
+        "cctui_other",
+        vec![import("sqlx", &[])],
+        vec![
+            func(
+                "bind",
+                5,
+                7,
+                vec![args(
+                    call("sqlx::query", 6),
+                    &["INSERT INTO users (id) VALUES ($1)"],
+                )],
+            ),
+            func("helper", 9, 11, vec![]),
+        ],
+    );
+    let web = file(
+        "webui/src/regexp.ts",
+        Language::TypeScript,
+        "src/regexp",
+        vec![],
+        vec![
+            func("escapeRegExp", 1, 3, vec![]),
+            func("helper", 5, 7, vec![]),
+        ],
+    );
+    vec![tui, invite, daemon, daemon_tests, core, other, web]
+}
+
+#[test]
+fn loose_resolution_regressions() {
+    let idx = Index::new(build_graph(
+        Path::new("/cctui"),
+        loose_fixture(),
+        &Packs::builtin(),
+    ));
+    let main = "fn:crates/cctui-daemon/src/main.rs#main";
+    let out: Vec<&str> = idx.outgoing(main).iter().map(|e| e.to.as_str()).collect();
+    assert!(
+        !out.iter().any(|to| to.ends_with("#Run::expect")),
+        "`.expect()` on an unknown receiver must not resolve: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|to| to.ends_with("#format")),
+        "macros never resolve: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|to| to.ends_with("#map")),
+        "stoplisted method: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|to| to.contains("webui/")),
+        "Rust never calls TS: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|to| to.ends_with("#helper")),
+        "no global fallback into unrelated packages: {out:?}"
+    );
+    assert!(
+        out.contains(&"fn:crates/cctui-core/src/lib.rs#render"),
+        "explicit import wins: {out:?}"
+    );
+    assert!(!out.iter().any(|to| to.contains("invite.rs#render")));
+    assert!(
+        out.contains(&"fn:crates/cctui-core/src/lib.rs#bind"),
+        "unique name within imported packages: {out:?}"
+    );
+    assert!(!out.iter().any(|to| to.contains("cctui-other")), "{out:?}");
+    assert!(out.contains(&"fn:crates/cctui-daemon/src/main.rs#local_only"));
+    let node = idx.node(main).unwrap();
+    assert!(node.effects.transitive.contains(&EffectKind::DbRead));
+    assert!(!node.effects.transitive.contains(&EffectKind::DbWrite));
+    let test_edges = edges_between(
+        &idx,
+        "fn:crates/cctui-daemon/src/tests.rs#test_main_runs",
+        main.replace("#main", "#local_only").as_str(),
+    );
+    assert_eq!(
+        test_edges.len(),
+        1,
+        "`super::*` inside an inline test module resolves to the file's own module"
+    );
+    assert!(
+        idx.graph()
+            .meta
+            .warnings
+            .iter()
+            .all(|w| !w.starts_with("unresolved import")),
+        "{:?}",
+        idx.graph().meta.warnings
+    );
+}
+
+#[test]
+fn multi_candidate_edges_do_not_propagate_effects() {
+    let mut files = loose_fixture();
+    files.push(file(
+        "crates/cctui-daemon/src/two.rs",
+        Language::Rust,
+        "cctui_daemon::two",
+        vec![],
+        vec![
+            func(
+                "Alpha::bind",
+                1,
+                3,
+                vec![args(
+                    call("sqlx::query", 2),
+                    &["INSERT INTO users (id) VALUES ($1)"],
+                )],
+            ),
+            ty("Alpha", 0, &[]),
+            func("Beta::bind", 5, 7, vec![]),
+            ty("Beta", 4, &[]),
+            func(
+                "caller",
+                9,
+                11,
+                vec![CallSite {
+                    receiver: Some("x".into()),
+                    ..call("x.bind", 10)
+                }],
+            ),
+        ],
+    ));
+    files[5].imports.clear();
+    let idx = Index::new(build_graph(Path::new("/cctui"), files, &Packs::builtin()));
+    let out = idx.outgoing("fn:crates/cctui-daemon/src/two.rs#caller");
+    let binds: Vec<&&hoshizora_model::Edge> =
+        out.iter().filter(|e| e.to.ends_with("::bind")).collect();
+    assert_eq!(binds.len(), 2, "{out:?}");
+    assert!(
+        binds
+            .iter()
+            .all(|e| e.attrs.get("candidates").map(String::as_str) == Some("2"))
+    );
+    let caller = idx
+        .node("fn:crates/cctui-daemon/src/two.rs#caller")
+        .unwrap();
+    assert!(
+        caller.effects.transitive.is_empty(),
+        "{:?}",
+        caller.effects.transitive
+    );
+    let flow = idx.flow(&caller.id, 3, &[]).unwrap();
+    assert!(
+        flow.edges
+            .iter()
+            .any(|e| e.attrs.contains_key("candidates")),
+        "flow keeps the dimmed edges"
+    );
 }

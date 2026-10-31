@@ -25,7 +25,7 @@
 //! path (`from sqlalchemy import text` makes `text(...)` match `sqlalchemy.text`). `*` matches
 //! any run of characters.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::Context;
@@ -126,12 +126,22 @@ pub struct RouteRule {
     pub method: Option<String>,
 }
 
+/// Method names too common to resolve by name alone (`map`, `expect`, `push`...).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveRules {
+    pub language: Language,
+    #[serde(default)]
+    pub ignore_methods: Vec<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PackFile {
     #[serde(default)]
     effect: Vec<EffectRule>,
     #[serde(default)]
     route: Vec<RouteRule>,
+    #[serde(default)]
+    resolve: Vec<ResolveRules>,
 }
 
 /// Effect, route and client rules loaded from TOML packs.
@@ -139,6 +149,7 @@ struct PackFile {
 pub struct Packs {
     effects: BTreeMap<String, EffectRule>,
     routes: BTreeMap<String, RouteRule>,
+    ignore_methods: BTreeMap<Language, HashSet<String>>,
 }
 
 const BUILTIN: &[(&str, &str)] = &[
@@ -190,7 +201,25 @@ impl Packs {
         for rule in file.route {
             self.routes.insert(rule.id.clone(), rule);
         }
+        for rules in file.resolve {
+            self.ignore_methods
+                .entry(rules.language)
+                .or_default()
+                .extend(rules.ignore_methods);
+        }
         Ok(())
+    }
+
+    /// Whether `name` is on the language's stoplist of common methods. JavaScript shares the
+    /// TypeScript list.
+    pub fn ignores_method(&self, language: Language, name: &str) -> bool {
+        let language = match language {
+            Language::JavaScript => Language::TypeScript,
+            l => l,
+        };
+        self.ignore_methods
+            .get(&language)
+            .is_some_and(|set| set.contains(name))
     }
 
     pub fn effects(&self) -> impl Iterator<Item = &EffectRule> {

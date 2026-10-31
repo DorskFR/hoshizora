@@ -36,6 +36,8 @@ pub(crate) struct FileScope {
     /// Local binding (alias, imported name, last path segment) → import.
     pub bindings: HashMap<String, usize>,
     pub imports: Vec<ImportTarget>,
+    /// Imports that bring every name of a module into scope (`use x::*`, `from x import *`).
+    pub globs: Vec<usize>,
 }
 
 pub(crate) struct Ctx<'a> {
@@ -53,6 +55,8 @@ pub(crate) struct Ctx<'a> {
     pub file_nodes: Vec<usize>,
     pub package_of_file: Vec<usize>,
     pub scopes: Vec<FileScope>,
+    /// Per package: itself plus the packages its files import from.
+    pub pkg_allowed: Vec<HashSet<usize>>,
     pub rule_sets: Vec<effects::RuleSet<'a>>,
     /// Per file: local name → function.
     pub fn_by_file_local: Vec<HashMap<String, usize>>,
@@ -150,6 +154,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
         file_nodes: Vec::with_capacity(files.len()),
         package_of_file: Vec::with_capacity(files.len()),
         scopes: Vec::with_capacity(files.len()),
+        pkg_allowed: Vec::new(),
         rule_sets: Vec::with_capacity(files.len()),
         fn_by_file_local: vec![HashMap::new(); files.len()],
         fn_by_file_name: vec![HashMap::new(); files.len()],

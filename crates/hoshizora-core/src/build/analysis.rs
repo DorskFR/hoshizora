@@ -439,10 +439,26 @@ pub(crate) fn transitive(ctx: &mut Ctx) {
         .iter()
         .map(|nd| nd.function.as_ref().is_some_and(|f| f.is_async))
         .collect();
+    // A sync helper that sleeps blocks a Rust/Python/Go async caller; JavaScript timers do not.
+    let can_block: Vec<bool> = ctx
+        .nodes
+        .iter()
+        .map(|nd| {
+            !matches!(
+                nd.language,
+                Some(Language::TypeScript | Language::JavaScript)
+            )
+        })
+        .collect();
     let blocking_sources = effect_bit(EffectKind::Sleep) | effect_bit(EffectKind::Blocking);
+    // Concurrency facts of a server handler do not describe the client that requests it.
+    let local_only = blocking_sources
+        | effect_bit(EffectKind::Lock)
+        | effect_bit(EffectKind::Spawn)
+        | effect_bit(EffectKind::Join);
     let mut callers: Vec<Vec<(usize, EdgeKind)>> = vec![Vec::new(); n];
     for (e, &(from, to)) in ctx.edges.iter().zip(&ctx.edge_ends) {
-        if FLOW_KINDS.contains(&e.kind) {
+        if FLOW_KINDS.contains(&e.kind) && !e.attrs.contains_key("candidates") {
             callers[to].push((from, e.kind));
         }
     }
@@ -454,10 +470,16 @@ pub(crate) fn transitive(ctx: &mut Ctx) {
     while let Some(i) = queue.pop_front() {
         queued[i] = false;
         for &(c, kind) in &callers[i] {
-            let mut merged = mask[c] | mask[i];
+            let inherited = if kind == EdgeKind::Requests {
+                mask[i] & !local_only
+            } else {
+                mask[i]
+            };
+            let mut merged = mask[c] | inherited;
             if kind == EdgeKind::Calls
                 && !is_async[i]
                 && is_async[c]
+                && can_block[i]
                 && mask[i] & blocking_sources != 0
             {
                 merged |= effect_bit(EffectKind::Blocking);
