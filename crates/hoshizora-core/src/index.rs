@@ -20,14 +20,14 @@ pub const DEFAULT_FLOW_KINDS: &[EdgeKind] = &[
 pub const FLOW_NODE_LIMIT: usize = 2000;
 
 pub struct Index {
-    graph: Graph,
+    pub(crate) graph: Graph,
     by_id: HashMap<String, usize>,
-    outgoing: Vec<Vec<usize>>,
+    pub(crate) outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
     /// File → function node indices sorted by span start.
     by_file: HashMap<String, Vec<usize>>,
     by_name: HashMap<String, Vec<usize>>,
-    lanes: Vec<String>,
+    pub(crate) lanes: Vec<String>,
 }
 
 impl Index {
@@ -82,7 +82,7 @@ impl Index {
         &self.graph
     }
 
-    fn idx(&self, id: &str) -> Option<usize> {
+    pub(crate) fn idx(&self, id: &str) -> Option<usize> {
         self.by_id.get(id).copied()
     }
 
@@ -307,18 +307,28 @@ impl Index {
             .collect()
     }
 
+    /// Names match ignoring case, `_`, `-` and spaces, so `SpawnSession`, `spawn session` and
+    /// `spawn_session` all find `spawn_session`. Entrypoints and routes rank first, tests last.
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
-        let q = query.trim().to_lowercase();
+        let q = fold_name(query);
         if q.is_empty() {
             return Vec::new();
         }
+        let tokens = name_tokens(query);
         let mut hits: Vec<SearchHit> = self
             .graph
             .nodes
             .iter()
-            .filter_map(|n| {
-                let name = n.name.to_lowercase();
-                let qualified = n.qualified_name.to_lowercase();
+            .enumerate()
+            .filter_map(|(i, n)| {
+                let name = fold_name(&n.name);
+                let qualified = fold_name(&n.qualified_name);
+                let file = n
+                    .file
+                    .as_deref()
+                    .and_then(|f| f.rsplit('/').next())
+                    .map(fold_name)
+                    .unwrap_or_default();
                 let score = if name == q {
                     1.0
                 } else if qualified == q {
@@ -331,12 +341,38 @@ impl Index {
                     0.6
                 } else if qualified.contains(&q) {
                     0.5
+                } else if n.kind == NodeKind::Function && file.contains(&q) {
+                    0.4
+                } else if tokens.len() > 1 && tokens.iter().all(|t| qualified.contains(t)) {
+                    0.45
                 } else if is_subsequence(&q, &name) {
                     0.3
                 } else {
                     return None;
                 };
                 let score = score - (n.name.len() as f32 * 0.0001).min(0.05);
+                let score = if n.name.eq_ignore_ascii_case(query.trim()) {
+                    score + 0.2
+                } else {
+                    score
+                };
+                let score = if self.is_test(i) {
+                    score * 0.2
+                } else if n.kind == NodeKind::Route
+                    || n.entrypoint.is_some_and(|k| {
+                        matches!(
+                            k,
+                            EntrypointKind::UiHandler
+                                | EntrypointKind::HttpHandler
+                                | EntrypointKind::Main
+                                | EntrypointKind::Cli
+                        )
+                    })
+                {
+                    score + 0.15
+                } else {
+                    score
+                };
                 Some(SearchHit {
                     node: n.id.clone(),
                     name: n.name.clone(),
@@ -693,6 +729,32 @@ fn effect_root(via: &str) -> String {
     } else {
         first_segment(via)
     }
+}
+
+fn fold_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Lowercase words of a name, split on separators and camelCase boundaries.
+fn name_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        let boundary = matches!(c, '_' | '-' | ' ' | '.' | ':' | '/') || c.is_uppercase();
+        if boundary && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        if c.is_alphanumeric() {
+            cur.extend(c.to_lowercase());
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn is_subsequence(needle: &str, hay: &str) -> bool {
