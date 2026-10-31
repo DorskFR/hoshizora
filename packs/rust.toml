@@ -240,6 +240,22 @@ requires_import = "rdkafka"
 kind = "subscribe"
 target = "arg0"
 
+# Enum values handed to a method call and matched on elsewhere are messages: the variant is
+# the topic. The adapter emits `<message>` / `<match>` sites for them.
+[[effect]]
+id = "rust.message.send"
+language = "rust"
+match = ["<message>"]
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "rust.message.receive"
+language = "rust"
+match = ["<match>"]
+kind = "subscribe"
+target = "arg0"
+
 # Routes
 
 [[route]]

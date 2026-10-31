@@ -174,6 +174,113 @@ fn call_info(node: Node, source: &str) -> Option<CallInfo> {
     }
 }
 
+/// `Enum::Variant` for a variant expression carrying data (`A::B { .. }`, `A::B(..)`), or
+/// a pattern destructuring one.
+fn variant_path(node: Node, source: &str) -> Option<String> {
+    let path = match node.kind() {
+        "struct_expression" => node.child_by_field_name("name")?,
+        "call_expression" => node.child_by_field_name("function")?,
+        "struct_pattern" => node.child_by_field_name("type")?,
+        "tuple_struct_pattern" => node.child_by_field_name("type")?,
+        _ => return None,
+    };
+    if !matches!(path.kind(), "scoped_identifier" | "scoped_type_identifier") {
+        return None;
+    }
+    let full = strip_generics(text(path, source));
+    let segs: Vec<&str> = full.split("::").map(str::trim).collect();
+    let n = segs.len();
+    if n < 2 {
+        return None;
+    }
+    let (ty, variant) = (segs[n - 2], segs[n - 1]);
+    let typed = |s: &str| s.starts_with(|c: char| c.is_ascii_uppercase());
+    if !typed(ty) || !typed(variant) || matches!(ty, "Some" | "Ok" | "Err" | "Box" | "Self") {
+        return None;
+    }
+    Some(format!("{ty}::{variant}"))
+}
+
+/// Message passing seen through enum values: a variant with data handed to a method call
+/// (`tx.send(frame)`, `bus.deliver(Msg::X { .. })`) is a `<message>` site; a match arm or
+/// `if let` destructuring one is a `<match>` site. Both carry the variant as their first
+/// string argument so packs can turn them into publish/subscribe effects on a topic.
+fn message_sites(body: Node, source: &str) -> Vec<CallSite> {
+    let mut bound: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    let mut pending = vec![body];
+    let site = |callee: &str, receiver: Option<String>, variant: String, node: Node| CallSite {
+        callee: callee.to_owned(),
+        name: callee.to_owned(),
+        receiver,
+        string_args: vec![variant],
+        line: common::line(node),
+        loop_depth: 0,
+        awaited: false,
+        conditional: false,
+        in_closure: false,
+    };
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "let_declaration" => {
+                if let (Some(pat), Some(value)) = (
+                    node.child_by_field_name("pattern"),
+                    node.child_by_field_name("value"),
+                ) && pat.kind() == "identifier"
+                    && let Some(variant) = variant_path(value, source)
+                {
+                    bound.push((text(pat, source).to_owned(), variant));
+                }
+            }
+            "call_expression" => {
+                let func = node.child_by_field_name("function");
+                let receiver = func
+                    .filter(|f| f.kind() == "field_expression")
+                    .and_then(|f| field_text(f, "value", source));
+                if receiver.is_some()
+                    && let Some(args) = node.child_by_field_name("arguments")
+                {
+                    for arg in named_children(args) {
+                        let inner = if arg.kind() == "reference_expression" {
+                            arg.child_by_field_name("value").unwrap_or(arg)
+                        } else {
+                            arg
+                        };
+                        let variant = variant_path(inner, source).or_else(|| {
+                            (inner.kind() == "identifier").then(|| {
+                                let name = text(inner, source);
+                                bound
+                                    .iter()
+                                    .rev()
+                                    .find(|(n, _)| n == name)
+                                    .map(|(_, v)| v.clone())
+                            })?
+                        });
+                        if let Some(variant) = variant {
+                            out.push(site("<message>", receiver.clone(), variant, node));
+                        }
+                    }
+                }
+            }
+            "match_arm" | "let_condition" => {
+                let pat = node.child_by_field_name("pattern").map(|p| {
+                    if p.kind() == "match_pattern" {
+                        p.named_child(0).unwrap_or(p)
+                    } else {
+                        p
+                    }
+                });
+                if let Some(variant) = pat.and_then(|p| variant_path(p, source)) {
+                    out.push(site("<match>", None, variant, node));
+                }
+            }
+            _ => {}
+        }
+        pending.extend(named_children(node).into_iter().rev());
+    }
+    out
+}
+
 fn doc(node: Node, source: &str) -> Option<String> {
     let lines: Vec<&str> = preceding_comments(node, COMMENTS, &["attribute_item"])
         .into_iter()
@@ -260,9 +367,12 @@ impl Ctx<'_> {
             },
             attributes: attributes(node, self.source),
             implements: vec![],
-            body: node
-                .child_by_field_name("body")
-                .map(|b| common::analyze_body(b, self.source, &SPEC)),
+            body: node.child_by_field_name("body").map(|b| {
+                let mut body = common::analyze_body(b, self.source, &SPEC);
+                body.calls.extend(message_sites(b, self.source));
+                body.calls.sort_by_key(|c| c.line);
+                body
+            }),
             name,
         });
     }

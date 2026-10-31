@@ -105,10 +105,17 @@ fn synthetic() -> Graph {
         Some(ts),
     );
     form_type.name = "Form".into();
+    let mut notify = func("fn:api/src/spawn.rs#notify_daemon", "mod:api", rs, true);
+    notify.effects.direct = vec![effect(EffectKind::Publish, "DaemonFrame::Command")];
+    let mut handle_frame = func("fn:daemon/src/sup.rs#handle_frame", "mod:daemon", rs, true);
+    handle_frame.effects.direct = vec![effect(EffectKind::Subscribe, "DaemonFrame::Command")];
+    let mut spawn_adapter = func("fn:daemon/src/sup.rs#spawn_adapter", "mod:daemon", rs, true);
+    spawn_adapter.effects.direct = vec![effect(EffectKind::Process, "claude")];
     Graph {
         nodes: vec![
             node("mod:web", NodeKind::Package, None, Some(ts)),
             node("mod:api", NodeKind::Package, None, Some(rs)),
+            node("mod:daemon", NodeKind::Package, None, Some(rs)),
             form_type,
             submit,
             func("fn:web/src/spawnForm.ts#buildBody", "mod:web", ts, false),
@@ -117,11 +124,35 @@ fn synthetic() -> Graph {
             handler,
             func("fn:api/src/spawn.rs#validate", "mod:api", rs, false),
             insert,
-            func("fn:api/src/spawn.rs#notify_daemon", "mod:api", rs, true),
+            notify,
             node("table:sessions", NodeKind::Table, None, None),
+            node("topic:DaemonFrame::Command", NodeKind::Topic, None, None),
+            handle_frame,
+            spawn_adapter,
             test_fn,
         ],
         edges: vec![
+            edge(
+                "fn:api/src/spawn.rs#notify_daemon",
+                "topic:DaemonFrame::Command",
+                EdgeKind::Publishes,
+                Confidence::Heuristic,
+                3,
+            ),
+            edge(
+                "fn:daemon/src/sup.rs#handle_frame",
+                "topic:DaemonFrame::Command",
+                EdgeKind::Subscribes,
+                Confidence::Heuristic,
+                8,
+            ),
+            edge(
+                "fn:daemon/src/sup.rs#handle_frame",
+                "fn:daemon/src/sup.rs#spawn_adapter",
+                EdgeKind::Calls,
+                Confidence::Exact,
+                9,
+            ),
             edge(
                 "fn:web/src/spawnForm.ts#Form.submit",
                 "fn:web/src/spawnForm.ts#buildBody",
@@ -268,21 +299,43 @@ fn folds_helpers_and_orders_lanes() {
             "POST /sessions/spawn",
             "spawn_session",
             "notify_daemon",
-            "insert_session",
-            "sessions"
+            "DaemonFrame::Command",
+            "sessions",
+            "handle_frame",
+            "spawn_adapter",
         ],
         "{text}"
     );
     let kinds: Vec<LaneKind> = story.lanes.iter().map(|l| l.kind).collect();
     assert_eq!(
         kinds,
-        [LaneKind::Ui, LaneKind::Service, LaneKind::Database],
+        [
+            LaneKind::Ui,
+            LaneKind::Service,
+            LaneKind::Worker,
+            LaneKind::Queue,
+            LaneKind::Database
+        ],
         "{text}"
     );
     assert_eq!(story.lanes[0].label, "web");
     assert_eq!(story.lanes[1].label, "api");
+    assert_eq!(story.lanes[2].label, "daemon");
     assert_eq!(story.steps[0].folded, ["fn:web/src/spawnForm.ts#buildBody"]);
-    assert_eq!(story.steps[3].folded, ["fn:api/src/spawn.rs#validate"]);
+    assert_eq!(
+        story.steps[3].folded,
+        [
+            "fn:api/src/spawn.rs#validate",
+            "fn:api/src/db.rs#insert_session"
+        ],
+        "a helper that only writes the database folds into the handler"
+    );
+    assert!(
+        story.steps[3]
+            .effects
+            .iter()
+            .any(|e| e.kind == EffectKind::DbWrite && e.target.as_deref() == Some("sessions"))
+    );
     assert!(!text.contains("spawns_a_session"), "{text}");
     assert_eq!(story.steps[2].lane, "mod:api");
     let label = |from: &str, to: &str| {
@@ -305,16 +358,29 @@ fn folds_helpers_and_orders_lanes() {
         Some("POST /sessions/spawn")
     );
     assert_eq!(
-        label("spawn_session", "insert_session").kind,
-        EdgeKind::Calls
-    );
-    assert_eq!(
-        label("insert_session", "table:sessions").label.as_deref(),
-        Some("write sessions")
+        label("spawn_session", "table:sessions").label.as_deref(),
+        Some("write sessions"),
+        "the folded helper's table link contracts to the handler"
     );
     let spawn = label("spawn_session", "notify_daemon");
     assert_eq!(spawn.label.as_deref(), Some("spawn"));
     assert!(spawn.detached);
+    assert_eq!(
+        label("notify_daemon", "topic:DaemonFrame::Command")
+            .label
+            .as_deref(),
+        Some("publish DaemonFrame::Command")
+    );
+    let sub = label("topic:DaemonFrame::Command", "handle_frame");
+    assert_eq!(sub.kind, EdgeKind::Subscribes);
+    assert_eq!(sub.label.as_deref(), Some("subscribe DaemonFrame::Command"));
+    assert!(
+        !story
+            .links
+            .iter()
+            .any(|l| l.from.ends_with("handle_frame") && l.to.starts_with("topic:")),
+        "a subscriber does not link back to its topic\n{text}"
+    );
     assert!(!story.truncated);
 }
 

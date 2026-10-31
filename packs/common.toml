@@ -3,7 +3,7 @@
 
 [[effect]]
 id = "common.http.client_call"
-match = ["*.get", "*.post", "*.put", "*.delete", "*.patch", "*.head", "*.request", "*.fetch", "*.Get", "*.Post", "*.Put", "*.Delete", "*.Do"]
+match = ["*.get", "*.post", "*.put", "*.delete", "*.patch", "*.head", "*.request", "*.fetch", "*.Get", "*.Post", "*.Put", "*.Delete", "*.Do", "*.get*", "*.post*", "*.put*", "*.patch*", "*.delete*", "*.upload*"]
 kind = "network"
 target = "url"
 client = true

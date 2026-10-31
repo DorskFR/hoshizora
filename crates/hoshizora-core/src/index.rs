@@ -23,7 +23,7 @@ pub struct Index {
     pub(crate) graph: Graph,
     by_id: HashMap<String, usize>,
     pub(crate) outgoing: Vec<Vec<usize>>,
-    incoming: Vec<Vec<usize>>,
+    pub(crate) incoming: Vec<Vec<usize>>,
     /// File → function node indices sorted by span start.
     by_file: HashMap<String, Vec<usize>>,
     by_name: HashMap<String, Vec<usize>>,

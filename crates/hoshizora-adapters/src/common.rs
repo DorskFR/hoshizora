@@ -212,13 +212,32 @@ pub fn analyze_body(body: Node, source: &str, spec: &BodySpec) -> Body {
 
 /// Body facts for a sequence of statements/expressions that do not share a block node.
 pub fn analyze_nodes(nodes: &[Node], source: &str, spec: &BodySpec) -> Body {
+    analyze_nodes_with(nodes, source, spec, &|_| true)
+}
+
+/// Like [`analyze_nodes`], emitting bare argument references only when `is_ref` accepts
+/// the name, so data arguments (`send(body, files)`) are not mistaken for callbacks.
+pub fn analyze_nodes_with(
+    nodes: &[Node],
+    source: &str,
+    spec: &BodySpec,
+    is_ref: &dyn Fn(&str) -> bool,
+) -> Body {
     let mut out = Body {
         cyclomatic: 1,
         ..Body::default()
     };
     let last_stmt = nodes.last().map(|n| n.id());
     for child in nodes {
-        walk(*child, source, spec, State::default(), &mut out, last_stmt);
+        walk(
+            *child,
+            source,
+            spec,
+            State::default(),
+            &mut out,
+            last_stmt,
+            is_ref,
+        );
     }
     out.cyclomatic = 1 + out.branches + out.loops;
     out.calls.sort_by_key(|c| c.line);
@@ -275,6 +294,7 @@ fn walk(
     mut st: State,
     out: &mut Body,
     last_stmt: Option<usize>,
+    is_ref: &dyn Fn(&str) -> bool,
 ) {
     let kind = node.kind();
     if spec.stop.contains(&kind) {
@@ -338,7 +358,7 @@ fn walk(
             }
         }
         if let Some(args) = node.child_by_field_name("arguments") {
-            emit_refs(&named_children(args), source, spec, st, out);
+            emit_refs(&named_children(args), source, spec, st, out, is_ref);
         }
     }
     if spec.ref_containers.contains(&kind) {
@@ -346,7 +366,7 @@ fn walk(
             Some(v) => vec![v],
             None => named_children(node),
         };
-        emit_refs(&elements, source, spec, st, out);
+        emit_refs(&elements, source, spec, st, out, is_ref);
     }
     let is_cond = spec.conditionals.contains(&kind);
     let guard = node.child_by_field_name("condition").map(|n| n.id());
@@ -355,14 +375,21 @@ fn walk(
         if is_cond && guard != Some(child.id()) {
             cst.conditional = true;
         }
-        walk(child, source, spec, cst, out, last_stmt);
+        walk(child, source, spec, cst, out, last_stmt, is_ref);
     }
 }
 
-fn emit_refs(nodes: &[Node], source: &str, spec: &BodySpec, st: State, out: &mut Body) {
+fn emit_refs(
+    nodes: &[Node],
+    source: &str,
+    spec: &BodySpec,
+    st: State,
+    out: &mut Body,
+    is_ref: &dyn Fn(&str) -> bool,
+) {
     for n in nodes {
         let t = strip_ws(text(*n, source));
-        if spec.ref_kinds.contains(&n.kind()) && names_function(&t) {
+        if spec.ref_kinds.contains(&n.kind()) && names_function(&t) && is_ref(&t) {
             out.calls.push(site(t, None, vec![], *n, false, st));
         }
     }

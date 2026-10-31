@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use hoshizora_model::api::{LaneKind, Story, StoryLane, StoryLink, StoryStep};
-use hoshizora_model::{Confidence, Edge, EdgeKind, EntrypointKind, Language, Node, NodeKind};
+use hoshizora_model::{
+    Confidence, Edge, EdgeKind, EffectKind, EntrypointKind, Language, Node, NodeKind,
+};
 
 use crate::Index;
 use crate::index::DEFAULT_FLOW_KINDS;
@@ -39,11 +41,8 @@ impl Index {
             if v.depth >= depth {
                 continue;
             }
-            for e in self.story_edges(v.node) {
+            for (e, t) in self.story_edges(v.node) {
                 let edge = &self.graph.edges[e];
-                let Some(t) = self.idx(&edge.to) else {
-                    continue;
-                };
                 let detached = v.detached || is_detached(edge, &self.graph.nodes[t]);
                 if let Some(&existing) = step_of.get(&t) {
                     if existing != v.step {
@@ -57,7 +56,7 @@ impl Index {
                 if !visited.insert(t) {
                     continue;
                 }
-                if self.keeps(t, edge.kind, v.step, &steps) {
+                if self.keeps(t, edge.kind) {
                     if steps.len() >= STORY_STEP_LIMIT {
                         truncated = true;
                         continue;
@@ -97,14 +96,26 @@ impl Index {
         })
     }
 
-    /// Outgoing flow edges worth following, in source order: never into tests, never along
-    /// a name match that could mean several things.
-    fn story_edges(&self, i: usize) -> Vec<usize> {
+    /// Flow edges worth following with their target, in source order: never into tests,
+    /// never along a name match that could mean several things. A topic continues into its
+    /// subscribers.
+    fn story_edges(&self, i: usize) -> Vec<(usize, usize)> {
+        if self.graph.nodes[i].kind == NodeKind::Topic {
+            let mut out: Vec<(usize, usize)> = self.incoming[i]
+                .iter()
+                .copied()
+                .filter(|&e| self.graph.edges[e].kind == EdgeKind::Subscribes)
+                .filter_map(|e| self.idx(&self.graph.edges[e].from).map(|t| (e, t)))
+                .filter(|&(_, t)| !self.is_test(t))
+                .collect();
+            out.sort_by_key(|&(_, t)| self.graph.nodes[t].id.clone());
+            return out;
+        }
         let mut by_site: HashMap<(u32, EdgeKind, &str), Vec<usize>> = HashMap::new();
         let mut order = Vec::new();
         for &e in &self.outgoing[i] {
             let edge = &self.graph.edges[e];
-            if !DEFAULT_FLOW_KINDS.contains(&edge.kind) {
+            if !DEFAULT_FLOW_KINDS.contains(&edge.kind) || edge.kind == EdgeKind::Subscribes {
                 continue;
             }
             let Some(t) = self.idx(&edge.to) else {
@@ -127,11 +138,13 @@ impl Index {
         let mut out = Vec::new();
         for key in order {
             let candidates = &by_site[&key];
-            if let Some(e) = self.pick(i, candidates) {
-                out.push(e);
+            if let Some(e) = self.pick(i, candidates)
+                && let Some(t) = self.idx(&self.graph.edges[e].to)
+            {
+                out.push((e, t));
             }
         }
-        out.sort_by_key(|&e| (self.graph.edges[e].line.unwrap_or(0), e));
+        out.sort_by_key(|&(e, _)| (self.graph.edges[e].line.unwrap_or(0), e));
         out
     }
 
@@ -154,10 +167,22 @@ impl Index {
         if let Some(&e) = sure.first() {
             return Some(e);
         }
+        let caller = &self.graph.nodes[from];
+        // A method name matched without a type (`x.error(..)`) is only trusted within the file.
+        let candidates: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&e| {
+                let edge = &self.graph.edges[e];
+                !edge.attrs.contains_key("receiver")
+                    || self
+                        .idx(&edge.to)
+                        .is_some_and(|t| self.graph.nodes[t].file == caller.file)
+            })
+            .collect();
         if candidates.len() == 1 {
             return candidates.first().copied();
         }
-        let caller = &self.graph.nodes[from];
         let same_file: Vec<usize> = candidates
             .iter()
             .copied()
@@ -192,17 +217,21 @@ impl Index {
                 .any(|seg| seg == "tests" || seg == "test")
     }
 
-    /// A node becomes its own step when it is not a plain helper: synthetic nodes, route
-    /// handlers, spawned work, functions with effects of their own, and functions in another
-    /// lane than the step reaching them.
-    fn keeps(&self, i: usize, via: EdgeKind, from_step: usize, steps: &[StoryStep]) -> bool {
+    /// A node becomes its own step when it is not a helper: synthetic nodes, route handlers,
+    /// spawned work, and functions that talk to something other than the database. Helpers
+    /// that only touch tables fold into their caller, which then reads as "writes sessions";
+    /// a call into another package is a library call, not a process boundary, so it folds
+    /// the same way (routes, topics and hosts are the boundaries).
+    fn keeps(&self, i: usize, via: EdgeKind) -> bool {
         let n = &self.graph.nodes[i];
         match n.kind {
             NodeKind::Route | NodeKind::Table | NodeKind::Host | NodeKind::Topic => true,
             NodeKind::Function => {
                 matches!(via, EdgeKind::Handles | EdgeKind::Spawns)
-                    || !n.effects.direct.is_empty()
-                    || self.lane_id(i) != steps[from_step].lane
+                    || n.effects
+                        .direct
+                        .iter()
+                        .any(|e| is_story_effect(e.kind) && !is_db(e.kind))
             }
             _ => false,
         }
@@ -345,6 +374,18 @@ impl Index {
         });
         lanes
     }
+}
+
+/// Effects that mean something to a reader of the flow; locks, joins and sleeps do not.
+fn is_story_effect(kind: EffectKind) -> bool {
+    !matches!(
+        kind,
+        EffectKind::Lock | EffectKind::Join | EffectKind::Sleep | EffectKind::Blocking
+    )
+}
+
+fn is_db(kind: EffectKind) -> bool {
+    matches!(kind, EffectKind::DbRead | EffectKind::DbWrite)
 }
 
 fn push_link(links: &mut Vec<StoryLink>, link: StoryLink) {

@@ -108,6 +108,13 @@ impl<'r> RuleSet<'r> {
 
 pub(crate) fn build_rule_sets(ctx: &mut Ctx) {
     for file in ctx.files {
+        let qualified: HashSet<&str> = file
+            .symbols
+            .iter()
+            .filter_map(|s| s.body.as_ref())
+            .flat_map(|b| b.calls.iter())
+            .filter_map(|c| c.callee.split_once("::").map(|(root, _)| root))
+            .collect();
         let rules = ctx
             .packs
             .effects()
@@ -118,9 +125,10 @@ pub(crate) fn build_rule_sets(ctx: &mut Ctx) {
                 })
             })
             .filter(|r| {
-                r.requires_import
-                    .as_ref()
-                    .is_none_or(|req| file.imports.iter().any(|i| i.path.contains(req.as_str())))
+                r.requires_import.as_ref().is_none_or(|req| {
+                    file.imports.iter().any(|i| i.path.contains(req.as_str()))
+                        || qualified.contains(req.as_str())
+                })
             })
             .collect();
         ctx.rule_sets.push(RuleSet::new(rules));
@@ -275,7 +283,7 @@ fn builder_routes(ctx: &mut Ctx) {
                 continue;
             };
             let candidates = expanded_callees(ctx, fi, &call.callee);
-            let Some(rule) = ctx
+            let rule = ctx
                 .packs
                 .routes()
                 .filter(|r| r.style == RouteStyle::Builder)
@@ -286,16 +294,34 @@ fn builder_routes(ctx: &mut Ctx) {
                             .iter()
                             .any(|c| p.matches(c) || p.matches(&format!("_.{c}")))
                     })
-                })
-            else {
-                continue;
-            };
+                });
+            // Arguments of a multi-line registration run until the next registration.
+            let window_end = body
+                .calls
+                .iter()
+                .filter(|c| c.line > call.line && literal_path(c).is_some())
+                .map(|c| c.line)
+                .min()
+                .unwrap_or(u32::MAX)
+                .min(call.line + REGISTRATION_WINDOW);
             let same_line: Vec<(usize, &CallSite)> = body
                 .calls
                 .iter()
                 .enumerate()
-                .filter(|(j, c)| *j != ci && c.line == call.line)
+                .filter(|(j, c)| *j != ci && c.line >= call.line && c.line < window_end)
                 .collect();
+            // `r.add("/x", post(handler))`: a method router built alongside marks a
+            // registration even when the registering call is a project-specific wrapper.
+            let method_router = method_from_name(&call.name).is_none()
+                && same_line
+                    .iter()
+                    .any(|(_, c)| c.receiver.is_none() && method_from_name(&c.name).is_some());
+            let Some(default_method) = rule
+                .map(|r| r.method.clone())
+                .or_else(|| method_router.then_some(None))
+            else {
+                continue;
+            };
             let last = callee_segments(&call.callee)
                 .last()
                 .cloned()
@@ -313,7 +339,7 @@ fn builder_routes(ctx: &mut Ctx) {
                 }
             }
             if methods.is_empty() {
-                methods.push(rule.method.clone().unwrap_or_else(|| "ANY".to_owned()));
+                methods.push(default_method.unwrap_or_else(|| "ANY".to_owned()));
             }
             let mut handlers = Vec::new();
             for (_, c) in &same_line {
@@ -321,7 +347,9 @@ fn builder_routes(ctx: &mut Ctx) {
                     continue;
                 }
                 for (t, _) in resolve_call(ctx, f, c) {
-                    if t != f && !handlers.contains(&t) {
+                    // axum handlers are async; sync calls alongside (`body_limit()`) are config.
+                    let plausible = language != Language::Rust || ctx.symbol(t).is_async;
+                    if t != f && plausible && !handlers.contains(&t) {
                         handlers.push(t);
                     }
                 }
@@ -359,6 +387,9 @@ fn builder_routes(ctx: &mut Ctx) {
         }
     }
 }
+
+/// Lines a route registration's arguments may span.
+const REGISTRATION_WINDOW: u32 = 12;
 
 fn known_routes(ctx: &Ctx) -> Vec<RouteRef> {
     ctx.nodes
@@ -420,8 +451,42 @@ fn effect_edge(
     ctx.add_edge(from, to, edge);
 }
 
+/// Enum variants of types defined in the repo that are both handed to a method call
+/// somewhere and matched on elsewhere: the messages of the codebase. One-sided sightings
+/// are plain enum use; third-party enums (`serde_json::Value`) are data, not messages.
+fn message_topics(ctx: &Ctx) -> HashSet<String> {
+    let mut sent: HashSet<&str> = HashSet::new();
+    let mut matched: HashSet<&str> = HashSet::new();
+    for f in 0..ctx.fns.len() {
+        let Some(body) = &ctx.symbol(f).body else {
+            continue;
+        };
+        for call in &body.calls {
+            let Some(variant) = call.string_args.first() else {
+                continue;
+            };
+            match call.callee.as_str() {
+                MESSAGE_SITE => sent.insert(variant),
+                MATCH_SITE => matched.insert(variant),
+                _ => false,
+            };
+        }
+    }
+    sent.intersection(&matched)
+        .filter(|v| {
+            v.split_once("::")
+                .is_some_and(|(ty, _)| ctx.type_by_name.contains_key(ty))
+        })
+        .map(|v| (*v).to_owned())
+        .collect()
+}
+
+pub(crate) const MESSAGE_SITE: &str = "<message>";
+pub(crate) const MATCH_SITE: &str = "<match>";
+
 pub(crate) fn effects(ctx: &mut Ctx) {
     let routes = known_routes(ctx);
+    let topics = message_topics(ctx);
     let mut wrappers: HashMap<usize, String> = HashMap::new();
     for f in 0..ctx.fns.len() {
         let sym = ctx.symbol(f);
@@ -432,6 +497,11 @@ pub(crate) fn effects(ctx: &mut Ctx) {
         let mut seen: HashSet<(EffectKind, u32, String)> = HashSet::new();
         let mut used: BTreeMap<String, usize> = BTreeMap::new();
         for call in &body.calls {
+            if matches!(call.callee.as_str(), MESSAGE_SITE | MATCH_SITE)
+                && !call.string_args.first().is_some_and(|v| topics.contains(v))
+            {
+                continue;
+            }
             let candidates = expanded_callees(ctx, fi, &call.callee);
             if let Some(first) = callee_segments(&call.callee).first()
                 && let Some(&imp) = ctx.scopes[fi].bindings.get(first)
@@ -526,7 +596,7 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                                     .last()
                                     .cloned()
                                     .unwrap_or_default();
-                                let method = method_from_name(&last);
+                                let method = method_from_prefix(&last);
                                 let hits = if placeholder_base && parts.path == "/" {
                                     Vec::new()
                                 } else {
@@ -588,6 +658,20 @@ pub(crate) fn effects(ctx: &mut Ctx) {
         ctx.nodes[from].effects.direct = direct;
     }
     wrapper_requests(ctx, &routes, wrappers);
+}
+
+/// `post` → POST, and `postForm` / `get_json` / `deleteOne` → the verb they start with.
+fn method_from_prefix(name: &str) -> Option<&'static str> {
+    if let Some(m) = method_from_name(name) {
+        return Some(m);
+    }
+    let verb_len = name
+        .find(|c: char| c.is_ascii_uppercase() || c == '_')
+        .unwrap_or(name.len());
+    let verb = &name[..verb_len];
+    (verb_len < name.len())
+        .then(|| method_from_name(verb))
+        .flatten()
 }
 
 fn has_string_param(ctx: &Ctx, f: usize) -> bool {
