@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Observatory</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Observatory console</h1>
+      <p class="hint">
+        Every click is a browser span exported to hoshizora; the API and worker join the same
+        trace through <code>traceparent</code>.
+      </p>
+      <form id="launch-form" aria-labelledby="launch-heading">
+        <h2 id="launch-heading">Launch observation</h2>
+        <label for="star">Star</label>
+        <input id="star" name="star" value="Vega" autocomplete="off" />
+        <label for="site">Site</label>
+        <select id="site" name="site">
+          <option value="paranal">Paranal</option>
+          <option value="mauna-kea">Mauna Kea</option>
+          <option value="la-palma">La Palma</option>
+        </select>
+        <button type="submit" id="launch">Launch observation</button>
+      </form>
+      <section aria-labelledby="catalog-heading">
+        <h2 id="catalog-heading">Catalog</h2>
+        <div class="row">
+          <button type="button" id="list-stars">List stars</button>
+          <button type="button" id="recompute">Recompute catalog</button>
+          <button type="button" id="summary">Catalog summary</button>
+        </div>
+      </section>
+      <section aria-labelledby="output-heading">
+        <h2 id="output-heading">Output</h2>
+        <pre id="output" aria-live="polite" tabindex="0">Ready.</pre>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

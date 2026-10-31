@@ -1,0 +1,8 @@
+target
+tmp
+.git
+**/node_modules
+viewer/dist
+examples/demo/**/target
+examples/demo/**/.venv
+.hoshizora

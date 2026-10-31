@@ -1,0 +1,285 @@
+# Python effect, route and client rules. See crates/hoshizora-core/src/packs.rs for the format.
+
+[[effect]]
+id = "python.requests"
+language = "python"
+match = ["requests.get", "requests.post", "requests.put", "requests.delete", "requests.patch", "requests.head", "requests.request", "requests.Session.*", "session.get", "session.post", "session.put", "session.delete"]
+requires_import = "requests"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "python.httpx"
+language = "python"
+match = ["httpx.get", "httpx.post", "httpx.put", "httpx.delete", "httpx.patch", "httpx.request", "httpx.stream", "client.get", "client.post", "client.put", "client.delete", "client.patch", "client.request", "self.client.get", "self.client.post", "self.client.put", "self.client.delete", "self._client.get", "self._client.post"]
+requires_import = "httpx"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "python.aiohttp"
+language = "python"
+match = ["session.get", "session.post", "session.put", "session.delete", "session.request", "aiohttp.request", "self.session.get", "self.session.post", "self._session.get", "self._session.post"]
+requires_import = "aiohttp"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "python.urllib"
+language = "python"
+match = ["urllib.request.urlopen", "urlopen", "urllib.request.Request", "urllib.request.urlretrieve", "http.client.HTTPConnection", "http.client.HTTPSConnection"]
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "python.sqlalchemy.execute"
+language = "python"
+match = ["sqlalchemy.text", "*.execute", "*.exec_driver_sql", "*.scalars", "*.scalar", "*.fetchall", "*.fetchone"]
+requires_import = "sqlalchemy"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "python.sqlalchemy.orm_read"
+language = "python"
+match = ["*.query", "sqlalchemy.select", "sqlalchemy.future.select", "select", "*.get", "*.first", "*.all", "*.one", "*.one_or_none"]
+requires_import = "sqlalchemy"
+kind = "db_read"
+
+[[effect]]
+id = "python.sqlalchemy.orm_write"
+language = "python"
+match = ["*.add", "*.add_all", "*.merge", "*.delete", "*.commit", "*.flush", "sqlalchemy.insert", "sqlalchemy.update", "sqlalchemy.delete", "insert", "update", "delete"]
+requires_import = "sqlalchemy"
+kind = "db_write"
+
+[[effect]]
+id = "python.psycopg"
+language = "python"
+match = ["*.execute", "*.executemany", "*.fetchall", "*.fetchone", "*.fetchmany", "*.copy"]
+requires_import = "psycopg"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "python.asyncpg"
+language = "python"
+match = ["*.fetch", "*.fetchrow", "*.fetchval", "*.execute", "*.executemany", "*.copy_records_to_table"]
+requires_import = "asyncpg"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "python.sqlite3"
+language = "python"
+match = ["*.execute", "*.executemany", "*.executescript", "*.fetchall", "*.fetchone"]
+requires_import = "sqlite3"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "python.django.read"
+language = "python"
+match = ["*.objects.filter", "*.objects.get", "*.objects.all", "*.objects.exclude", "*.objects.first", "*.objects.last", "*.objects.count", "*.objects.exists", "*.objects.values", "*.objects.values_list", "*.objects.select_related", "*.objects.prefetch_related", "*.objects.annotate", "*.objects.aggregate", "get_object_or_404", "get_list_or_404"]
+kind = "db_read"
+
+[[effect]]
+id = "python.django.write"
+language = "python"
+match = ["*.save", "*.delete", "*.objects.create", "*.objects.update", "*.objects.bulk_create", "*.objects.bulk_update", "*.objects.get_or_create", "*.objects.update_or_create", "*.objects.filter.update", "*.objects.filter.delete"]
+requires_import = "django"
+kind = "db_write"
+
+[[effect]]
+id = "python.redis.read"
+language = "python"
+match = ["*.get", "*.hget", "*.hgetall", "*.lrange", "*.smembers", "*.exists", "*.keys", "*.mget", "*.zrange"]
+requires_import = "redis"
+kind = "db_read"
+target = "arg0"
+
+[[effect]]
+id = "python.redis.write"
+language = "python"
+match = ["*.set", "*.setex", "*.hset", "*.delete", "*.incr", "*.decr", "*.lpush", "*.rpush", "*.sadd", "*.expire", "*.zadd"]
+requires_import = "redis"
+kind = "db_write"
+target = "arg0"
+
+[[effect]]
+id = "python.redis.publish"
+language = "python"
+match = ["*.publish"]
+requires_import = "redis"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "python.redis.subscribe"
+language = "python"
+match = ["*.subscribe", "*.psubscribe"]
+requires_import = "redis"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "python.fs.open"
+language = "python"
+match = ["open", "io.open", "codecs.open", "*.read_text", "*.read_bytes", "*.read", "*.readlines", "*.iterdir", "*.glob", "*.rglob", "*.exists", "*.is_file", "*.stat", "os.listdir", "os.scandir", "os.walk", "os.path.exists", "os.stat", "shutil.copy", "shutil.copytree", "json.load", "yaml.safe_load", "tomllib.load"]
+kind = "fs_read"
+target = "arg0"
+
+[[effect]]
+id = "python.fs.write"
+language = "python"
+match = ["*.write_text", "*.write_bytes", "*.write", "*.writelines", "*.mkdir", "*.unlink", "*.rmdir", "*.touch", "*.rename", "os.makedirs", "os.mkdir", "os.remove", "os.unlink", "os.rename", "os.replace", "shutil.rmtree", "shutil.move", "json.dump"]
+kind = "fs_write"
+target = "arg0"
+
+[[effect]]
+id = "python.subprocess"
+language = "python"
+match = ["subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "os.system", "os.popen", "os.exec*", "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell"]
+kind = "process"
+target = "arg0"
+
+[[effect]]
+id = "python.asyncio.spawn"
+language = "python"
+match = ["asyncio.create_task", "asyncio.ensure_future", "loop.create_task", "*.create_task", "asyncio.run_coroutine_threadsafe", "asyncio.to_thread", "loop.run_in_executor", "*.run_in_executor"]
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "python.asyncio.gather"
+language = "python"
+match = ["asyncio.gather", "asyncio.wait", "asyncio.wait_for", "asyncio.as_completed", "asyncio.TaskGroup"]
+kind = "join"
+spawn = true
+
+[[effect]]
+id = "python.asyncio.sleep"
+language = "python"
+match = ["asyncio.sleep", "anyio.sleep", "trio.sleep"]
+kind = "sleep"
+
+[[effect]]
+id = "python.asyncio.lock"
+language = "python"
+match = ["*.acquire", "asyncio.Lock", "asyncio.Semaphore", "threading.Lock", "threading.RLock", "threading.Semaphore"]
+kind = "lock"
+
+[[effect]]
+id = "python.threading"
+language = "python"
+match = ["threading.Thread", "Thread", "*.submit", "*.map", "concurrent.futures.ThreadPoolExecutor", "concurrent.futures.ProcessPoolExecutor", "ThreadPoolExecutor", "ProcessPoolExecutor", "multiprocessing.Process", "Process", "multiprocessing.Pool"]
+requires_import = "threading"
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "python.concurrent.futures"
+language = "python"
+match = ["*.submit", "*.map", "ThreadPoolExecutor", "ProcessPoolExecutor", "concurrent.futures.ThreadPoolExecutor", "concurrent.futures.ProcessPoolExecutor"]
+requires_import = "concurrent.futures"
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "python.threading.join"
+language = "python"
+match = ["*.join", "*.result", "concurrent.futures.wait", "concurrent.futures.as_completed", "as_completed"]
+requires_import = "concurrent.futures"
+kind = "join"
+
+[[effect]]
+id = "python.thread.join"
+language = "python"
+match = ["*.join"]
+requires_import = "threading"
+kind = "join"
+
+[[effect]]
+id = "python.time.sleep"
+language = "python"
+match = ["time.sleep", "sleep"]
+kind = "sleep"
+
+[[effect]]
+id = "python.blocking_in_async"
+language = "python"
+match = ["time.sleep", "requests.get", "requests.post", "requests.put", "requests.delete", "subprocess.run", "subprocess.call", "subprocess.check_output", "open", "*.result"]
+kind = "blocking"
+async_only = true
+
+[[effect]]
+id = "python.kafka.produce"
+language = "python"
+match = ["*.send", "*.produce", "*.send_and_wait"]
+requires_import = "kafka"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "python.kafka.consume"
+language = "python"
+match = ["KafkaConsumer", "AIOKafkaConsumer", "*.subscribe", "*.poll", "*.getone", "*.getmany"]
+requires_import = "kafka"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "python.pika.publish"
+language = "python"
+match = ["*.basic_publish"]
+requires_import = "pika"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "python.pika.consume"
+language = "python"
+match = ["*.basic_consume", "*.basic_get", "*.consume"]
+requires_import = "pika"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "python.nats.publish"
+language = "python"
+match = ["*.publish", "*.request"]
+requires_import = "nats"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "python.nats.subscribe"
+language = "python"
+match = ["*.subscribe"]
+requires_import = "nats"
+kind = "subscribe"
+target = "arg0"
+
+# Routes
+
+[[route]]
+id = "python.decorator"
+language = "python"
+style = "attribute"
+match = ["app.get", "app.post", "app.put", "app.delete", "app.patch", "app.head", "app.options", "app.route", "app.api_route", "app.websocket", "router.get", "router.post", "router.put", "router.delete", "router.patch", "router.route", "router.api_route", "router.websocket", "*_router.get", "*_router.post", "*_router.put", "*_router.delete", "*_router.patch", "bp.route", "bp.get", "bp.post", "blueprint.route", "*.route", "*.get", "*.post", "*.put", "*.delete", "*.patch"]
+
+[[route]]
+id = "python.builder"
+language = "python"
+style = "builder"
+match = ["app.add_url_rule", "app.add_api_route", "router.add_api_route", "*.add_route", "*.add_url_rule", "*.add_api_route", "web.get", "web.post", "web.put", "web.delete", "*.add_get", "*.add_post", "*.add_put", "*.add_delete", "path", "re_path", "url", "django.urls.path", "django.urls.re_path"]
+
+[[resolve]]
+language = "python"
+ignore_methods = [
+  "append", "extend", "insert", "remove", "pop", "clear", "index", "count", "sort", "reverse", "copy", "keys", "values", "items", "get", "setdefault", "update", "popitem", "add", "discard", "union", "intersection", "difference", "split", "rsplit", "join", "strip", "lstrip", "rstrip", "lower", "upper", "title", "capitalize", "startswith", "endswith", "replace", "find", "rfind", "format", "format_map", "encode", "decode", "isdigit", "isalpha", "isalnum", "isspace", "partition", "splitlines", "zfill", "read", "write", "readline", "readlines", "writelines", "close", "flush", "seek", "tell", "len", "str", "repr", "int", "float", "bool", "list", "dict", "set", "tuple", "print", "range", "enumerate", "zip", "map", "filter", "sorted", "reversed", "sum", "min", "max", "abs", "round", "any", "all", "isinstance", "issubclass", "hasattr", "getattr", "setattr", "type", "id", "hash", "iter", "next", "open", "super", "vars", "dir", "callable", "exit", "get_event_loop", "run", "run_until_complete", "create_task", "gather", "sleep", "wait", "wait_for", "result", "exception", "cancel", "done", "set_result", "add_done_callback", "acquire", "release", "notify", "notify_all", "put", "put_nowait", "get_nowait", "qsize", "empty", "task_done", "info", "debug", "warning", "error", "critical", "log", "getLogger", "setLevel", "addHandler", "model_dump", "model_validate", "json", "parse_obj", "schema", "deepcopy", "now", "utcnow", "today", "strftime", "strptime", "timestamp", "isoformat", "fromisoformat", "total_seconds", "exists", "is_file", "is_dir", "mkdir", "unlink", "glob", "rglob", "iterdir", "resolve", "absolute", "with_suffix", "with_name", "relative_to", "joinpath", "read_text", "write_text", "read_bytes", "write_bytes", "loads", "dumps", "load", "dump", "assertEqual", "assertTrue", "assertFalse", "assertIn", "assertIsNone", "assertRaises", "setUp", "tearDown", "mock", "patch", "assert_called", "assert_called_once", "assert_called_with", "assert_not_called", "raise_for_status", "text", "content", "headers", "cookies", "commit", "rollback", "execute", "executemany", "fetchone", "fetchall", "fetchmany", "cursor", "connect", "begin", "scalar", "scalars", "one", "one_or_none", "first", "query", "add_all", "merge", "delete", "refresh",
+]

@@ -1,0 +1,267 @@
+# Rust effect, route and client rules. See crates/hoshizora-core/src/packs.rs for the format.
+
+[[effect]]
+id = "rust.reqwest.request"
+language = "rust"
+match = ["reqwest::get", "reqwest::Client::get", "*.get", "*.post", "*.put", "*.delete", "*.patch", "*.head", "*.request"]
+requires_import = "reqwest"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "rust.reqwest.send"
+language = "rust"
+match = ["*.send", "*.execute", "*.bytes", "*.json", "*.text"]
+requires_import = "reqwest"
+kind = "network"
+
+[[effect]]
+id = "rust.hyper.request"
+language = "rust"
+match = ["hyper::Client::*", "*.request", "hyper::Request::*", "hyper_util::*::request"]
+requires_import = "hyper"
+kind = "network"
+target = "url"
+client = true
+
+[[effect]]
+id = "rust.sqlx.query"
+language = "rust"
+match = ["sqlx::query*", "sqlx::raw_sql", "*.fetch_one", "*.fetch_all", "*.fetch_optional", "*.fetch", "*.execute", "*.fetch_many"]
+requires_import = "sqlx"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "rust.sqlx.transaction"
+language = "rust"
+match = ["*.begin", "*.commit", "*.rollback"]
+requires_import = "sqlx"
+kind = "db_write"
+
+[[effect]]
+id = "rust.diesel.read"
+language = "rust"
+match = ["*.load", "*.first", "*.get_result", "*.get_results", "*.count", "diesel::sql_query"]
+requires_import = "diesel"
+kind = "db"
+target = "sql"
+
+[[effect]]
+id = "rust.diesel.write"
+language = "rust"
+match = ["diesel::insert_into", "diesel::update", "diesel::delete", "diesel::replace_into", "*.insert_into", "*.on_conflict"]
+requires_import = "diesel"
+kind = "db_write"
+
+[[effect]]
+id = "rust.sea_orm.read"
+language = "rust"
+match = ["*::find", "*::find_by_id", "*.one", "*.all", "*.paginate", "*.count"]
+requires_import = "sea_orm"
+kind = "db_read"
+
+[[effect]]
+id = "rust.sea_orm.write"
+language = "rust"
+match = ["*::insert", "*::insert_many", "*::update", "*::update_many", "*::delete", "*::delete_many", "*.insert", "*.update", "*.delete", "*.save", "*.exec"]
+requires_import = "sea_orm"
+kind = "db_write"
+
+[[effect]]
+id = "rust.redis.read"
+language = "rust"
+match = ["*.get", "*.hget", "*.hgetall", "*.lrange", "*.smembers", "*.exists", "*.keys", "*.mget"]
+requires_import = "redis"
+kind = "db_read"
+target = "arg0"
+
+[[effect]]
+id = "rust.redis.write"
+language = "rust"
+match = ["*.set", "*.set_ex", "*.setex", "*.hset", "*.del", "*.incr", "*.decr", "*.lpush", "*.rpush", "*.sadd", "*.expire", "*.publish"]
+requires_import = "redis"
+kind = "db_write"
+target = "arg0"
+
+[[effect]]
+id = "rust.tokio.spawn"
+language = "rust"
+match = ["tokio::spawn", "tokio::task::spawn", "tokio::task::spawn_local", "*.spawn", "*.spawn_local", "async_std::task::spawn", "smol::spawn"]
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "rust.tokio.spawn_blocking"
+language = "rust"
+match = ["tokio::task::spawn_blocking", "tokio::task::block_in_place", "*.spawn_blocking"]
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "rust.tokio.join"
+language = "rust"
+match = ["tokio::join!", "tokio::try_join!", "join!", "try_join!", "futures::join!", "futures::try_join!", "futures::future::join_all", "futures::future::try_join_all", "futures::join_all", "*.join_next", "*.join_all", "tokio::select!", "select!", "*.await_all"]
+kind = "join"
+
+[[effect]]
+id = "rust.tokio.joinset"
+language = "rust"
+match = ["JoinSet::new", "tokio::task::JoinSet::new"]
+kind = "spawn"
+
+[[effect]]
+id = "rust.tokio.lock"
+language = "rust"
+match = ["*.lock", "*.read", "*.write", "*.try_lock", "*.acquire", "*.acquire_owned", "*.acquire_many", "*.try_acquire"]
+kind = "lock"
+
+[[effect]]
+id = "rust.tokio.sleep"
+language = "rust"
+match = ["tokio::time::sleep", "tokio::time::sleep_until", "tokio::time::timeout", "async_std::task::sleep", "*.tick"]
+kind = "sleep"
+
+[[effect]]
+id = "rust.tokio.channel_send"
+language = "rust"
+match = ["*.send", "*.try_send", "*.send_async", "*.blocking_send"]
+requires_import = "tokio::sync"
+kind = "publish"
+
+[[effect]]
+id = "rust.tokio.channel_recv"
+language = "rust"
+match = ["*.recv", "*.try_recv", "*.recv_many", "*.blocking_recv", "*.changed", "*.borrow_and_update"]
+requires_import = "tokio::sync"
+kind = "subscribe"
+
+[[effect]]
+id = "rust.rayon.par_iter"
+language = "rust"
+match = ["*.par_iter", "*.par_iter_mut", "*.into_par_iter", "*.par_chunks", "*.par_bridge", "*.par_sort", "*.par_sort_unstable", "rayon::join", "rayon::scope", "rayon::spawn"]
+requires_import = "rayon"
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "rust.std.fs_read"
+language = "rust"
+match = ["std::fs::read", "std::fs::read_to_string", "std::fs::read_dir", "std::fs::metadata", "std::fs::File::open", "File::open", "fs::read", "fs::read_to_string", "fs::read_dir", "fs::metadata", "tokio::fs::read", "tokio::fs::read_to_string", "tokio::fs::read_dir", "tokio::fs::metadata", "tokio::fs::File::open", "*.read_to_string", "*.read_to_end", "*.read_line", "*.read_dir"]
+kind = "fs_read"
+target = "arg0"
+
+[[effect]]
+id = "rust.std.fs_write"
+language = "rust"
+match = ["std::fs::write", "std::fs::create_dir", "std::fs::create_dir_all", "std::fs::remove_file", "std::fs::remove_dir_all", "std::fs::rename", "std::fs::copy", "std::fs::File::create", "File::create", "fs::write", "fs::create_dir", "fs::create_dir_all", "fs::remove_file", "fs::remove_dir_all", "fs::rename", "fs::copy", "tokio::fs::write", "tokio::fs::create_dir", "tokio::fs::create_dir_all", "tokio::fs::remove_file", "tokio::fs::remove_dir_all", "tokio::fs::rename", "tokio::fs::copy", "tokio::fs::File::create", "*.write_all", "*.sync_all"]
+kind = "fs_write"
+target = "arg0"
+
+[[effect]]
+id = "rust.std.process"
+language = "rust"
+match = ["std::process::Command::new", "process::Command::new", "Command::new", "tokio::process::Command::new", "*.spawn_command", "*.output", "*.status"]
+kind = "process"
+target = "arg0"
+
+[[effect]]
+id = "rust.std.thread_spawn"
+language = "rust"
+match = ["std::thread::spawn", "thread::spawn", "std::thread::scope", "thread::scope", "*.spawn_scoped"]
+kind = "spawn"
+spawn = true
+
+[[effect]]
+id = "rust.std.thread_join"
+language = "rust"
+match = ["*.join"]
+kind = "join"
+
+[[effect]]
+id = "rust.std.thread_sleep"
+language = "rust"
+match = ["std::thread::sleep", "thread::sleep"]
+kind = "sleep"
+
+[[effect]]
+id = "rust.std.blocking_in_async"
+language = "rust"
+match = ["std::thread::sleep", "thread::sleep", "std::fs::*", "fs::read_to_string", "fs::read", "fs::write", "*.blocking_lock", "*.blocking_recv", "*.blocking_send", "reqwest::blocking::*", "std::process::Command::new", "*.wait"]
+kind = "blocking"
+async_only = true
+
+[[effect]]
+id = "rust.nats.publish"
+language = "rust"
+match = ["*.publish", "*.publish_with_reply", "*.request"]
+requires_import = "async_nats"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "rust.nats.subscribe"
+language = "rust"
+match = ["*.subscribe", "*.queue_subscribe"]
+requires_import = "async_nats"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "rust.lapin.publish"
+language = "rust"
+match = ["*.basic_publish"]
+requires_import = "lapin"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "rust.lapin.consume"
+language = "rust"
+match = ["*.basic_consume", "*.basic_get"]
+requires_import = "lapin"
+kind = "subscribe"
+target = "arg0"
+
+[[effect]]
+id = "rust.rdkafka.produce"
+language = "rust"
+match = ["*.send", "*.send_result", "FutureRecord::to", "BaseRecord::to"]
+requires_import = "rdkafka"
+kind = "publish"
+target = "arg0"
+
+[[effect]]
+id = "rust.rdkafka.consume"
+language = "rust"
+match = ["*.subscribe", "*.recv", "*.poll", "*.stream"]
+requires_import = "rdkafka"
+kind = "subscribe"
+target = "arg0"
+
+# Routes
+
+[[route]]
+id = "rust.actix.attribute"
+language = "rust"
+style = "attribute"
+match = ["get", "post", "put", "delete", "patch", "head", "options", "route", "actix_web::get", "actix_web::post", "actix_web::put", "actix_web::delete", "actix_web::patch", "actix_web::route"]
+
+[[route]]
+id = "rust.rocket.attribute"
+language = "rust"
+style = "attribute"
+match = ["rocket::get", "rocket::post", "rocket::put", "rocket::delete", "rocket::patch"]
+
+[[route]]
+id = "rust.axum.route"
+language = "rust"
+style = "builder"
+match = ["*.route", "*.route_service", "*.nest", "*.service", "*.at", "*.resource"]
+
+[[resolve]]
+language = "rust"
+ignore_methods = [
+  "map", "map_err", "map_or", "map_or_else", "and_then", "or_else", "ok", "err", "ok_or", "ok_or_else", "unwrap", "unwrap_or", "unwrap_or_default", "unwrap_or_else", "expect", "expect_err", "is_some", "is_none", "is_ok", "is_err", "as_ref", "as_mut", "as_deref", "as_str", "as_bytes", "as_slice", "as_ptr", "take", "replace", "copied", "cloned", "flatten", "filter", "filter_map", "find", "find_map", "position", "any", "all", "count", "sum", "product", "min", "max", "min_by", "max_by", "min_by_key", "max_by_key", "fold", "for_each", "iter", "iter_mut", "into_iter", "next", "peek", "skip", "step_by", "chain", "zip", "enumerate", "rev", "last", "nth", "collect", "extend", "partition", "windows", "chunks", "sort", "sort_by", "sort_by_key", "sort_unstable", "sort_unstable_by", "sort_unstable_by_key", "dedup", "retain", "drain", "push", "push_str", "pop", "insert", "remove", "clear", "truncate", "len", "is_empty", "contains", "contains_key", "get", "get_mut", "get_or_insert_with", "entry", "or_insert", "or_insert_with", "or_default", "keys", "values", "values_mut", "first", "split", "split_once", "rsplit", "splitn", "lines", "chars", "bytes", "trim", "trim_start", "trim_end", "trim_matches", "starts_with", "ends_with", "strip_prefix", "strip_suffix", "to_string", "to_owned", "to_vec", "to_lowercase", "to_uppercase", "to_ascii_lowercase", "to_ascii_uppercase", "parse", "clone", "into", "from", "try_into", "try_from", "default", "eq", "ne", "cmp", "partial_cmp", "hash", "fmt", "deref", "borrow", "borrow_mut", "join", "concat", "repeat", "format", "write", "writeln", "write_str", "write_all", "read", "read_to_string", "read_to_end", "read_line", "flush", "lock", "try_lock", "send", "recv", "try_recv", "try_send", "subscribe", "poll", "spawn", "abort", "is_finished", "with_capacity", "new", "build", "builder", "with_context", "context", "wrap_err", "with", "then", "then_some", "and", "or", "xor", "not", "abs", "pow", "sqrt", "floor", "ceil", "round", "saturating_sub", "saturating_add", "checked_sub", "checked_add", "wrapping_add", "wrapping_sub", "as_secs", "as_millis", "as_micros", "as_nanos", "elapsed", "duration_since", "now", "serialize", "deserialize", "encode", "decode", "display", "debug", "id", "name", "kind", "key", "value", "path", "file", "line", "status", "body", "headers", "header", "text", "json", "bytes_stream", "is_null", "as_object", "as_array", "as_i64", "as_u64", "as_f64", "as_bool", "to_le_bytes", "to_be_bytes", "from_le_bytes", "from_be_bytes", "from_utf8", "from_utf8_lossy", "from_str", "from_iter", "exists", "is_file", "is_dir", "parent", "file_name", "extension", "to_path_buf", "to_str", "to_string_lossy", "into_inner", "into_bytes", "leak", "cast", "size_hint", "type_id",
+]

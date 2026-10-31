@@ -1,0 +1,50 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  background: #0b1020;
+  color: #e6e9f2;
+}
+main {
+  max-width: 48rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+.hint {
+  color: #9aa3b8;
+}
+form,
+section {
+  margin-top: 1.5rem;
+}
+label {
+  display: block;
+  margin-top: 0.5rem;
+}
+input,
+select {
+  padding: 0.4rem;
+  margin-top: 0.2rem;
+}
+button {
+  margin: 0.75rem 0.5rem 0 0;
+  padding: 0.5rem 1rem;
+  background: #2a4b8d;
+  color: inherit;
+  border: 1px solid #4a6fc0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+button:focus-visible {
+  outline: 2px solid #ffd166;
+  outline-offset: 2px;
+}
+button[aria-busy="true"] {
+  opacity: 0.6;
+}
+pre {
+  background: #121a33;
+  padding: 1rem;
+  overflow: auto;
+  max-height: 24rem;
+  border-radius: 4px;
+}

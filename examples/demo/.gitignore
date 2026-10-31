@@ -1,0 +1,7 @@
+api/target/
+web/dist/
+web/node_modules/
+worker/.venv/
+__pycache__/
+.pytest_cache/
+.hoshizora/

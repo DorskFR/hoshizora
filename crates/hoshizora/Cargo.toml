@@ -16,6 +16,20 @@ anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+axum = { version = "0.8.9", features = ["json", "query", "tokio", "http1"] }
+tower-http = { version = "0.6.11", features = ["cors", "compression-gzip", "compression-br"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+futures = "0.3.31"
+clap = { version = "4.6.7", features = ["derive"] }
+rust-embed = { version = "8.13.0" }
+mime_guess = "2.0.5"
+percent-encoding = "2.3.2"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.5"
+prost = "0.14.4"
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }
 
 [lints]
 workspace = true
