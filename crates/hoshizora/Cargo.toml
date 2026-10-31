@@ -1,0 +1,21 @@
+[package]
+name = "hoshizora"
+description = "Map a codebase as a 3D graph of flows and effects, animated by OpenTelemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hoshizora-model.workspace = true
+hoshizora-adapters.workspace = true
+hoshizora-core.workspace = true
+hoshizora-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

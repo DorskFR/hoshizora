@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/DorskFR/hoshizora"
+rust-version = "1.90"
+
+[workspace.dependencies]
+hoshizora-model = { path = "crates/hoshizora-model" }
+hoshizora-adapters = { path = "crates/hoshizora-adapters" }
+hoshizora-core = { path = "crates/hoshizora-core" }
+hoshizora-runtime = { path = "crates/hoshizora-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

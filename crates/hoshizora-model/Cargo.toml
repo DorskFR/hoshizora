@@ -1,0 +1,13 @@
+[package]
+name = "hoshizora-model"
+description = "Shared graph, adapter and runtime types for hoshizora"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
