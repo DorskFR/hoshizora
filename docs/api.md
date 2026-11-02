@@ -35,7 +35,8 @@ clone and index in the background like a `POST`. Refs containing `/` need the fi
 
 Spans go to the project whose `services` contains the resource's `service.name`; otherwise to
 the project named by the `x-hoshizora-project` header or `?project=` on `/v1/traces`; otherwise
-to the project their `code.filepath` resolves in; otherwise to the first project. Each project
+to the project their `code.filepath` resolves in; otherwise to the only project. With several
+projects, spans none of them claims are dropped. Each project
 has its own runtime stats, traces, insights and `runtime/stream`.
 
 ## Graph
