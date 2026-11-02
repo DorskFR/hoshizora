@@ -6,7 +6,10 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::Context;
 use hoshizora_model::Graph;
-use hoshizora_model::api::{AddProject, Project, ProjectSource, ProjectStatus};
+use hoshizora_model::api::{
+    AddProject, DiskSpace, Project, ProjectSource, ProjectStatus, ProjectStorage, PurgeReport,
+    Purged, Storage,
+};
 use hoshizora_runtime::RuntimeConfig;
 
 use crate::git::{self, GitOptions};
@@ -146,7 +149,8 @@ impl<Q: GraphQueries> AppState<Q> {
         for mut project in projects {
             let graph_path = self.graph_path(&project.id);
             let root = self.root_of(&project);
-            let loaded = (graph_path.exists() && root.exists())
+            let root_required = matches!(project.source, ProjectSource::Path { .. });
+            let loaded = (graph_path.exists() && (!root_required || root.exists()))
                 .then(|| hoshizora_core::load(&graph_path).ok())
                 .flatten();
             match loaded {
@@ -359,6 +363,86 @@ impl<Q: GraphQueries> AppState<Q> {
         Ok(())
     }
 
+    /// Deletes the clone of an idle git project; the registration and graph stay, and the next
+    /// reindex clones again. The registry lock is held while deleting so no job can start on
+    /// the half-removed tree.
+    pub fn purge(&self, id: &str) -> Result<Purged, AppError> {
+        let projects = self.write();
+        let entry = projects
+            .iter()
+            .find(|e| e.project.id == id)
+            .ok_or_else(|| AppError::not_found("project"))?;
+        self.purge_entry(entry)
+    }
+
+    fn purge_entry(&self, entry: &ProjectEntry<Q>) -> Result<Purged, AppError> {
+        let project = &entry.project;
+        if matches!(project.source, ProjectSource::Path { .. }) {
+            return Err(AppError::bad_request(
+                "a path project has no clone to purge",
+            ));
+        }
+        if busy(project.status) {
+            return Err(AppError::not_ready(
+                project.status,
+                "project is being cloned or indexed",
+            ));
+        }
+        let dir = self.repo_dir(&project.id);
+        let freed_bytes = dir_size(&dir);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| AppError::internal(format!("{e}")))?;
+        }
+        Ok(Purged {
+            id: project.id.clone(),
+            freed_bytes,
+        })
+    }
+
+    /// Purges every git project that is not cloning or indexing.
+    pub fn purge_all(&self) -> PurgeReport {
+        let projects = self.write();
+        let purged: Vec<Purged> = projects
+            .iter()
+            .filter(|e| matches!(e.project.source, ProjectSource::Git { .. }))
+            .filter(|e| !busy(e.project.status))
+            .filter_map(|e| self.purge_entry(e).ok())
+            .collect();
+        PurgeReport {
+            freed_bytes: purged.iter().map(|p| p.freed_bytes).sum(),
+            projects: purged,
+        }
+    }
+
+    /// Walks `repos/` and `graphs/`, so it costs a directory traversal per clone; the project
+    /// list itself never pays for it.
+    pub fn storage(&self) -> Storage {
+        let projects: Vec<ProjectStorage> = self
+            .list()
+            .iter()
+            .map(|p| {
+                let clone_bytes = match p.source {
+                    ProjectSource::Git { .. } => {
+                        let dir = self.repo_dir(&p.id);
+                        dir.exists().then(|| dir_size(&dir))
+                    }
+                    ProjectSource::Path { .. } => None,
+                };
+                ProjectStorage {
+                    id: p.id.clone(),
+                    clone_bytes,
+                    graph_bytes: dir_size(&self.graph_path(&p.id)),
+                }
+            })
+            .collect();
+        Storage {
+            clone_bytes: projects.iter().filter_map(|p| p.clone_bytes).sum(),
+            graph_bytes: projects.iter().map(|p| p.graph_bytes).sum(),
+            disk: disk_space(&self.data_dir),
+            projects,
+        }
+    }
+
     fn set_status(&self, id: &str, status: ProjectStatus, error: Option<String>) {
         if let Some(entry) = self.write().iter_mut().find(|e| e.project.id == id) {
             entry.project.status = status;
@@ -427,6 +511,53 @@ impl<Q: GraphQueries> AppState<Q> {
         self.persist();
         Ok(())
     }
+}
+
+/// Bytes under `path` (a file or a tree), symlinks counted as themselves and never followed.
+pub fn dir_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+#[cfg(unix)]
+fn disk_space(path: &Path) -> Option<DiskSpace> {
+    let probe = if path.exists() {
+        path
+    } else {
+        path.parent().filter(|p| p.exists())?
+    };
+    let st = rustix::fs::statvfs(probe).ok()?;
+    Some(DiskSpace {
+        total_bytes: st.f_blocks.saturating_mul(st.f_frsize),
+        free_bytes: st.f_bavail.saturating_mul(st.f_frsize),
+    })
+}
+
+#[cfg(not(unix))]
+fn disk_space(_path: &Path) -> Option<DiskSpace> {
+    None
 }
 
 fn busy(status: ProjectStatus) -> bool {

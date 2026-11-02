@@ -20,6 +20,7 @@ import type {
   NodeDetail,
   NodeStats,
   Project,
+  Purged,
   SearchHit,
   Story,
   TraceSummary,
@@ -206,6 +207,7 @@ export class MockBackend implements Backend {
 interface MockProject {
   project: Project;
   dataset: () => MockDataset;
+  cloneBytes: number | null;
 }
 
 const STAGE_MS = 1800;
@@ -248,7 +250,8 @@ export class MockProjects implements ProjectsApi {
   }
 
   private put(project: Project, dataset: () => MockDataset): void {
-    this.projects.set(project.id, { project, dataset });
+    const cloneBytes = project.source.kind === "git" ? 48_000_000 + project.nodes * 2_000 : null;
+    this.projects.set(project.id, { project, dataset, cloneBytes });
   }
 
   async list() {
@@ -323,12 +326,45 @@ export class MockProjects implements ProjectsApi {
     setTimeout(() => {
       p.project.status = "ready";
       p.project.indexed_at = new Date().toISOString();
+      if (p.project.source.kind === "git") p.cloneBytes ??= 48_000_000;
     }, STAGE_MS);
     return { ...p.project };
   }
 
   async remove(id: string) {
     this.projects.delete(id);
+  }
+
+  async purge(id: string) {
+    const p = this.projects.get(id);
+    if (!p) throw new Error(`unknown project ${id}`);
+    if (p.project.source.kind !== "git") throw new Error("a path project has no clone to purge");
+    const freed = p.cloneBytes;
+    p.cloneBytes = null;
+    return { id, freed_bytes: freed ?? 0 };
+  }
+
+  async purgeAll() {
+    const projects: Purged[] = [];
+    for (const p of this.projects.values()) {
+      if (p.project.source.kind !== "git" || p.cloneBytes === null) continue;
+      projects.push(await this.purge(p.project.id));
+    }
+    return { projects, freed_bytes: projects.reduce((n, p) => n + p.freed_bytes, 0) };
+  }
+
+  async storage() {
+    const projects = [...this.projects.values()].map((p) => ({
+      id: p.project.id,
+      clone_bytes: p.cloneBytes,
+      graph_bytes: p.project.nodes * 900 + p.project.edges * 300,
+    }));
+    return {
+      projects,
+      clone_bytes: projects.reduce((n, p) => n + (p.clone_bytes ?? 0), 0),
+      graph_bytes: projects.reduce((n, p) => n + p.graph_bytes, 0),
+      disk: { total_bytes: 1_073_741_824, free_bytes: 734_003_200 },
+    };
   }
 
   backend(id: string | null): Backend {

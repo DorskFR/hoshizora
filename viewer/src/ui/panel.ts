@@ -245,6 +245,18 @@ export class NodePanel {
           code.innerHTML = html;
         })
         .catch(() => undefined);
+    } else if (n.file && n.span) {
+      this.body.append(
+        section(
+          "source",
+          "Source",
+          h(
+            "p",
+            { class: "muted small", role: "note" },
+            "Source not available: the project's checkout is missing (purged clone). Reindex the project to restore it.",
+          ),
+        ),
+      );
     }
 
     if (f) {

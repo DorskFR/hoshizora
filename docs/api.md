@@ -18,6 +18,9 @@ or has `failed` get `409 {"error", "status"}`. Errors are JSON `{"error": "..."}
 | GET | `/api/projects/{project}` | `Project` |
 | POST | `/api/projects/{project}/reindex` | `202 Project`: fetch the latest commit and rebuild; `409` while a rebuild is already running |
 | DELETE | `/api/projects/{project}` | `204`, removes the clone and the graph |
+| POST | `/api/projects/{project}/purge` | `Purged` (`{id, freed_bytes}`): deletes the clone of a git project to reclaim disk; the project stays `ready` and its graph keeps being served, `/api/source` answers `410` until a `reindex` clones again. `400` for a path project (local trees are never deleted), `409` while cloning or indexing |
+| POST | `/api/purge` | `PurgeReport` (`{projects: Purged[], freed_bytes}`): purges every idle git project |
+| GET | `/api/storage` | `Storage`: `projects: [{id, clone_bytes, graph_bytes}]` (`clone_bytes` is `null` without a clone), `clone_bytes` and `graph_bytes` totals, and `disk: {total_bytes, free_bytes}` of the data dir's filesystem (`null` off Unix). Walks the clones on each call; `GET /api/projects` never does |
 
 `id` is `owner-repo` of the URL, lowercased (`dorskfr-hoshizora`); only `https://`, `ssh://`
 and `git@host:path` URLs are accepted. `ref` may be a branch or tag.

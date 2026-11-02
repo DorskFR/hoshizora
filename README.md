@@ -50,6 +50,18 @@ HOSHIZORA_PROJECTS=https://github.com/a/b,https://github.com/c/d hoshizora serve
 A declared URL or path that is already registered is left as it is, so the flags are safe to
 keep when the data dir does persist.
 
+Clones are only needed while indexing and for the source panel, so on a small volume they can be
+purged without losing anything: the project stays registered and its graph keeps being served,
+and the next reindex clones again. Path projects are never touched.
+
+```sh
+curl localhost:7317/api/storage                                    # clone/graph bytes per project, disk free
+curl -X POST localhost:7317/api/projects/tokio-rs-mini-redis/purge # {"id":..,"freed_bytes":..}
+curl -X POST localhost:7317/api/purge                              # every idle git project
+```
+
+The viewer's home screen shows the same sizes with "Purge clone" and "Purge all clones" buttons.
+
 Every `/api/...` route also exists under `/api/projects/{id}/...`; the unprefixed form is the
 first project. Set `HOSHIZORA_GIT_TOKEN` to clone private GitHub repositories. Spans are routed
 to the project owning their `service.name`, else by the `x-hoshizora-project` header or
