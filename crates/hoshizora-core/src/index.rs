@@ -2,11 +2,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::build::resolve::plausible_call;
+
 use hoshizora_model::api::{
     AffectedEntrypoint, DomainReport, FlowStep, Impact, SearchHit, StatesReport, Subgraph,
 };
 use hoshizora_model::{
-    DefaultKind, Edge, EdgeKind, EffectKind, EntrypointKind, Graph, Insight, Node, NodeKind,
+    DefaultKind, Edge, EdgeKind, EffectKind, EntrypointKind, Flow, Graph, Insight, Node, NodeKind,
 };
 
 /// Edge kinds followed by `flow` and `impact` when none are given.
@@ -573,10 +575,8 @@ impl Index {
             let e = &self.graph.edges[ei];
             if registration_code
                 || e.loop_depth == 0
-                || !matches!(
-                    e.kind,
-                    EdgeKind::Calls | EdgeKind::Spawns | EdgeKind::Requests
-                )
+                || !matches!(e.kind, EdgeKind::Calls | EdgeKind::Spawns)
+                || !plausible_call(e)
             {
                 continue;
             }
@@ -611,8 +611,10 @@ impl Index {
 
     /// Two or more consecutive awaited I/O items at the same loop depth, none conditional,
     /// each on a distinct receiver root, no later item on a local receiver (probably derived
-    /// from an earlier result, like `cur = await conn.execute(); cur.fetchall()`), and no
-    /// plain call on a line in between (which probably consumes the earlier result).
+    /// from an earlier result, like `cur = await conn.execute(); cur.fetchall()`), no plain
+    /// call on a line in between (which probably consumes the earlier result), no later item
+    /// reading a name bound or mutably borrowed since the first, no ordering barrier
+    /// (commit, lock, send, ...) in between, and no table written by one and touched by another.
     fn parallelisable(&self, i: usize, out: &mut Vec<Insight>) {
         let n = &self.graph.nodes[i];
         let boundaries: Vec<u32> = self.outgoing[i]
@@ -626,6 +628,37 @@ impl Index {
             .as_ref()
             .map(|f| f.params.iter().map(|p| p.name.as_str()).collect())
             .unwrap_or_default();
+        let flows: &[Flow] = n.function.as_ref().map_or(&[], |f| f.flows.as_slice());
+        let flow_at = |line: u32| flows.iter().find(|f| f.line == line);
+        let tables = self.table_accesses(i);
+        let ordered = |since: u32, it: &IoItem| {
+            let (uses, mutates) = flow_at(it.line).map_or((&[][..], &[][..]), |f| {
+                (f.uses.as_slice(), f.mutates.as_slice())
+            });
+            let shares = |a: &[String], b: &[String]| a.iter().any(|x| b.contains(x));
+            let data = flows
+                .iter()
+                .filter(|f| since <= f.line && f.line < it.line)
+                .any(|f| {
+                    shares(&f.binds, uses) || shares(&f.mutates, uses) || shares(&f.uses, mutates)
+                });
+            let barrier = flows
+                .iter()
+                .filter(|f| since <= f.line && f.line <= it.line)
+                .any(|f| f.barrier)
+                || n.effects
+                    .direct
+                    .iter()
+                    .any(|e| e.kind == EffectKind::Lock && since <= e.line && e.line <= it.line);
+            let table = tables.iter().any(|a| {
+                since <= a.line
+                    && a.line < it.line
+                    && tables
+                        .iter()
+                        .any(|b| b.line == it.line && b.table == a.table && (a.write || b.write))
+            });
+            data || barrier || table
+        };
         let items = self.io_items(i);
         let mut run: Vec<&IoItem> = Vec::new();
         let mut flush = |run: &mut Vec<&IoItem>| {
@@ -642,7 +675,8 @@ impl Index {
             run.clear();
         };
         for it in &items {
-            if !it.awaited || it.conditional {
+            let conditional = it.conditional || flow_at(it.line).is_some_and(|f| f.conditional);
+            if !it.awaited || conditional {
                 flush(&mut run);
                 continue;
             }
@@ -653,7 +687,8 @@ impl Index {
                 .iter()
                 .all(|prev| prev.loop_depth == it.loop_depth && prev.root != it.root)
                 && (run.is_empty() || !it.local_receiver(&params))
-                && !consumed_between;
+                && !consumed_between
+                && !run.first().is_some_and(|first| ordered(first.line, it));
             if independent {
                 run.push(it);
             } else {
@@ -802,7 +837,7 @@ impl Index {
         if info.is_async && !js {
             for &ei in &self.outgoing[i] {
                 let e = &self.graph.edges[ei];
-                if e.kind != EdgeKind::Calls {
+                if e.kind != EdgeKind::Calls || !plausible_call(e) {
                     continue;
                 }
                 let Some(t) = self.idx(&e.to) else { continue };
@@ -825,7 +860,7 @@ impl Index {
         if !reasons.is_empty() {
             out.push(Insight::Inefficient {
                 node: n.id.clone(),
-                self_p95_nanos: 0,
+                self_p95_nanos: None,
                 complexity: info.complexity.time.clone(),
                 reasons,
             });
@@ -852,7 +887,7 @@ impl Index {
             reasons.extend(info.complexity.basis.iter().cloned());
             out.push(Insight::Inefficient {
                 node: n.id.clone(),
-                self_p95_nanos: 0,
+                self_p95_nanos: None,
                 complexity: info.complexity.time.clone(),
                 reasons,
             });
@@ -925,12 +960,12 @@ struct IoItem {
 
 impl IoItem {
     /// A receiver that is neither a parameter nor `self` is a local, probably built from an
-    /// earlier awaited result.
+    /// earlier awaited result; a computed receiver (`a().await?.b()`) certainly is.
     fn local_receiver(&self, params: &HashSet<&str>) -> bool {
         self.is_method
             && !matches!(self.root.as_str(), "self" | "this" | "cls")
             && !params.contains(self.root.as_str())
-            && self.root.chars().next().is_some_and(|c| c.is_lowercase())
+            && (self.root == "<expr>" || self.root.chars().next().is_some_and(|c| c.is_lowercase()))
     }
 }
 

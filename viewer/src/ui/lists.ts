@@ -169,7 +169,7 @@ const KNOWN_FIELDS = new Set([
 function describeKnown(i: Insight): string {
   switch (i.kind) {
     case "inefficient":
-      return `self p95 ${fmtNanos(i.self_p95_nanos)} · ${i.complexity} · ${i.reasons.join(", ")}`;
+      return `${i.self_p95_nanos == null ? "no runtime data" : `self p95 ${fmtNanos(i.self_p95_nanos)}`} · ${i.complexity} · ${i.reasons.join(", ")}`;
     case "hot_path":
       return `${fmtRate(i.rate_per_sec)} · p95 ${fmtNanos(i.p95_nanos)}`;
     case "waiting":

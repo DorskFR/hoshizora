@@ -60,6 +60,7 @@ fn func(id: &str, parent: &str, language: Language, is_async: bool) -> Node {
         },
         fan_in: 0,
         fan_out: 0,
+        flows: vec![],
     });
     n
 }

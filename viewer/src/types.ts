@@ -260,7 +260,7 @@ export type Insight =
   | {
       kind: "inefficient";
       node: string;
-      self_p95_nanos: number;
+      self_p95_nanos: number | null;
       complexity: string;
       reasons: string[];
     }

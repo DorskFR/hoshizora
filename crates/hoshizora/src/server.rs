@@ -809,6 +809,7 @@ mod tests {
                 },
                 fan_in: 1,
                 fan_out: 0,
+                flows: vec![],
             });
             function.effects = Effects {
                 direct: vec![hoshizora_model::Effect {

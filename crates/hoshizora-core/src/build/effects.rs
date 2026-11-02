@@ -459,7 +459,15 @@ fn known_routes(ctx: &Ctx) -> Vec<RouteRef> {
         .collect()
 }
 
+/// A path made only of placeholders (`/{}`) names no route in particular.
+fn has_literal_segment(path: &str) -> bool {
+    path.split('/').any(|s| !s.is_empty() && s != "{}")
+}
+
 fn match_routes(routes: &[RouteRef], method: Option<&str>, path: &str) -> Vec<usize> {
+    if !has_literal_segment(path) {
+        return Vec::new();
+    }
     let method_ok = |r: &RouteRef| method.is_none_or(|m| r.method == "ANY" || r.method == m);
     let exact: Vec<usize> = routes
         .iter()
@@ -471,7 +479,7 @@ fn match_routes(routes: &[RouteRef], method: Option<&str>, path: &str) -> Vec<us
     }
     let suffix: Vec<usize> = routes
         .iter()
-        .filter(|r| method_ok(r) && path != "/" && r.path != "/")
+        .filter(|r| method_ok(r) && path != "/" && has_literal_segment(&r.path))
         .filter(|r| r.path.ends_with(path) || path.ends_with(&r.path))
         .map(|r| r.node)
         .collect();
@@ -480,6 +488,16 @@ fn match_routes(routes: &[RouteRef], method: Option<&str>, path: &str) -> Vec<us
     } else {
         Vec::new()
     }
+}
+
+/// Hits spanning several distinct paths: a suffix match that could mean any of them.
+fn ambiguous_routes(routes: &[RouteRef], hits: &[usize]) -> bool {
+    let paths: HashSet<&str> = routes
+        .iter()
+        .filter(|r| hits.contains(&r.node))
+        .map(|r| r.path.as_str())
+        .collect();
+    paths.len() > 1
 }
 
 fn effect_edge(
@@ -676,6 +694,8 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                                     match_routes(&routes, method, &parts.path)
                                 };
                                 if !hits.is_empty() {
+                                    let candidates = hits.len();
+                                    let ambiguous = ambiguous_routes(&routes, &hits);
                                     for route in hits {
                                         let mut edge = Edge::new(
                                             ctx.nodes[from].id.clone(),
@@ -688,6 +708,12 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                                         edge.conditional = call.conditional;
                                         edge.awaited = call.awaited;
                                         edge.attrs.insert("url".into(), raw.clone());
+                                        if ambiguous {
+                                            edge.attrs.insert(
+                                                "candidates".into(),
+                                                candidates.to_string(),
+                                            );
+                                        }
                                         ctx.add_edge(from, route, edge);
                                     }
                                 } else if let Some(host) = &parts.host {
@@ -835,6 +861,8 @@ fn wrapper_requests(ctx: &mut Ctx, routes: &[RouteRef], mut wrappers: HashMap<us
                     hits = gets;
                 }
             }
+            let candidates = hits.len();
+            let ambiguous = ambiguous_routes(routes, &hits);
             for route in hits {
                 let mut edge = Edge::new(
                     ctx.nodes[from].id.clone(),
@@ -848,6 +876,10 @@ fn wrapper_requests(ctx: &mut Ctx, routes: &[RouteRef], mut wrappers: HashMap<us
                 edge.awaited = call.awaited;
                 edge.attrs.insert("url".into(), literal.to_owned());
                 edge.attrs.insert("via".into(), call.callee.clone());
+                if ambiguous {
+                    edge.attrs
+                        .insert("candidates".into(), candidates.to_string());
+                }
                 ctx.add_edge(from, route, edge);
             }
             let node = &mut ctx.nodes[from];
@@ -869,5 +901,38 @@ fn wrapper_requests(ctx: &mut Ctx, routes: &[RouteRef], mut wrappers: HashMap<us
                 node.effects.direct.sort_by_key(|e| (e.line, e.kind));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn routes() -> Vec<RouteRef> {
+        [
+            ("GET", "/{}"),
+            ("GET", "/api/v1/album/{}"),
+            ("GET", "/api/v1/album"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (m, p))| RouteRef {
+            method: (*m).to_owned(),
+            path: (*p).to_owned(),
+            node: i,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn placeholder_only_paths_match_no_route() {
+        let routes = routes();
+        assert!(match_routes(&routes, Some("GET"), "/{}").is_empty());
+        assert!(match_routes(&routes, Some("GET"), "/{}/{}").is_empty());
+        assert_eq!(
+            match_routes(&routes, Some("GET"), "/api/v1/album/{}"),
+            vec![1]
+        );
+        assert_eq!(match_routes(&routes, Some("GET"), "/album"), vec![2]);
     }
 }

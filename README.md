@@ -137,7 +137,9 @@ The HTTP API is documented in [`docs/api.md`](docs/api.md); the architecture in
 
 - Calls are resolved by name within the caller's language and the packages it imports. Edges
   carry a confidence (`exact`, `name`, `heuristic`, `observed`); edges with several candidate
-  targets are kept for navigation but not used to propagate effects.
+  targets, and name matches for a method called on an unnamed expression (`x.get(0).start()`) or
+  on a binding not named after the target's type, are kept for navigation but not used to
+  propagate effects or complexity.
 - Complexity is a heuristic estimate with its reasons attached, not a proof.
 - Runtime stats come from spans: functions without spans are only visible statically.
 

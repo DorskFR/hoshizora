@@ -158,6 +158,28 @@ pub struct FunctionInfo {
     pub complexity: Complexity,
     pub fan_in: u32,
     pub fan_out: u32,
+    /// Per-line data flow of the body's calls, for ordering decisions between statements.
+    #[serde(default)]
+    pub flows: Vec<Flow>,
+}
+
+/// Names the calls on one source line bind, read and mutate. Only lines that await, bind,
+/// mutate or act as a barrier are kept; `uses` only for awaited lines.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Flow {
+    pub line: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutates: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conditional: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// A call whose position relative to other I/O is the point: transaction and lock
+    /// boundaries, channel sends, flushes.
+    pub barrier: bool,
 }
 
 /// Heuristic asymptotic estimate. `basis` says why, so nobody mistakes it for a proof.
