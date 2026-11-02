@@ -155,14 +155,23 @@ impl<Q: GraphQueries> AppState<Q> {
                 .flatten();
             match loaded {
                 Some(graph) => {
+                    let stale = graph.meta.indexer != hoshizora_core::INDEXER_VERSION;
                     project.status = ProjectStatus::Ready;
                     project.error = None;
                     let state = ProjectState::new(Q::from_graph(graph), root, self.config.clone());
                     fill_counts(&mut project, &state);
+                    let id = project.id.clone();
                     self.write().push(ProjectEntry {
                         project,
                         state: Some(state),
                     });
+                    if stale {
+                        tracing::info!(
+                            project = id,
+                            "graph built by another hoshizora version, reindexing"
+                        );
+                        let _ = self.reindex(&id);
+                    }
                 }
                 None => {
                     let id = project.id.clone();
@@ -900,10 +909,50 @@ mod tests {
 
         let restarted = make_state();
         assert_eq!(restarted.restore().unwrap(), 2);
+        assert!(
+            restarted
+                .list()
+                .iter()
+                .all(|p| p.status == ProjectStatus::Ready),
+            "same-version graphs are not rebuilt"
+        );
         for spec in specs {
             restarted.register(spec).unwrap();
         }
         assert_eq!(restarted.list().len(), 2);
+
+        let ids: Vec<String> = restarted.list().into_iter().map(|p| p.id).collect();
+        for id in &ids {
+            let path = restarted.graph_path(id);
+            let mut graph = hoshizora_core::load(&path).unwrap();
+            assert_eq!(graph.meta.indexer, hoshizora_core::INDEXER_VERSION);
+            graph.meta.indexer = "0.0.0".into();
+            std::fs::write(&path, serde_json::to_vec(&graph).unwrap()).unwrap();
+        }
+        let upgraded = make_state();
+        assert_eq!(upgraded.restore().unwrap(), 2);
+        assert!(
+            upgraded
+                .list()
+                .iter()
+                .all(|p| p.status != ProjectStatus::Ready),
+            "graphs from another version are rebuilt"
+        );
+        assert!(upgraded.get(&ids[0]).is_some());
+        for _ in 0..400 {
+            if upgraded
+                .list()
+                .iter()
+                .all(|p| matches!(p.status, ProjectStatus::Ready | ProjectStatus::Failed))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for id in &ids {
+            let graph = hoshizora_core::load(&upgraded.graph_path(id)).unwrap();
+            assert_eq!(graph.meta.indexer, hoshizora_core::INDEXER_VERSION);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

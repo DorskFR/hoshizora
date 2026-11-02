@@ -212,6 +212,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
     Graph {
         meta: GraphMeta {
             version: GRAPH_VERSION,
+            indexer: crate::INDEXER_VERSION.to_owned(),
             root: root.to_string_lossy().into_owned(),
             generated_at: crate::store::now_rfc3339(),
             languages,
