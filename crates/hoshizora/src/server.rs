@@ -783,6 +783,7 @@ mod tests {
         fn new() -> Self {
             let mut graph = Graph::default();
             graph.meta.root = "/tmp/fake".into();
+            graph.meta.indexer = hoshizora_core::INDEXER_VERSION.into();
             let mut function = node(FN_ID, NodeKind::Function, Some("src/lib.rs"), Some((2, 3)));
             function.function = Some(hoshizora_model::FunctionInfo {
                 signature: "fn create(&self) -> Session".into(),

@@ -94,6 +94,9 @@ pub struct StateSite {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GraphMeta {
     pub version: u32,
+    /// hoshizora version that built the graph; empty for graphs built before it was recorded.
+    #[serde(default)]
+    pub indexer: String,
     pub root: String,
     pub generated_at: String,
     pub languages: Vec<Language>,
