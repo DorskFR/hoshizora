@@ -1826,7 +1826,7 @@ fn multi_candidate_edges_do_not_propagate_effects() {
         vec![],
         vec![
             func(
-                "Alpha::bind",
+                "Alpha::attach_lease",
                 1,
                 3,
                 vec![args(
@@ -1835,7 +1835,7 @@ fn multi_candidate_edges_do_not_propagate_effects() {
                 )],
             ),
             ty("Alpha", 0, &[]),
-            func("Beta::bind", 5, 7, vec![]),
+            func("Beta::attach_lease", 5, 7, vec![]),
             ty("Beta", 4, &[]),
             func(
                 "caller",
@@ -1843,7 +1843,7 @@ fn multi_candidate_edges_do_not_propagate_effects() {
                 11,
                 vec![CallSite {
                     receiver: Some("x".into()),
-                    ..call("x.bind", 10)
+                    ..call("x.attach_lease", 10)
                 }],
             ),
         ],
@@ -1851,8 +1851,10 @@ fn multi_candidate_edges_do_not_propagate_effects() {
     files[5].imports.clear();
     let idx = Index::new(build_graph(Path::new("/cctui"), files, &Packs::builtin()));
     let out = idx.outgoing("fn:crates/cctui-daemon/src/two.rs#caller");
-    let binds: Vec<&&hoshizora_model::Edge> =
-        out.iter().filter(|e| e.to.ends_with("::bind")).collect();
+    let binds: Vec<&&hoshizora_model::Edge> = out
+        .iter()
+        .filter(|e| e.to.ends_with("::attach_lease"))
+        .collect();
     assert_eq!(binds.len(), 2, "{out:?}");
     assert!(
         binds

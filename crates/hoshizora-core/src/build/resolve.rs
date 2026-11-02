@@ -558,6 +558,110 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
 /// Receiver the adapter could not name: the result of a chained expression.
 const EXPR_RECEIVER: &str = "<expr>";
 
+/// Trait and lifecycle method names that std and third-party types implement too: on a
+/// receiver of unknown type, being the only project method of that name is not evidence.
+const COMMON_METHODS: &[&str] = &[
+    "abort",
+    "accept",
+    "acquire",
+    "add",
+    "apply",
+    "begin",
+    "bind",
+    "build",
+    "call",
+    "cancel",
+    "check",
+    "clear",
+    "clone",
+    "close",
+    "commit",
+    "compare",
+    "complete",
+    "connect",
+    "create",
+    "delete",
+    "disconnect",
+    "dispatch",
+    "done",
+    "drop",
+    "emit",
+    "end",
+    "execute",
+    "exit",
+    "fetch",
+    "finish",
+    "fire",
+    "flush",
+    "forget",
+    "get",
+    "handle",
+    "init",
+    "insert",
+    "join",
+    "kill",
+    "len",
+    "listen",
+    "load",
+    "lock",
+    "log",
+    "mark",
+    "merge",
+    "next",
+    "notify",
+    "open",
+    "pause",
+    "peek",
+    "poll",
+    "pop",
+    "process",
+    "publish",
+    "push",
+    "put",
+    "read",
+    "ready",
+    "receive",
+    "recv",
+    "register",
+    "release",
+    "reload",
+    "remove",
+    "render",
+    "reset",
+    "resolve",
+    "restart",
+    "resume",
+    "retry",
+    "rollback",
+    "run",
+    "save",
+    "schedule",
+    "send",
+    "set",
+    "shutdown",
+    "signal",
+    "spawn",
+    "start",
+    "step",
+    "stop",
+    "store",
+    "submit",
+    "subscribe",
+    "sync",
+    "tick",
+    "touch",
+    "trigger",
+    "try_recv",
+    "try_send",
+    "unlock",
+    "unsubscribe",
+    "update",
+    "validate",
+    "wait",
+    "wake",
+    "write",
+];
+
 /// Whether a call edge carries evidence for its target beyond a bare name: an exact
 /// resolution, or a method call whose receiver type is known (`self`, a parameter, a field
 /// chain), and no competing candidates.
@@ -593,7 +697,8 @@ pub(crate) fn plausible_call(edge: &Edge) -> bool {
     }
 }
 
-/// `scheduler` ↔ `Scheduler::start`, `repository` ↔ `MatchingRepository::find`.
+/// `scheduler` ↔ `Scheduler::start`, `repository` ↔ `MatchingRepository::find`,
+/// `conn` ↔ `Connection::process`; a field chain is judged by its last segment.
 fn receiver_names_type(receiver: &str, target: &str) -> bool {
     let Some(symbol) = target.rsplit('#').next() else {
         return false;
@@ -603,11 +708,15 @@ fn receiver_names_type(receiver: &str, target: &str) -> bool {
     };
     let ty = ty.to_ascii_lowercase();
     let receiver: String = receiver
+        .rsplit('.')
+        .next()
+        .unwrap_or(receiver)
         .chars()
         .filter(|c| *c != '_')
         .collect::<String>()
         .to_ascii_lowercase();
-    receiver.len() >= 3 && (ty.ends_with(&receiver) || receiver.ends_with(&ty))
+    receiver.len() >= 3
+        && (ty.ends_with(&receiver) || ty.starts_with(&receiver) || receiver.ends_with(&ty))
 }
 
 /// Targets of a call plus the type (or imported module) the receiver was resolved through,
@@ -793,14 +902,30 @@ fn resolve_targets(
     });
     let bare = call.receiver.is_none() && segments.len() == 1;
     let from_test = is_test_file(&ctx.files[fi].path);
+    let common = COMMON_METHODS.contains(&name.as_str());
     let not_caller = |cands: Vec<usize>| -> Vec<usize> {
-        cands
+        let cands: Vec<usize> = cands
             .into_iter()
             .filter(|&c| !(elsewhere && c == f))
             .filter(|&c| !on_value || ctx.symbol(c).kind == SymbolKind::Method)
             .filter(|&c| !bare || ctx.symbol(c).kind != SymbolKind::Method)
             .filter(|&c| from_test || !is_test_file(&ctx.files[ctx.fns[c].file].path))
-            .collect()
+            .collect();
+        let Some(receiver) = call.receiver.as_deref().filter(|_| on_value) else {
+            return cands;
+        };
+        let named: Vec<usize> = cands
+            .iter()
+            .copied()
+            .filter(|&c| receiver_names_type(receiver, &ctx.nodes[ctx.fns[c].node].id))
+            .collect();
+        if !named.is_empty() {
+            named
+        } else if common {
+            Vec::new()
+        } else {
+            cands
+        }
     };
 
     let generic = ctx.packs.ignores_method(language, &name);
