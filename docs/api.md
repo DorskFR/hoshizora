@@ -26,7 +26,8 @@ or has `failed` get `409 {"error", "status"}`. Errors are JSON `{"error": "..."}
 and `git@host:path` URLs are accepted. `ref` may be a branch or tag.
 
 Private GitHub repositories are cloned with `HOSHIZORA_GIT_TOKEN` when set. The project list
-persists in `<data-dir>/projects.json` and is restored on start. Projects declared with
+persists in `<data-dir>/projects.json` and is restored on start; a graph built by another
+hoshizora version (`meta.indexer`) is served as is and rebuilt in the background. Projects declared with
 `serve --project [name=]<url>[@ref]` (repeatable; also comma-separated in `HOSHIZORA_PROJECTS`)
 or `--projects-file <json>` (`HOSHIZORA_PROJECTS_FILE`; an array of `AddProject` bodies or
 `{path, name?}` entries) are added on start when their URL or path is not registered yet, and
