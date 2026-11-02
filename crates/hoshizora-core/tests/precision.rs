@@ -68,13 +68,7 @@ fn bare_identifiers_never_bind_to_methods() {
         .filter(|e| e.kind == hoshizora_model::EdgeKind::Calls)
         .map(|e| (e.to.as_str(), e.attrs.get("receiver").map(String::as_str)))
         .collect();
-    assert_eq!(
-        targets,
-        vec![
-            ("fn:src/scheduler.rs#Scheduler::start", Some("<expr>")),
-            ("fn:src/parse.rs#offset", None),
-        ]
-    );
+    assert_eq!(targets, vec![("fn:src/parse.rs#offset", None)]);
 }
 
 #[test]

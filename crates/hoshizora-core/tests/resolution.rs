@@ -675,3 +675,109 @@ fn value_receivers_do_not_bind_free_functions_by_name() {
         );
     }
 }
+
+/// A method call on a receiver of unknown type binds by name only when the name is not a
+/// common trait/lifecycle name (unique: plain edge; several: dimmed candidates), or when the
+/// receiver names the target type. Typed receivers resolve exactly as before.
+#[test]
+fn untyped_receivers_bind_only_distinctive_unique_methods() {
+    let idx = build(vec![
+        file(
+            "api/src/watchdog.rs",
+            Language::Rust,
+            "api/src/watchdog",
+            vec![],
+            vec![
+                func("Watchdog::tick", 1, vec![]),
+                func("Watchdog::reconcile_leases", 30, vec![]),
+                func("Watchdog::describe_thing", 60, vec![]),
+            ],
+        ),
+        file(
+            "api/src/durable.rs",
+            Language::Rust,
+            "api/src/durable",
+            vec![],
+            vec![
+                func("Durable::forget", 1, vec![]),
+                func("Durable::describe_thing", 30, vec![]),
+                func("Connection::process", 60, vec![]),
+            ],
+        ),
+        file(
+            "api/src/main.rs",
+            Language::Rust,
+            "api/src/main",
+            vec![],
+            vec![
+                func(
+                    "run",
+                    1,
+                    vec![
+                        recv(call("tick.tick", 2), "tick"),
+                        recv(call("<expr>.forget", 3), "<expr>"),
+                        recv(call("<expr>.reconcile_leases", 4), "<expr>"),
+                        recv(call("thing.describe_thing", 5), "thing"),
+                        recv(call("watchdog.tick", 6), "watchdog"),
+                        recv(call("conn.process", 7), "conn"),
+                        recv(call("<expr>.process", 8), "<expr>"),
+                    ],
+                ),
+                with_params(
+                    func("typed", 40, vec![recv(call("w.tick", 41), "w")]),
+                    &[("w", "Watchdog")],
+                ),
+            ],
+        ),
+    ]);
+    let run = "fn:api/src/main.rs#run";
+    let tick = "fn:api/src/watchdog.rs#Watchdog::tick";
+    assert!(
+        edge(&idx, run, "fn:api/src/durable.rs#Durable::forget").is_none(),
+        "<expr>.forget() does not bind the only forget: the name is common"
+    );
+    let distinctive = edge(
+        &idx,
+        run,
+        "fn:api/src/watchdog.rs#Watchdog::reconcile_leases",
+    )
+    .expect("<expr>.reconcile_leases() binds the unique distinctive method");
+    assert_eq!(distinctive.confidence, Confidence::Name);
+    for to in [
+        "fn:api/src/watchdog.rs#Watchdog::describe_thing",
+        "fn:api/src/durable.rs#Durable::describe_thing",
+    ] {
+        let e = edge(&idx, run, to).expect("thing.describe_thing() keeps both candidates");
+        assert_eq!(e.attrs.get("candidates").map(String::as_str), Some("2"));
+    }
+    let process = "fn:api/src/durable.rs#Connection::process";
+    let abbreviated: Vec<Option<u32>> = idx
+        .outgoing(run)
+        .iter()
+        .filter(|e| e.to == process)
+        .map(|e| e.line)
+        .collect();
+    assert_eq!(
+        abbreviated,
+        vec![Some(7)],
+        "conn.process() binds through the abbreviated receiver; <expr>.process() does not"
+    );
+    let named = edge(&idx, run, tick).expect("watchdog.tick() binds through the receiver name");
+    assert_eq!(
+        named.attrs.get("receiver").map(String::as_str),
+        Some("watchdog")
+    );
+    assert!(
+        !idx.outgoing(run)
+            .iter()
+            .any(|e| e.to == tick && e.line == Some(2)),
+        "tick.tick() on an unknown type does not bind Watchdog::tick"
+    );
+    let typed =
+        edge(&idx, "fn:api/src/main.rs#typed", tick).expect("w: Watchdog resolves w.tick()");
+    assert_eq!(typed.confidence, Confidence::Exact);
+    assert_eq!(
+        typed.attrs.get("receiver_type").map(String::as_str),
+        Some("Watchdog")
+    );
+}
