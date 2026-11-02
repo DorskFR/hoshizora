@@ -7,7 +7,9 @@
 
 use std::collections::HashSet;
 
-use hoshizora_model::{CallSite, Confidence, Edge, EdgeKind, FileFacts, Language, NodeKind};
+use hoshizora_model::{
+    CallSite, Confidence, Edge, EdgeKind, FileFacts, Language, NodeKind, SymbolKind,
+};
 
 use super::packages::{self, normalise};
 use super::{Ctx, FileScope, ImportTarget, effects};
@@ -693,12 +695,17 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
 
     let elsewhere = call.receiver.as_deref().is_some_and(|r| !is_self(r))
         || (segments.len() >= 2 && !is_method);
+    let on_value = call.receiver.as_deref().is_some_and(|r| {
+        !is_self(r)
+            && !ctx.scopes[fi].bindings.contains_key(r)
+            && !(language == Language::Go && ctx.package_names.contains_key(r))
+    });
     let not_caller = |cands: Vec<usize>| -> Vec<usize> {
-        if elsewhere {
-            cands.into_iter().filter(|&c| c != f).collect()
-        } else {
-            cands
-        }
+        cands
+            .into_iter()
+            .filter(|&c| !(elsewhere && c == f))
+            .filter(|&c| !on_value || ctx.symbol(c).kind == SymbolKind::Method)
+            .collect()
     };
 
     if let Some(cands) = ctx.fn_by_file_name[fi].get(&name).cloned().map(not_caller)
