@@ -396,9 +396,10 @@ impl Index {
         hits
     }
 
-    /// Every domain (or the one whose name or id is `domain`) with the sites branching on it.
+    /// Every domain (or the one whose name or id is `domain`) with the sites branching on it,
+    /// and every column (or those of that table, that `table.column`, or linked to that domain).
     pub fn states(&self, domain: Option<&str>) -> StatesReport {
-        let domains = self
+        let domains: Vec<DomainReport> = self
             .graph
             .states
             .domains
@@ -416,12 +417,29 @@ impl Index {
                     .collect(),
             })
             .collect();
-        StatesReport { domains }
+        let columns = self
+            .graph
+            .states
+            .columns
+            .iter()
+            .filter(|c| {
+                domain.is_none_or(|q| {
+                    c.table == q
+                        || format!("{}.{}", c.table, c.column) == q
+                        || c.domains
+                            .iter()
+                            .any(|id| domains.iter().any(|d| d.domain.id == *id))
+                })
+            })
+            .cloned()
+            .collect();
+        StatesReport { domains, columns }
     }
 
     /// Findings that need no runtime data: I/O in loops, blocking calls in async code,
-    /// sequential independent awaits, high-complexity hot candidates, branches on a domain
-    /// whose catch-all silently swallows values they do not handle.
+    /// sequential independent awaits, high-complexity hot candidates, a table read then
+    /// written across an await without a transaction, branches on a domain whose catch-all
+    /// silently swallows values they do not handle.
     pub fn static_insights(&self) -> Vec<Insight> {
         let mut out = Vec::new();
         for (i, n) in self.graph.nodes.iter().enumerate() {
@@ -430,6 +448,7 @@ impl Index {
             self.parallelisable(i, &mut out);
             self.blocking(i, info, &mut out);
             self.complexity_candidate(n, info, &mut out);
+            self.read_then_write(i, &mut out);
         }
         out.extend(self.unhandled_values());
         out
@@ -645,6 +664,123 @@ impl Index {
         flush(&mut run);
     }
 
+    /// Table accesses of a function: its own `reads`/`writes` edges plus those of the
+    /// functions it calls, placed at the line of the call. Callees that take a lock or open a
+    /// transaction themselves are left out.
+    fn table_accesses(&self, i: usize) -> Vec<TableAccess> {
+        let n = &self.graph.nodes[i];
+        let deletes_at = |node: &Node, line: Option<u32>| {
+            node.effects
+                .direct
+                .iter()
+                .any(|e| e.kind == EffectKind::DbDelete && Some(e.line) == line)
+        };
+        let mut out = Vec::new();
+        for &ei in &self.outgoing[i] {
+            let e = &self.graph.edges[ei];
+            let Some(line) = e.line else { continue };
+            match e.kind {
+                EdgeKind::Reads | EdgeKind::Writes => out.push(TableAccess {
+                    table: e.to.trim_start_matches("table:").to_owned(),
+                    line,
+                    write: e.kind == EdgeKind::Writes,
+                    delete: deletes_at(n, Some(line)),
+                }),
+                EdgeKind::Calls => {
+                    let Some(t) = self.idx(&e.to) else { continue };
+                    let callee = &self.graph.nodes[t];
+                    if callee
+                        .effects
+                        .direct
+                        .iter()
+                        .any(|d| d.kind == EffectKind::Lock)
+                    {
+                        continue;
+                    }
+                    for &ci in &self.outgoing[t] {
+                        let c = &self.graph.edges[ci];
+                        if !matches!(c.kind, EdgeKind::Reads | EdgeKind::Writes) {
+                            continue;
+                        }
+                        out.push(TableAccess {
+                            table: c.to.trim_start_matches("table:").to_owned(),
+                            line,
+                            write: c.kind == EdgeKind::Writes,
+                            delete: deletes_at(callee, c.line),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.sort_by(|a, b| (a.line, &a.table, a.write).cmp(&(b.line, &b.table, b.write)));
+        out
+    }
+
+    /// A read of a table followed by a write to it, with an awaited call or effect from the
+    /// read line up to the write line, and no lock or transaction taken before the write.
+    /// Functions handed a transaction by their caller (`tx: &mut Transaction<'_, _>`) run
+    /// inside it and are skipped.
+    fn read_then_write(&self, i: usize, out: &mut Vec<Insight>) {
+        let n = &self.graph.nodes[i];
+        if self.is_test(i)
+            || n.function
+                .as_ref()
+                .is_some_and(|f| in_transaction(&f.params))
+        {
+            return;
+        }
+        let accesses = self.table_accesses(i);
+        if !accesses.iter().any(|a| a.write) || !accesses.iter().any(|a| !a.write) {
+            return;
+        }
+        let lock_before = n
+            .effects
+            .direct
+            .iter()
+            .filter(|e| e.kind == EffectKind::Lock)
+            .map(|e| e.line)
+            .min();
+        let mut awaits: Vec<u32> = n
+            .effects
+            .direct
+            .iter()
+            .filter(|e| e.awaited)
+            .map(|e| e.line)
+            .collect();
+        awaits.extend(
+            self.outgoing[i]
+                .iter()
+                .map(|&ei| &self.graph.edges[ei])
+                .filter(|e| e.awaited)
+                .filter_map(|e| e.line),
+        );
+        let mut reported: HashSet<&str> = HashSet::new();
+        for r in accesses.iter().filter(|a| !a.write) {
+            if reported.contains(r.table.as_str()) {
+                continue;
+            }
+            let Some(w) = accesses
+                .iter()
+                .find(|a| a.write && a.table == r.table && a.line > r.line)
+            else {
+                continue;
+            };
+            let yields = awaits.iter().any(|&l| l >= r.line && l < w.line);
+            let guarded = lock_before.is_some_and(|l| l <= w.line);
+            if yields && !guarded {
+                reported.insert(r.table.as_str());
+                out.push(Insight::ReadThenWrite {
+                    node: n.id.clone(),
+                    table: r.table.clone(),
+                    read_line: r.line,
+                    write_line: w.line,
+                    write: if w.delete { "deletes" } else { "writes" }.to_owned(),
+                });
+            }
+        }
+    }
+
     fn blocking(&self, i: usize, info: &hoshizora_model::FunctionInfo, out: &mut Vec<Insight>) {
         let n = &self.graph.nodes[i];
         let mut reasons: Vec<String> = n
@@ -728,18 +864,24 @@ const IO_KINDS: &[EffectKind] = &[
     EffectKind::Network,
     EffectKind::DbRead,
     EffectKind::DbWrite,
+    EffectKind::DbDelete,
     EffectKind::FsRead,
     EffectKind::FsWrite,
 ];
 
-const LOOP_IO_KINDS: &[EffectKind] =
-    &[EffectKind::Network, EffectKind::DbRead, EffectKind::DbWrite];
+const LOOP_IO_KINDS: &[EffectKind] = &[
+    EffectKind::Network,
+    EffectKind::DbRead,
+    EffectKind::DbWrite,
+    EffectKind::DbDelete,
+];
 
 fn kind_name(kind: EffectKind) -> &'static str {
     match kind {
         EffectKind::Network => "network",
         EffectKind::DbRead => "db_read",
         EffectKind::DbWrite => "db_write",
+        EffectKind::DbDelete => "db_delete",
         EffectKind::FsRead => "fs_read",
         EffectKind::FsWrite => "fs_write",
         EffectKind::Process => "process",
@@ -751,6 +893,22 @@ fn kind_name(kind: EffectKind) -> &'static str {
         EffectKind::Sleep => "sleep",
         EffectKind::Blocking => "blocking",
     }
+}
+
+fn in_transaction(params: &[hoshizora_model::Param]) -> bool {
+    params.iter().any(|p| {
+        matches!(p.name.as_str(), "tx" | "txn" | "trx" | "transaction")
+            || p.ty.as_deref().is_some_and(|t| {
+                t.contains("Transaction") || t.contains("Tx<") || t.ends_with("Tx")
+            })
+    })
+}
+
+struct TableAccess {
+    table: String,
+    line: u32,
+    write: bool,
+    delete: bool,
 }
 
 struct IoItem {

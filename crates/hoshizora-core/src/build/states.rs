@@ -5,12 +5,20 @@
 //! the only domain of that name anywhere. Unqualified sites link by overlap: at least two
 //! handled values, all of them members of exactly one domain (ties broken the same way).
 //! A site whose values match none of the named domain's members stays unlinked.
+//!
+//! Columns come from the SQL seen in effects outside tests: every `table.column` some
+//! statement sets to a quoted literal, with the statements comparing it against literals as
+//! readers, linked to the domains (any language) whose members cover every value written.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use hoshizora_model::{Language, StateDomain, StateSite, States};
+use hoshizora_model::{
+    ColumnReader, ColumnSite, ColumnValue, EntrypointKind, Language, StateColumn, StateDomain,
+    StateSite, States,
+};
 
 use super::Ctx;
+use crate::story::is_test_file;
 
 fn family(language: Language) -> u8 {
     match language {
@@ -111,7 +119,106 @@ pub(crate) fn build(ctx: &mut Ctx) -> States {
             b.subject.as_str(),
         ))
     });
-    States { domains, sites }
+    let columns = columns(ctx, &domains);
+    for _ in 0..columns.len() {
+        ctx.count("states.columns");
+    }
+    States {
+        domains,
+        sites,
+        columns,
+    }
+}
+
+/// `(function, line)` → literal values one statement compares the column against.
+type ReaderMap = BTreeMap<(String, u32), Vec<String>>;
+
+fn columns(ctx: &Ctx, domains: &[StateDomain]) -> Vec<StateColumn> {
+    let is_test = |f: usize| {
+        let node = &ctx.nodes[ctx.fns[f].node];
+        node.entrypoint == Some(EntrypointKind::Test)
+            || is_test_file(&ctx.files[ctx.fns[f].file].path)
+            || node
+                .qualified_name
+                .split("::")
+                .any(|seg| seg == "tests" || seg == "test")
+    };
+    let mut written: BTreeMap<(String, String), BTreeMap<String, Vec<ColumnSite>>> =
+        BTreeMap::new();
+    for site in ctx.sql_sites.iter().filter(|s| !is_test(s.function)) {
+        let function = ctx.nodes[ctx.fns[site.function].node].id.clone();
+        for a in &site.assignments {
+            let writers = written
+                .entry((a.table.clone(), a.column.clone()))
+                .or_default()
+                .entry(a.value.clone())
+                .or_default();
+            let at = ColumnSite {
+                function: function.clone(),
+                line: site.line,
+            };
+            if !writers.contains(&at) {
+                writers.push(at);
+            }
+        }
+    }
+    let mut readers: BTreeMap<(String, String), ReaderMap> = BTreeMap::new();
+    for site in ctx.sql_sites.iter().filter(|s| !is_test(s.function)) {
+        let function = ctx.nodes[ctx.fns[site.function].node].id.clone();
+        for c in &site.conditions {
+            let key = (c.table.clone(), c.column.clone());
+            if !written.contains_key(&key) {
+                continue;
+            }
+            let values = readers
+                .entry(key)
+                .or_default()
+                .entry((function.clone(), site.line))
+                .or_default();
+            if !values.contains(&c.value) {
+                values.push(c.value.clone());
+            }
+        }
+    }
+    written
+        .into_iter()
+        .map(|((table, column), values)| {
+            let linked: Vec<String> = domains
+                .iter()
+                .filter(|d| {
+                    values.keys().all(|v| {
+                        d.values.iter().any(|m| {
+                            m.literal.as_deref() == Some(v.as_str())
+                                || m.name.eq_ignore_ascii_case(v)
+                        })
+                    })
+                })
+                .map(|d| d.id.clone())
+                .collect();
+            StateColumn {
+                readers: readers
+                    .remove(&(table.clone(), column.clone()))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|((function, line), values)| ColumnReader {
+                        function,
+                        line,
+                        values,
+                    })
+                    .collect(),
+                table,
+                column,
+                values: values
+                    .into_iter()
+                    .map(|(value, mut writers)| {
+                        writers.sort();
+                        ColumnValue { value, writers }
+                    })
+                    .collect(),
+                domains: linked,
+            }
+        })
+        .collect()
 }
 
 /// The single candidate closest to file `fi`; `None` when none or when the nearest tier

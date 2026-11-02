@@ -16,10 +16,11 @@ pub const FLOW_KINDS: &[EdgeKind] = &[
     EdgeKind::Requests,
 ];
 
-pub const ALL_EFFECTS: [EffectKind; 13] = [
+pub const ALL_EFFECTS: [EffectKind; 14] = [
     EffectKind::Network,
     EffectKind::DbRead,
     EffectKind::DbWrite,
+    EffectKind::DbDelete,
     EffectKind::FsRead,
     EffectKind::FsWrite,
     EffectKind::Process,
@@ -381,6 +382,7 @@ fn describe(
                     EffectKind::Network
                         | EffectKind::DbRead
                         | EffectKind::DbWrite
+                        | EffectKind::DbDelete
                         | EffectKind::FsRead
                         | EffectKind::FsWrite
                 )

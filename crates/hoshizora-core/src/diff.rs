@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-use hoshizora_model::{EffectKind, EntrypointKind, Insight, Language, Node, NodeKind, StateSite};
+use hoshizora_model::{
+    EffectKind, EntrypointKind, Insight, Language, Node, NodeKind, StateColumn, StateSite,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{DEFAULT_FLOW_KINDS, Index};
@@ -30,6 +32,28 @@ pub struct StatesDelta {
     /// Sites in added or modified functions with missing values and a catch-all that swallows
     /// them (same rule as the `unhandled_values` insight).
     pub silent_defaults: Vec<StateSite>,
+    #[serde(default)]
+    pub columns: Vec<ColumnDelta>,
+}
+
+/// A table column whose set of literal values written changed, matched by `table.column`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnDelta {
+    pub table: String,
+    pub column: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Statements comparing the column against literals, and branch sites on a domain linked
+    /// to it, that have no case for an added value.
+    pub unhandled: Vec<UnhandledReader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnhandledReader {
+    pub function: String,
+    pub line: u32,
+    /// Added values the reader does not mention.
+    pub values: Vec<String>,
 }
 
 /// Domains are matched by name within a language family; same-named domains are merged.
@@ -82,6 +106,8 @@ pub struct EffectDelta {
 pub struct TableContext {
     pub db_read: Vec<String>,
     pub db_write: Vec<String>,
+    #[serde(default)]
+    pub db_delete: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -281,7 +307,122 @@ fn states_delta(base: &Index, head: &Index, changed: &[String]) -> StatesDelta {
     StatesDelta {
         domains,
         silent_defaults,
+        columns: column_deltas(base, head),
     }
+}
+
+fn column_values(index: &Index) -> BTreeMap<(&str, &str), (BTreeSet<&str>, &StateColumn)> {
+    index
+        .graph
+        .states
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                (c.table.as_str(), c.column.as_str()),
+                (c.values.iter().map(|v| v.value.as_str()).collect(), c),
+            )
+        })
+        .collect()
+}
+
+fn column_deltas(base: &Index, head: &Index) -> Vec<ColumnDelta> {
+    let before = column_values(base);
+    let after = column_values(head);
+    let empty = BTreeSet::new();
+    let mut out = Vec::new();
+    for (key, (values, column)) in &after {
+        let old = before.get(key).map_or(&empty, |(v, _)| v);
+        let added: Vec<String> = values.difference(old).map(|v| (*v).to_owned()).collect();
+        let removed: Vec<String> = old.difference(values).map(|v| (*v).to_owned()).collect();
+        if added.is_empty() && removed.is_empty() {
+            continue;
+        }
+        let not_test = |function: &str| !head.idx(function).is_some_and(|i| head.is_test(i));
+        let mut unhandled: Vec<UnhandledReader> = column
+            .readers
+            .iter()
+            .filter(|r| not_test(&r.function))
+            .filter_map(|r| {
+                let values: Vec<String> = added
+                    .iter()
+                    .filter(|a| !r.values.contains(a))
+                    .cloned()
+                    .collect();
+                (!values.is_empty()).then(|| UnhandledReader {
+                    function: r.function.clone(),
+                    line: r.line,
+                    values,
+                })
+            })
+            .collect();
+        for domain in head
+            .graph
+            .states
+            .domains
+            .iter()
+            .filter(|d| column.domains.contains(&d.id))
+        {
+            let names_of = |value: &str| -> Vec<&str> {
+                domain
+                    .values
+                    .iter()
+                    .filter(|m| {
+                        m.literal.as_deref() == Some(value) || m.name.eq_ignore_ascii_case(value)
+                    })
+                    .map(|m| m.name.as_str())
+                    .collect()
+            };
+            for site in head
+                .graph
+                .states
+                .sites
+                .iter()
+                .filter(|s| s.domain == domain.id && not_test(&s.function))
+            {
+                let values: Vec<String> = added
+                    .iter()
+                    .filter(|a| {
+                        !site
+                            .handled
+                            .iter()
+                            .any(|h| h == *a || names_of(a).contains(&h.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                if !values.is_empty() {
+                    unhandled.push(UnhandledReader {
+                        function: site.function.clone(),
+                        line: site.line,
+                        values,
+                    });
+                }
+            }
+        }
+        unhandled.sort_by(|a, b| (&a.function, a.line).cmp(&(&b.function, b.line)));
+        unhandled.dedup_by(|a, b| a.function == b.function && a.line == b.line);
+        out.push(ColumnDelta {
+            table: key.0.to_owned(),
+            column: key.1.to_owned(),
+            added,
+            removed,
+            unhandled,
+        });
+    }
+    for (key, (values, _)) in &before {
+        if after.contains_key(key) {
+            continue;
+        }
+        out.push(ColumnDelta {
+            table: key.0.to_owned(),
+            column: key.1.to_owned(),
+            added: Vec::new(),
+            removed: values.iter().map(|v| (*v).to_owned()).collect(),
+            unhandled: Vec::new(),
+        });
+    }
+    out.sort_by(|a, b| (&a.table, &a.column).cmp(&(&b.table, &b.column)));
+    out
 }
 
 fn functions(index: &Index) -> BTreeMap<&str, &Node> {
@@ -571,7 +712,11 @@ fn tables(
         let Some(n) = head_fns.get(id.as_str()) else {
             continue;
         };
-        for kind in [EffectKind::DbRead, EffectKind::DbWrite] {
+        for kind in [
+            EffectKind::DbRead,
+            EffectKind::DbWrite,
+            EffectKind::DbDelete,
+        ] {
             for t in table_targets(n, kind) {
                 out.entry(t.to_owned()).or_default();
             }
@@ -593,12 +738,17 @@ fn tables(
                 ctx.db_write.push(n.id.clone());
             }
         }
+        for t in table_targets(n, EffectKind::DbDelete) {
+            if let Some(ctx) = out.get_mut(t) {
+                ctx.db_delete.push(n.id.clone());
+            }
+        }
     }
     for ctx in out.values_mut() {
-        ctx.db_read.sort();
-        ctx.db_read.dedup();
-        ctx.db_write.sort();
-        ctx.db_write.dedup();
+        for list in [&mut ctx.db_read, &mut ctx.db_write, &mut ctx.db_delete] {
+            list.sort();
+            list.dedup();
+        }
     }
     out
 }
@@ -673,6 +823,12 @@ fn insight_key(i: &Insight, rename: &HashMap<&str, &str>) -> String {
             node(n),
             missing.join(",")
         ),
+        Insight::ReadThenWrite {
+            node: n,
+            table,
+            write,
+            ..
+        } => format!("read_then_write|{}|{table}|{write}", node(n)),
     }
 }
 

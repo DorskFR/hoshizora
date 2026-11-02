@@ -7,7 +7,7 @@
 //! id = "rust.sqlx.query"
 //! match = ["sqlx::query*", "*.fetch_one", "*.fetch_all"]
 //! requires_import = "sqlx"
-//! kind = "db"          # db | db_read | db_write | network | fs_read | ... (db picks read/write from SQL)
+//! kind = "db"          # db | db_read | db_write | db_delete | network | fs_read | ... (db picks read/write from SQL)
 //! target = "sql"       # sql | url | arg0 | none
 //! language = "rust"    # optional
 //! client = true        # url effects that should link to Route nodes
@@ -42,6 +42,7 @@ pub enum RuleKind {
     Network,
     DbRead,
     DbWrite,
+    DbDelete,
     FsRead,
     FsWrite,
     Process,
@@ -60,6 +61,7 @@ impl RuleKind {
             Self::Db | Self::DbRead => EffectKind::DbRead,
             Self::Network => EffectKind::Network,
             Self::DbWrite => EffectKind::DbWrite,
+            Self::DbDelete => EffectKind::DbDelete,
             Self::FsRead => EffectKind::FsRead,
             Self::FsWrite => EffectKind::FsWrite,
             Self::Process => EffectKind::Process,

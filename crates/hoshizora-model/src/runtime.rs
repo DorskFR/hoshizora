@@ -138,6 +138,17 @@ pub enum Insight {
         missing: Vec<String>,
         default: DefaultKind,
     },
+    /// A table read, then written or deleted from later in the same function with the task
+    /// yielding in between and no transaction or lock taken first: the rows may have changed
+    /// under the write.
+    ReadThenWrite {
+        node: NodeId,
+        table: String,
+        read_line: u32,
+        write_line: u32,
+        /// `writes` or `deletes`.
+        write: String,
+    },
 }
 
 /// One event on the live stream.

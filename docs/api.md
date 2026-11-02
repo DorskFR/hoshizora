@@ -23,7 +23,11 @@ or has `failed` get `409 {"error", "status"}`. Errors are JSON `{"error": "..."}
 and `git@host:path` URLs are accepted. `ref` may be a branch or tag.
 
 Private GitHub repositories are cloned with `HOSHIZORA_GIT_TOKEN` when set. The project list
-persists in `<data-dir>/projects.json` and is restored on start.
+persists in `<data-dir>/projects.json` and is restored on start. Projects declared with
+`serve --project [name=]<url>[@ref]` (repeatable; also comma-separated in `HOSHIZORA_PROJECTS`)
+or `--projects-file <json>` (`HOSHIZORA_PROJECTS_FILE`; an array of `AddProject` bodies or
+`{path, name?}` entries) are added on start when their URL or path is not registered yet, and
+clone and index in the background like a `POST`. Refs containing `/` need the file form.
 
 Spans go to the project whose `services` contains the resource's `service.name`; otherwise to
 the project named by the `x-hoshizora-project` header or `?project=` on `/v1/traces`; otherwise
@@ -48,9 +52,9 @@ has its own runtime stats, traces, insights and `runtime/stream`.
 | GET | `/api/impact?of={id}&depth=` | `Impact`: everything that reaches `of` |
 | GET | `/api/story?from={id}&depth=` | `Story`: the flow condensed for humans — steps grouped into lanes (UI, services, databases, externals), pure helpers folded into their caller, tests and name-heuristic edges left out, at most 60 steps |
 | GET | `/api/dead` | `Node[]` with `dead = true` |
-| GET | `/api/effects?kind=db_write&target=sessions` | `Node[]` with that direct effect |
-| GET | `/api/insights` | `Insights`: static + runtime findings |
-| GET | `/api/states?domain=` | `StatesReport`: value domains (enums, literal unions, `as const` lists, typed const blocks) with the branch sites linked to each — per site the function, line, subject, handled and missing values and what the catch-all does (`none`, `throws`, `returns_empty`, `other`). `domain` filters by name or id |
+| GET | `/api/effects?kind=db_write&target=sessions` | `Node[]` with that direct effect. Kinds: `network`, `db_read`, `db_write`, `db_delete` (`DELETE FROM`, ORM delete/remove), `fs_read`, `fs_write`, `process`, `spawn`, `join`, `lock` (also transaction begins and `SELECT ... FOR UPDATE`), `publish`, `subscribe`, `sleep`, `blocking` |
+| GET | `/api/insights` | `Insights`: static + runtime findings. Static kinds: `io_in_loop`, `parallelisable`, `inefficient`, `unhandled_values`, `read_then_write` (a table read, then written or deleted from later in the same function across an await, with no lock or transaction before the write; reads and writes one callee away count at the line of the call) |
+| GET | `/api/states?domain=` | `StatesReport`: value domains (enums, literal unions, `as const` lists, typed const blocks) with the branch sites linked to each — per site the function, line, subject, handled and missing values and what the catch-all does (`none`, `throws`, `returns_empty`, `other`) — plus `columns`: every `table.column` SQL outside tests sets to a quoted literal (`SET status = 'done'`, `INSERT ... VALUES (.., 'queued')`), with the writers per value, the statements comparing the column against literals (`readers`) and the ids of domains whose members cover every value written. `domain` filters domains by name or id and columns by `table`, `table.column` or linked domain |
 
 ## Runtime
 

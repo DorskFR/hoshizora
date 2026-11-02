@@ -40,22 +40,46 @@ kind = "db_read"
 
 [[effect]]
 id = "ts.prisma.write"
-match = ["*.create", "*.createMany", "*.update", "*.updateMany", "*.upsert", "*.delete", "*.deleteMany", "*.$executeRaw", "*.$executeRawUnsafe", "*.$transaction"]
+match = ["*.create", "*.createMany", "*.update", "*.updateMany", "*.upsert", "*.$executeRaw", "*.$executeRawUnsafe"]
 requires_import = "prisma"
 kind = "db_write"
 
 [[effect]]
+id = "ts.prisma.delete"
+match = ["*.delete", "*.deleteMany"]
+requires_import = "prisma"
+kind = "db_delete"
+
+[[effect]]
+id = "ts.prisma.transaction"
+match = ["*.$transaction"]
+requires_import = "prisma"
+kind = "lock"
+
+[[effect]]
 id = "ts.knex"
-match = ["knex", "knex.raw", "*.raw", "*.select", "*.first", "*.where", "*.insert", "*.update", "*.del", "*.delete", "*.truncate", "*.returning"]
+match = ["knex", "knex.raw", "*.raw", "*.select", "*.first", "*.where", "*.insert", "*.update", "*.returning"]
 requires_import = "knex"
 kind = "db"
 target = "sql"
 
 [[effect]]
 id = "ts.knex.write"
-match = ["*.insert", "*.update", "*.del", "*.delete", "*.truncate", "*.increment", "*.decrement"]
+match = ["*.insert", "*.update", "*.increment", "*.decrement"]
 requires_import = "knex"
 kind = "db_write"
+
+[[effect]]
+id = "ts.knex.delete"
+match = ["*.del", "*.delete", "*.truncate"]
+requires_import = "knex"
+kind = "db_delete"
+
+[[effect]]
+id = "ts.knex.transaction"
+match = ["*.transaction"]
+requires_import = "knex"
+kind = "lock"
 
 [[effect]]
 id = "ts.drizzle.read"
@@ -66,9 +90,21 @@ target = "sql"
 
 [[effect]]
 id = "ts.drizzle.write"
-match = ["db.insert", "db.update", "db.delete", "*.insert", "*.update", "*.delete", "db.transaction"]
+match = ["db.insert", "db.update", "*.insert", "*.update"]
 requires_import = "drizzle-orm"
 kind = "db_write"
+
+[[effect]]
+id = "ts.drizzle.delete"
+match = ["db.delete", "*.delete"]
+requires_import = "drizzle-orm"
+kind = "db_delete"
+
+[[effect]]
+id = "ts.drizzle.transaction"
+match = ["db.transaction", "*.transaction"]
+requires_import = "drizzle-orm"
+kind = "lock"
 
 [[effect]]
 id = "ts.pg"
@@ -79,10 +115,16 @@ target = "sql"
 
 [[effect]]
 id = "ts.postgres_js"
-match = ["sql", "sql.unsafe", "sql.begin"]
+match = ["sql", "sql.unsafe"]
 requires_import = "postgres"
 kind = "db"
 target = "sql"
+
+[[effect]]
+id = "ts.postgres_js.begin"
+match = ["sql.begin"]
+requires_import = "postgres"
+kind = "lock"
 
 [[effect]]
 id = "ts.typeorm.read"
@@ -92,9 +134,21 @@ kind = "db_read"
 
 [[effect]]
 id = "ts.typeorm.write"
-match = ["*.save", "*.insert", "*.update", "*.delete", "*.remove", "*.upsert", "*.softDelete", "*.increment", "*.decrement"]
+match = ["*.save", "*.insert", "*.update", "*.upsert", "*.increment", "*.decrement"]
 requires_import = "typeorm"
 kind = "db_write"
+
+[[effect]]
+id = "ts.typeorm.delete"
+match = ["*.delete", "*.remove", "*.softDelete"]
+requires_import = "typeorm"
+kind = "db_delete"
+
+[[effect]]
+id = "ts.typeorm.transaction"
+match = ["*.transaction", "*.startTransaction"]
+requires_import = "typeorm"
+kind = "lock"
 
 [[effect]]
 id = "ts.mongoose.read"
@@ -104,9 +158,15 @@ kind = "db_read"
 
 [[effect]]
 id = "ts.mongoose.write"
-match = ["*.save", "*.create", "*.insertMany", "*.updateOne", "*.updateMany", "*.findByIdAndUpdate", "*.findOneAndUpdate", "*.deleteOne", "*.deleteMany", "*.findByIdAndDelete"]
+match = ["*.save", "*.create", "*.insertMany", "*.updateOne", "*.updateMany", "*.findByIdAndUpdate", "*.findOneAndUpdate"]
 requires_import = "mongoose"
 kind = "db_write"
+
+[[effect]]
+id = "ts.mongoose.delete"
+match = ["*.deleteOne", "*.deleteMany", "*.findByIdAndDelete"]
+requires_import = "mongoose"
+kind = "db_delete"
 
 [[effect]]
 id = "ts.redis.read"

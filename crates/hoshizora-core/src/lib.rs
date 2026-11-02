@@ -2,6 +2,7 @@
 //! output is the language-neutral `Graph` served by the API.
 
 mod build;
+pub mod coverage;
 pub mod diff;
 mod index;
 pub mod packs;

@@ -30,12 +30,25 @@ One server can hold several projects. Give it a data dir and add repositories by
 shallow-cloned and indexed in the background, and the list survives restarts:
 
 ```sh
-hoshizora serve --data-dir .hoshizora                      # or --project <url-or-path>, repeatable
+hoshizora serve --data-dir .hoshizora
 curl -X POST localhost:7317/api/projects -H 'content-type: application/json' \
      -d '{"url":"https://github.com/tokio-rs/mini-redis","services":["mini-redis"]}'
 curl localhost:7317/api/projects                           # poll until status is "ready"
 curl localhost:7317/api/projects/tokio-rs-mini-redis/search?q=set
 ```
+
+Projects can also be declared on the command line, so a server whose data dir is wiped (a
+container without a volume) re-creates them on every start without blocking startup:
+
+```sh
+hoshizora serve --project https://github.com/tokio-rs/mini-redis@master \
+                --project 'docs=./site'                    # [name=]<url>[@ref] or [name=]<path>
+hoshizora serve --projects-file projects.json             # [{"url":..,"ref":..,"name":..,"services":[..]}, {"path":..}]
+HOSHIZORA_PROJECTS=https://github.com/a/b,https://github.com/c/d hoshizora serve
+```
+
+A declared URL or path that is already registered is left as it is, so the flags are safe to
+keep when the data dir does persist.
 
 Every `/api/...` route also exists under `/api/projects/{id}/...`; the unprefixed form is the
 first project. Set `HOSHIZORA_GIT_TOKEN` to clone private GitHub repositories. Spans are routed
@@ -69,6 +82,7 @@ hoshizora query states --domain Status                       # branches on a val
 hoshizora query dead
 hoshizora query search  launch
 hoshizora diff ./base ./head                                   # what a change does
+hoshizora coverage --cases cases.json                          # score diffs against known review corrections
 ```
 
 `diff` takes two source trees or graph files and prints which functions were added, removed,
@@ -79,6 +93,10 @@ touches, insights that appeared or went away, and for each changed function the 
 user-facing entrypoints (routes, UI handlers, jobs, CLI, main) with one shortest path each,
 capped at 10 with an `omitted` count, and a `states` section: domains whose values were added
 or removed, with every site in the repo that does not handle a new value.
+
+`coverage` replays `diff` over labelled PRs and reports, per signal, how many of the review
+corrections outside the diff it would have pointed at and how large its set was; see
+[`docs/coverage.md`](docs/coverage.md).
 
 ### States
 

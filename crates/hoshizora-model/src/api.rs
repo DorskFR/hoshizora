@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{Edge, EntrypointKind, Node, NodeId, StateDomain, StateSite};
+use crate::graph::{Edge, EntrypointKind, Node, NodeId, StateColumn, StateDomain, StateSite};
 use crate::runtime::{Insight, NodeStats};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,10 +61,13 @@ pub struct AffectedEntrypoint {
     pub path: Vec<NodeId>,
 }
 
-/// `states` query: every domain (or the one named) with the sites branching on it.
+/// `states` query: every domain (or the one named) with the sites branching on it, and the
+/// table columns written with literals (filtered by `table.column`, table or linked domain).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct StatesReport {
     pub domains: Vec<DomainReport>,
+    #[serde(default)]
+    pub columns: Vec<StateColumn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

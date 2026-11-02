@@ -463,6 +463,110 @@ pub fn is_url(spec: &str) -> bool {
     git::validate_url(spec, true).is_ok()
 }
 
+/// One project to register at startup: a git URL with the same fields as the add API, or a
+/// local source tree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectSpec {
+    Git(AddProject),
+    Path { path: PathBuf, name: Option<String> },
+}
+
+/// `[name=]<url>[@ref]` or `[name=]<path>`. The ref is the part after the last `@` when it
+/// contains neither `/` nor `:`, so `git@host:owner/repo` and `ssh://git@host/...` stay intact;
+/// refs with a slash need the projects file.
+pub fn parse_spec(spec: &str) -> anyhow::Result<ProjectSpec> {
+    let spec = spec.trim();
+    let (name, rest) = match spec.split_once('=') {
+        Some((n, rest))
+            if !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ')) =>
+        {
+            (Some(n.trim().to_string()), rest)
+        }
+        _ => (None, spec),
+    };
+    if rest.is_empty() {
+        anyhow::bail!("empty project spec");
+    }
+    let (url, r#ref) = match rest.rsplit_once('@') {
+        Some((url, r)) if !r.is_empty() && !r.contains('/') && !r.contains(':') => {
+            (url, Some(r.to_string()))
+        }
+        _ => (rest, None),
+    };
+    if is_url(url) {
+        if let Some(r) = &r#ref {
+            git::validate_ref(r)?;
+        }
+        return Ok(ProjectSpec::Git(AddProject {
+            url: url.to_string(),
+            r#ref,
+            name,
+            services: Vec::new(),
+        }));
+    }
+    if is_url(rest) {
+        return Ok(ProjectSpec::Git(AddProject {
+            url: rest.to_string(),
+            r#ref: None,
+            name,
+            services: Vec::new(),
+        }));
+    }
+    Ok(ProjectSpec::Path {
+        path: PathBuf::from(rest),
+        name,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct SpecEntry {
+    url: Option<String>,
+    path: Option<PathBuf>,
+    r#ref: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    services: Vec<String>,
+}
+
+/// JSON array of `{url, ref?, name?, services?}` (the add API body) or `{path, name?}`.
+pub fn load_specs_file(path: &Path) -> anyhow::Result<Vec<ProjectSpec>> {
+    let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
+    let entries: Vec<SpecEntry> =
+        serde_json::from_str(&text).with_context(|| path.display().to_string())?;
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| match (e.url, e.path) {
+            (Some(url), None) => Ok(ProjectSpec::Git(AddProject {
+                url,
+                r#ref: e.r#ref,
+                name: e.name,
+                services: e.services,
+            })),
+            (None, Some(path)) => Ok(ProjectSpec::Path { path, name: e.name }),
+            _ => anyhow::bail!(
+                "{}: entry {i} needs exactly one of `url` or `path`",
+                path.display()
+            ),
+        })
+        .collect()
+}
+
+impl<Q: GraphQueries> AppState<Q> {
+    /// Adds the project unless an equal URL or path is already registered; cloning and
+    /// indexing run in the background either way.
+    pub fn register(self: &Arc<Self>, spec: ProjectSpec) -> anyhow::Result<Project> {
+        match spec {
+            ProjectSpec::Git(req) => self
+                .add_git(req)
+                .map_err(|e| anyhow::anyhow!("{}", e.message)),
+            ProjectSpec::Path { path, name } => self.add_path(&path, name),
+        }
+    }
+}
+
 pub fn rfc3339_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -502,6 +606,174 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(1_761_868_799), "2025-10-30T23:59:59Z");
+    }
+
+    fn git_spec(url: &str, r#ref: Option<&str>, name: Option<&str>) -> ProjectSpec {
+        ProjectSpec::Git(AddProject {
+            url: url.into(),
+            r#ref: r#ref.map(Into::into),
+            name: name.map(Into::into),
+            services: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn specs() {
+        assert_eq!(
+            parse_spec("https://github.com/a/b").unwrap(),
+            git_spec("https://github.com/a/b", None, None)
+        );
+        assert_eq!(
+            parse_spec("https://github.com/a/b@v1.2").unwrap(),
+            git_spec("https://github.com/a/b", Some("v1.2"), None)
+        );
+        assert_eq!(
+            parse_spec("mini-redis=https://github.com/tokio-rs/mini-redis@master").unwrap(),
+            git_spec(
+                "https://github.com/tokio-rs/mini-redis",
+                Some("master"),
+                Some("mini-redis")
+            )
+        );
+        assert_eq!(
+            parse_spec("git@github.com:a/b.git").unwrap(),
+            git_spec("git@github.com:a/b.git", None, None)
+        );
+        assert_eq!(
+            parse_spec("ssh://git@host/a/b@main").unwrap(),
+            git_spec("ssh://git@host/a/b", Some("main"), None)
+        );
+        assert_eq!(
+            parse_spec("docs=./src").unwrap(),
+            ProjectSpec::Path {
+                path: "./src".into(),
+                name: Some("docs".into())
+            }
+        );
+        assert_eq!(
+            parse_spec("/tmp/repo").unwrap(),
+            ProjectSpec::Path {
+                path: "/tmp/repo".into(),
+                name: None
+            }
+        );
+        assert!(parse_spec("").is_err());
+        assert!(parse_spec("https://github.com/a/b@--bad").is_err());
+    }
+
+    #[test]
+    fn specs_file() {
+        let dir = std::env::temp_dir().join(format!("hoshizora-specs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        std::fs::write(
+            &file,
+            r#"[{"url":"https://github.com/a/b","ref":"main","services":["b"]},{"path":"/tmp/x","name":"x"}]"#,
+        )
+        .unwrap();
+        let specs = load_specs_file(&file).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert!(
+            matches!(&specs[0], ProjectSpec::Git(a) if a.services == ["b"] && a.r#ref.as_deref() == Some("main"))
+        );
+        assert!(matches!(&specs[1], ProjectSpec::Path { name: Some(n), .. } if n == "x"));
+        std::fs::write(&file, r#"[{"name":"nothing"}]"#).unwrap();
+        assert!(load_specs_file(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn configured_projects_are_registered_once_and_indexed() {
+        let dir = std::env::temp_dir().join(format!(
+            "hoshizora-configured-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = dir.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&work)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+
+        let indexer: Indexer = Arc::new(|root: &Path| crate::build_graph(root, None));
+        let make_state = || {
+            AppState::<crate::queries::GraphIndex>::new(
+                dir.join("data"),
+                Arc::clone(&indexer),
+                RuntimeConfig::default(),
+                GitOptions {
+                    allow_file_urls: true,
+                    timeout: Some(std::time::Duration::from_secs(60)),
+                    ..Default::default()
+                },
+            )
+        };
+        let url = format!("file://{}", work.display());
+        let specs = vec![
+            parse_spec(&format!("example={url}@main")).unwrap(),
+            ProjectSpec::Path {
+                path: work.clone(),
+                name: None,
+            },
+        ];
+
+        let state = make_state();
+        for spec in specs.clone() {
+            state.register(spec).unwrap();
+        }
+        for spec in specs.clone() {
+            state.register(spec).unwrap();
+        }
+        let listed = state.list();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert_eq!(listed[0].name, "example");
+        assert!(
+            matches!(&listed[0].source, ProjectSource::Git { r#ref: Some(r), .. } if r == "main")
+        );
+        for _ in 0..400 {
+            if state
+                .list()
+                .iter()
+                .all(|p| matches!(p.status, ProjectStatus::Ready | ProjectStatus::Failed))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for p in state.list() {
+            assert_eq!(p.status, ProjectStatus::Ready, "{:?}", p.error);
+            assert!(p.nodes > 0);
+        }
+
+        let restarted = make_state();
+        assert_eq!(restarted.restore().unwrap(), 2);
+        for spec in specs {
+            restarted.register(spec).unwrap();
+        }
+        assert_eq!(restarted.list().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

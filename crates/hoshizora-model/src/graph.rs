@@ -23,12 +23,48 @@ pub struct Graph {
     pub states: States,
 }
 
-/// Declared value domains and the branch sites linked to them. Both lists are sorted
-/// (domains by id, sites by function then line).
+/// Declared value domains and the branch sites linked to them, plus the table columns SQL
+/// writes literals to. All lists are sorted (domains by id, sites by function then line,
+/// columns by table then column).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct States {
     pub domains: Vec<StateDomain>,
     pub sites: Vec<StateSite>,
+    #[serde(default)]
+    pub columns: Vec<StateColumn>,
+}
+
+/// A column some statement sets to a quoted literal (`SET status = 'done'`,
+/// `INSERT ... VALUES (.., 'queued')`): the values written to it and the statements that
+/// compare it against literals.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateColumn {
+    pub table: String,
+    pub column: String,
+    pub values: Vec<ColumnValue>,
+    pub readers: Vec<ColumnReader>,
+    /// Ids of declared domains whose members cover every value written.
+    pub domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnValue {
+    pub value: String,
+    pub writers: Vec<ColumnSite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ColumnSite {
+    pub function: NodeId,
+    pub line: u32,
+}
+
+/// One statement testing the column: `WHERE status = 'x'`, `status IN ('a', 'b')`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnReader {
+    pub function: NodeId,
+    pub line: u32,
+    pub values: Vec<String>,
 }
 
 /// Id: `domain:<path>#<name>`.
@@ -153,6 +189,8 @@ pub enum EffectKind {
     Network,
     DbRead,
     DbWrite,
+    /// Removes rows: `DELETE FROM t`, ORM `delete`/`remove`.
+    DbDelete,
     FsRead,
     FsWrite,
     /// Starts an OS process.

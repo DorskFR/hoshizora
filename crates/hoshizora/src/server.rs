@@ -904,6 +904,7 @@ mod tests {
                     })
                     .into_iter()
                     .collect(),
+                columns: Vec::new(),
             }
         }
     }

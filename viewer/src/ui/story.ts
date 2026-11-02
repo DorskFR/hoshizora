@@ -38,6 +38,7 @@ const EFFECT_WORDS: Record<EffectKind, string> = {
   network: "calls",
   db_read: "reads",
   db_write: "writes",
+  db_delete: "deletes rows of",
   fs_read: "reads file",
   fs_write: "writes file",
   process: "runs",
