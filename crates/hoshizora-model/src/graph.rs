@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::facts::{Language, Param, Span, Visibility};
+use crate::facts::{DefaultKind, DomainValue, Language, Param, Span, Visibility};
 
 /// Stable node id. Code nodes: `<kind>:<path>[#<local_name>]`, e.g.
 /// `fn:crates/api/src/sessions.rs#SessionStore::create`, `file:webui/src/api.ts`,
@@ -19,6 +19,40 @@ pub struct Graph {
     pub meta: GraphMeta,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    #[serde(default)]
+    pub states: States,
+}
+
+/// Declared value domains and the branch sites linked to them. Both lists are sorted
+/// (domains by id, sites by function then line).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct States {
+    pub domains: Vec<StateDomain>,
+    pub sites: Vec<StateSite>,
+}
+
+/// Id: `domain:<path>#<name>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateDomain {
+    pub id: String,
+    pub name: String,
+    pub file: String,
+    pub language: Language,
+    pub values: Vec<DomainValue>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateSite {
+    pub function: NodeId,
+    pub line: u32,
+    pub subject: String,
+    pub domain: String,
+    /// Values with a branch, as written (member name or literal).
+    pub handled: Vec<String>,
+    /// Domain member names no branch covers.
+    pub missing: Vec<String>,
+    pub default: DefaultKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

@@ -1,10 +1,13 @@
-use hoshizora_model::{FileFacts, Import, Language, Param, Symbol, SymbolKind, Visibility};
+use hoshizora_model::{
+    DefaultKind, Discrimination, Domain, DomainValue, FileFacts, Import, Language, Param, Symbol,
+    SymbolKind, Visibility,
+};
 use tree_sitter::Node;
 
 use crate::Adapter;
 use crate::common::{
-    self, BodySpec, CallInfo, all_children, collapse_ws, field_text, has_child_kind, header,
-    named_children, span, string_args, text,
+    self, BodySpec, CallInfo, ChainSpec, Comparison, Handled, Sites, all_children, collapse_ws,
+    field_text, has_child_kind, header, named_children, span, string_args, strip_ws, text,
 };
 
 pub struct PythonAdapter;
@@ -98,6 +101,199 @@ fn call_info(node: Node, source: &str) -> Option<CallInfo> {
     ))
 }
 
+const CHAIN: ChainSpec = ChainSpec {
+    ifs: &["if_statement"],
+    elifs: &["elif_clause"],
+    elses: &["else_clause"],
+};
+
+const ENUM_BASES: &[&str] = &["Enum", "StrEnum", "IntEnum", "Flag", "IntFlag"];
+
+fn literal(node: Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "string"
+            if !named_children(node)
+                .iter()
+                .any(|c| c.kind() == "interpolation") =>
+        {
+            Some(common::string_value(node, source, INTERP, SKIP))
+        }
+        "integer" => Some(text(node, source).to_owned()),
+        "unary_operator" if text(node, source).starts_with('-') => {
+            Some(strip_ws(text(node, source)))
+        }
+        _ => None,
+    }
+}
+
+fn value(node: Node, source: &str) -> Option<Handled> {
+    match node.kind() {
+        "attribute" | "dotted_name" => Handled::member(text(node, source), "."),
+        "parenthesized_expression" => value(named_children(node).into_iter().next()?, source),
+        _ => literal(node, source).map(Handled::literal),
+    }
+}
+
+/// `x == S.A`, `x == 'a' or x == 'b'`, `x in ('a', 'b')`.
+fn compare(node: Node, source: &str) -> Option<Comparison> {
+    match node.kind() {
+        "parenthesized_expression" => compare(named_children(node).into_iter().next()?, source),
+        "boolean_operator" => {
+            if text(node.child_by_field_name("operator")?, source) != "or" {
+                return None;
+            }
+            Comparison::merge(
+                compare(node.child_by_field_name("left")?, source),
+                compare(node.child_by_field_name("right")?, source),
+            )
+        }
+        "comparison_operator" => {
+            let kids = named_children(node);
+            let [left, right] = kids.as_slice() else {
+                return None;
+            };
+            let op = all_children(node)
+                .into_iter()
+                .find(|c| !c.is_named())
+                .map(|c| text(c, source))?;
+            match op {
+                "==" => match (value(*right, source), value(*left, source)) {
+                    (Some(v), _) => Comparison::new(text(*left, source), vec![v]),
+                    (None, Some(v)) => Comparison::new(text(*right, source), vec![v]),
+                    _ => None,
+                },
+                "in" if matches!(right.kind(), "tuple" | "list" | "set") => {
+                    let values = named_children(*right)
+                        .into_iter()
+                        .map(|e| value(e, source))
+                        .collect::<Option<Vec<_>>>()?;
+                    Comparison::new(text(*left, source), values)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn case_values(node: Node, source: &str, out: &mut Vec<Handled>) -> Option<bool> {
+    match node.kind() {
+        "case_pattern" | "union_pattern" => {
+            let mut wildcard = false;
+            for c in all_children(node) {
+                if c.is_named() || c.kind() == "_" {
+                    wildcard |= case_values(c, source, out)?;
+                }
+            }
+            Some(wildcard)
+        }
+        "_" | "identifier" => Some(true),
+        "dotted_name" if !text(node, source).contains('.') => Some(true),
+        "dotted_name" | "attribute" | "string" | "integer" | "unary_operator" => {
+            out.push(value(node, source)?);
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn match_site(node: Node, source: &str, sites: &mut Sites) {
+    let (Some(subject), Some(body)) = (
+        node.child_by_field_name("subject"),
+        node.child_by_field_name("body"),
+    ) else {
+        return;
+    };
+    let mut cmp = Comparison {
+        subject: strip_ws(text(subject, source)),
+        ..Comparison::default()
+    };
+    let mut default = DefaultKind::None;
+    for case in named_children(body) {
+        if case.kind() != "case_clause" {
+            continue;
+        }
+        let mut values = Vec::new();
+        let mut wildcard = false;
+        for pat in named_children(case)
+            .into_iter()
+            .filter(|c| c.kind() == "case_pattern")
+        {
+            let Some(w) = case_values(pat, source, &mut values) else {
+                return;
+            };
+            wildcard |= w;
+        }
+        cmp.extend(values);
+        if wildcard && case.child_by_field_name("guard").is_none() {
+            default = case
+                .child_by_field_name("consequence")
+                .map_or(DefaultKind::Other, |b| {
+                    common::classify_default(text(b, source))
+                });
+        }
+    }
+    sites.push(common::line(node), cmp, default);
+}
+
+fn discriminations(body: Node, source: &str) -> Vec<Discrimination> {
+    let mut sites = Sites::default();
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "match_statement" => match_site(node, source, &mut sites),
+            "if_statement" => sites.if_chain(node, source, &CHAIN, &compare, &|b, s| {
+                text(b, s).to_owned()
+            }),
+            "function_definition" | "class_definition" if node != body => continue,
+            _ => {}
+        }
+        pending.extend(named_children(node).into_iter().rev());
+    }
+    sites.out
+}
+
+fn enum_domain(node: Node, source: &str) -> Option<Domain> {
+    let bases = node.child_by_field_name("superclasses")?;
+    let is_enum = named_children(bases)
+        .iter()
+        .any(|b| ENUM_BASES.contains(&common::last_segment(text(*b, source)).as_str()));
+    if !is_enum {
+        return None;
+    }
+    let body = node.child_by_field_name("body")?;
+    let values: Vec<DomainValue> = named_children(body)
+        .into_iter()
+        .filter(|s| s.kind() == "expression_statement")
+        .filter_map(|s| {
+            named_children(s)
+                .into_iter()
+                .find(|n| n.kind() == "assignment")
+        })
+        .filter_map(|a| {
+            let left = a.child_by_field_name("left")?;
+            if left.kind() != "identifier" {
+                return None;
+            }
+            let name = text(left, source).to_owned();
+            if name.starts_with('_') {
+                return None;
+            }
+            Some(DomainValue {
+                literal: a
+                    .child_by_field_name("right")
+                    .and_then(|r| literal(r, source)),
+                name,
+            })
+        })
+        .collect();
+    (values.len() >= 2).then_some(Domain {
+        name: field_text(node, "name", source)?,
+        values,
+        span: span(node),
+    })
+}
+
 fn docstring(body: Node, source: &str) -> Option<String> {
     let first = named_children(body).into_iter().next()?;
     if first.kind() != "expression_statement" {
@@ -183,6 +379,7 @@ struct Ctx<'a> {
     candidates: Vec<(Node<'a>, Node<'a>, String)>,
     /// Statements emitted as symbols, excluded from `<module>`.
     bound: Vec<usize>,
+    domains: Vec<Domain>,
 }
 
 impl<'a> Ctx<'a> {
@@ -290,10 +487,19 @@ impl<'a> Ctx<'a> {
             attributes,
             implements,
             body: (!is_class)
-                .then(|| body.map(|b| common::analyze_body(b, self.source, &SPEC)))
+                .then(|| {
+                    body.map(|b| {
+                        let mut out = common::analyze_body(b, self.source, &SPEC);
+                        out.discriminations = discriminations(b, self.source);
+                        out
+                    })
+                })
                 .flatten(),
             name,
         });
+        if is_class {
+            self.domains.extend(enum_domain(node, self.source));
+        }
         if let Some(body) = body {
             for child in named_children(body) {
                 self.statement(child, Some(&local_name), is_class);
@@ -406,6 +612,7 @@ impl Adapter for PythonAdapter {
             imports: vec![],
             candidates: vec![],
             bound: vec![],
+            domains: vec![],
         };
         for stmt in all_children(tree.root_node()) {
             ctx.statement(stmt, None, false);
@@ -428,6 +635,7 @@ impl Adapter for PythonAdapter {
             lines: common::line_count(source),
             imports: ctx.imports,
             symbols: ctx.symbols,
+            domains: ctx.domains,
         })
     }
 }

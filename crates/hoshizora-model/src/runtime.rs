@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::facts::DefaultKind;
 use crate::graph::{Confidence, NodeId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,6 +130,14 @@ pub enum Insight {
     },
     /// Statically reachable code never observed during the window.
     NeverObserved { node: NodeId },
+    /// A branch on a declared domain misses some of its values and a catch-all swallows them.
+    UnhandledValues {
+        node: NodeId,
+        line: u32,
+        domain: String,
+        missing: Vec<String>,
+        default: DefaultKind,
+    },
 }
 
 /// One event on the live stream.

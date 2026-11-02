@@ -1,7 +1,7 @@
 //! Graph access the server and CLI need, so handlers can be tested against a fake.
 
 use hoshizora_core::Index;
-use hoshizora_model::api::{Impact, SearchHit, Story, Subgraph};
+use hoshizora_model::api::{Impact, SearchHit, StatesReport, Story, Subgraph};
 use hoshizora_model::{Edge, EdgeKind, EffectKind, Graph, Insight, Node};
 use hoshizora_runtime::NodeLookup;
 
@@ -20,6 +20,7 @@ pub trait GraphQueries: NodeLookup + 'static {
     fn with_effect(&self, kind: EffectKind, target: Option<&str>) -> Vec<Node>;
     fn search(&self, query: &str, limit: usize) -> Vec<SearchHit>;
     fn static_insights(&self) -> Vec<Insight>;
+    fn states(&self, domain: Option<&str>) -> StatesReport;
 }
 
 pub struct GraphIndex(pub Index);
@@ -85,6 +86,9 @@ impl GraphQueries for GraphIndex {
     }
     fn static_insights(&self) -> Vec<Insight> {
         self.0.static_insights()
+    }
+    fn states(&self, domain: Option<&str>) -> StatesReport {
+        self.0.states(domain)
     }
 }
 

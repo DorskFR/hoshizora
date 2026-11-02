@@ -126,6 +126,12 @@ enum QueryCommand {
     },
     /// Static findings.
     Insights,
+    /// Value domains (enums, literal unions, const lists) and the branches on them, with the
+    /// values each branch misses.
+    States {
+        #[arg(long)]
+        domain: Option<String>,
+    },
     /// Fuzzy search over names.
     Search {
         q: String,
@@ -451,6 +457,7 @@ fn cmd_query(graph_path: &Path, query: QueryCommand) -> anyhow::Result<()> {
         QueryCommand::Insights => serde_json::to_value(hoshizora_model::api::Insights {
             insights: index.static_insights(),
         })?,
+        QueryCommand::States { domain } => serde_json::to_value(index.states(domain.as_deref()))?,
         QueryCommand::Search { q, limit } => serde_json::to_value(index.search(&q, limit))?,
         QueryCommand::Node { id } => {
             let node = index

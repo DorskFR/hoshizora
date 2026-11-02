@@ -127,6 +127,7 @@ fn file(
         lines: 200,
         imports,
         symbols,
+        domains: vec![],
     }
 }
 

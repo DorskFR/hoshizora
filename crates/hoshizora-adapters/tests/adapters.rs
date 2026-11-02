@@ -4,7 +4,10 @@ use hoshizora_adapters::{
     Adapter, Flavor, GoAdapter, PythonAdapter, RustAdapter, SfcAdapter, TsAdapter, index_tree,
     module_path,
 };
-use hoshizora_model::{CallSite, FileFacts, Language, Symbol, SymbolKind, Visibility};
+use hoshizora_model::{
+    CallSite, DefaultKind, Discrimination, Domain, FileFacts, Language, Symbol, SymbolKind,
+    Visibility,
+};
 
 fn sym<'a>(facts: &'a FileFacts, local_name: &str) -> &'a Symbol {
     facts
@@ -866,4 +869,189 @@ fn rust_message_sites() {
             ("FrameDown::Ack", 20),
         ]
     );
+}
+
+fn domain<'a>(facts: &'a FileFacts, name: &str) -> &'a Domain {
+    facts
+        .domains
+        .iter()
+        .find(|d| d.name == name)
+        .unwrap_or_else(|| panic!("missing domain {name}"))
+}
+
+fn values(d: &Domain) -> Vec<(&str, Option<&str>)> {
+    d.values
+        .iter()
+        .map(|v| (v.name.as_str(), v.literal.as_deref()))
+        .collect()
+}
+
+fn sites(facts: &FileFacts, local_name: &str) -> Vec<Discrimination> {
+    sym(facts, local_name)
+        .body
+        .as_ref()
+        .expect("body")
+        .discriminations
+        .clone()
+}
+
+fn site(facts: &FileFacts, local_name: &str) -> Discrimination {
+    let all = sites(facts, local_name);
+    assert_eq!(all.len(), 1, "{local_name}: {all:?}");
+    all.into_iter().next().unwrap()
+}
+
+#[test]
+fn typescript_domains_and_discriminations() {
+    let facts = TsAdapter(Flavor::TypeScript)
+        .parse(
+            "src/states.ts",
+            include_str!("fixtures/states.ts"),
+            "src/states",
+        )
+        .unwrap();
+    let names: Vec<&str> = facts.domains.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["Status", "Phase", "MODES", "KINDS"]);
+    assert_eq!(
+        values(domain(&facts, "Status")),
+        vec![
+            ("Active", Some("active")),
+            ("Paused", Some("paused")),
+            ("Done", Some("done"))
+        ]
+    );
+    assert_eq!(
+        values(domain(&facts, "Phase")),
+        vec![("idle", None), ("running", None), ("failed", None)]
+    );
+    assert_eq!(
+        values(domain(&facts, "MODES")),
+        vec![("fast", None), ("slow", None)]
+    );
+    assert_eq!(
+        values(domain(&facts, "KINDS")),
+        vec![("Note", Some("note")), ("Task", Some("task"))]
+    );
+
+    let s = site(&facts, "label");
+    assert_eq!(s.subject, "status");
+    assert_eq!(s.domain_hint.as_deref(), Some("Status"));
+    assert_eq!(s.handled, vec!["Active", "Paused"]);
+    assert_eq!(s.default, DefaultKind::ReturnsEmpty);
+    assert_eq!(s.line, 16);
+
+    let s = site(&facts, "phaseColor");
+    assert_eq!(s.subject, "phase");
+    assert_eq!(s.domain_hint, None);
+    assert_eq!(s.handled, vec!["idle", "running", "failed"]);
+    assert_eq!(s.default, DefaultKind::Throws);
+
+    let s = site(&facts, "modeOk");
+    assert_eq!(s.subject, "mode");
+    assert_eq!(s.handled, vec!["fast", "slow"]);
+    assert_eq!(s.default, DefaultKind::None);
+
+    let all = sites(&facts, "noop");
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].handled, vec!["Active"]);
+    assert_eq!(all[0].default, DefaultKind::ReturnsEmpty);
+    assert_eq!(all[1].subject, "x.length");
+    assert_eq!(all[1].default, DefaultKind::Throws);
+}
+
+#[test]
+fn rust_domains_and_discriminations() {
+    let facts = RustAdapter
+        .parse("src/states.rs", include_str!("fixtures/states.rs"), "crate")
+        .unwrap();
+    let names: Vec<&str> = facts.domains.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["Status"]);
+    assert_eq!(
+        values(domain(&facts, "Status")),
+        vec![("Active", None), ("Paused", None), ("Done", None)]
+    );
+
+    let s = site(&facts, "label");
+    assert_eq!(s.subject, "s");
+    assert_eq!(s.domain_hint.as_deref(), Some("Status"));
+    assert_eq!(s.handled, vec!["Active", "Paused", "Done"]);
+    assert_eq!(s.default, DefaultKind::ReturnsEmpty);
+
+    let s = site(&facts, "is_live");
+    assert_eq!(s.handled, vec!["Active", "Paused", "Done"]);
+    assert_eq!(s.domain_hint.as_deref(), Some("Status"));
+    assert_eq!(s.default, DefaultKind::Throws);
+
+    assert!(sites(&facts, "pairs").is_empty());
+    assert!(sites(&facts, "opt").is_empty());
+
+    let s = site(&facts, "code");
+    assert_eq!(s.handled, vec!["x", "y"]);
+    assert_eq!(s.domain_hint, None);
+    assert_eq!(s.default, DefaultKind::ReturnsEmpty);
+}
+
+#[test]
+fn python_domains_and_discriminations() {
+    let facts = PythonAdapter
+        .parse(
+            "app/states.py",
+            include_str!("fixtures/states.py"),
+            "app.states",
+        )
+        .unwrap();
+    let names: Vec<&str> = facts.domains.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["Status"]);
+    assert_eq!(
+        values(domain(&facts, "Status")),
+        vec![
+            ("ACTIVE", Some("active")),
+            ("PAUSED", Some("paused")),
+            ("DONE", None)
+        ]
+    );
+
+    let s = site(&facts, "label");
+    assert_eq!(s.subject, "status");
+    assert_eq!(s.domain_hint.as_deref(), Some("Status"));
+    assert_eq!(s.handled, vec!["ACTIVE", "PAUSED", "x"]);
+    assert_eq!(s.default, DefaultKind::ReturnsEmpty);
+
+    let s = site(&facts, "color");
+    assert_eq!(s.handled, vec!["ACTIVE", "paused", "done"]);
+    assert_eq!(s.default, DefaultKind::Throws);
+
+    let s = site(&facts, "guarded");
+    assert_eq!(s.handled, vec!["ACTIVE"]);
+    assert_eq!(s.default, DefaultKind::None);
+}
+
+#[test]
+fn go_domains_and_discriminations() {
+    let facts = GoAdapter
+        .parse("states.go", include_str!("fixtures/states.go"), "states")
+        .unwrap();
+    let names: Vec<&str> = facts.domains.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["Status", "Kind"]);
+    assert_eq!(
+        values(domain(&facts, "Status")),
+        vec![
+            ("Active", Some("active")),
+            ("Paused", Some("paused")),
+            ("Done", Some("done"))
+        ]
+    );
+    assert_eq!(
+        values(domain(&facts, "Kind")),
+        vec![("KindA", None), ("KindB", None)]
+    );
+
+    let s = site(&facts, "label");
+    assert_eq!(s.subject, "s");
+    assert_eq!(s.handled, vec!["Active", "Paused"]);
+    assert_eq!(s.default, DefaultKind::ReturnsEmpty);
+
+    let s = site(&facts, "live");
+    assert_eq!(s.handled, vec!["Active", "Paused", "done"]);
+    assert_eq!(s.default, DefaultKind::Throws);
 }

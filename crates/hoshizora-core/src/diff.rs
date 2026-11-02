@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-use hoshizora_model::{EffectKind, EntrypointKind, Insight, Node, NodeKind};
+use hoshizora_model::{EffectKind, EntrypointKind, Insight, Language, Node, NodeKind, StateSite};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{DEFAULT_FLOW_KINDS, Index};
@@ -19,6 +19,37 @@ pub struct DiffReport {
     pub tables_touched: BTreeMap<String, TableContext>,
     pub insights: InsightDelta,
     pub impact: BTreeMap<String, ImpactSummary>,
+    #[serde(default)]
+    pub states: StatesDelta,
+}
+
+/// Value domains whose members changed, and the branch sites that do not follow.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct StatesDelta {
+    pub domains: Vec<DomainDelta>,
+    /// Sites in added or modified functions with missing values and a catch-all that swallows
+    /// them (same rule as the `unhandled_values` insight).
+    pub silent_defaults: Vec<StateSite>,
+}
+
+/// Domains are matched by name within a language family; same-named domains are merged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DomainDelta {
+    pub domain: String,
+    pub language: Language,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Every site in head linked to the domain that handles none of the added values it
+    /// lists, anywhere in the repo.
+    pub unhandled: Vec<UnhandledSite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnhandledSite {
+    #[serde(flatten)]
+    pub site: StateSite,
+    /// Added values this site has no branch for.
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -129,6 +160,7 @@ pub fn diff(base: &Index, head: &Index) -> DiffReport {
         .iter()
         .map(|id| (id.clone(), impact_of(head, id)))
         .collect();
+    let states = states_delta(base, head, &changed);
 
     DiffReport {
         functions: FunctionDelta {
@@ -142,6 +174,113 @@ pub fn diff(base: &Index, head: &Index) -> DiffReport {
         tables_touched,
         insights,
         impact,
+        states,
+    }
+}
+
+fn family(language: Language) -> &'static str {
+    match language {
+        Language::TypeScript | Language::JavaScript => "typescript",
+        Language::Rust => "rust",
+        Language::Python => "python",
+        Language::Go => "go",
+    }
+}
+
+/// Member names across every same-named domain, and the ids merged.
+type MergedDomain<'a> = (Language, BTreeSet<&'a str>, Vec<&'a str>);
+
+/// `(family, name)` → merged domain.
+fn domain_values(index: &Index) -> BTreeMap<(&str, &str), MergedDomain<'_>> {
+    let mut out: BTreeMap<(&str, &str), MergedDomain<'_>> = BTreeMap::new();
+    for d in &index.graph.states.domains {
+        let entry = out
+            .entry((family(d.language), d.name.as_str()))
+            .or_insert_with(|| (d.language, BTreeSet::new(), Vec::new()));
+        entry.1.extend(d.values.iter().map(|v| v.name.as_str()));
+        entry.2.push(d.id.as_str());
+    }
+    out
+}
+
+fn states_delta(base: &Index, head: &Index, changed: &[String]) -> StatesDelta {
+    let before = domain_values(base);
+    let after = domain_values(head);
+    let empty = BTreeSet::new();
+    let mut domains = Vec::new();
+    for (key, (language, values, ids)) in &after {
+        let old = before.get(key).map_or(&empty, |(_, v, _)| v);
+        let added: Vec<String> = values.difference(old).map(|v| (*v).to_owned()).collect();
+        let removed: Vec<String> = old.difference(values).map(|v| (*v).to_owned()).collect();
+        if added.is_empty() && removed.is_empty() {
+            continue;
+        }
+        let literal_of = |name: &str| -> Vec<&str> {
+            head.graph
+                .states
+                .domains
+                .iter()
+                .filter(|d| ids.contains(&d.id.as_str()))
+                .flat_map(|d| d.values.iter())
+                .filter(|v| v.name == name)
+                .filter_map(|v| v.literal.as_deref())
+                .collect()
+        };
+        let unhandled = head
+            .graph
+            .states
+            .sites
+            .iter()
+            .filter(|s| ids.contains(&s.domain.as_str()))
+            .filter(|s| !head.idx(&s.function).is_some_and(|i| head.is_test(i)))
+            .filter_map(|s| {
+                let values: Vec<String> = added
+                    .iter()
+                    .filter(|a| {
+                        !s.handled
+                            .iter()
+                            .any(|h| h == *a || literal_of(a).contains(&h.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                (!values.is_empty()).then(|| UnhandledSite {
+                    site: s.clone(),
+                    values,
+                })
+            })
+            .collect();
+        domains.push(DomainDelta {
+            domain: key.1.to_owned(),
+            language: *language,
+            added,
+            removed,
+            unhandled,
+        });
+    }
+    for (key, (language, values, _)) in &before {
+        if after.contains_key(key) {
+            continue;
+        }
+        domains.push(DomainDelta {
+            domain: key.1.to_owned(),
+            language: *language,
+            added: Vec::new(),
+            removed: values.iter().map(|v| (*v).to_owned()).collect(),
+            unhandled: Vec::new(),
+        });
+    }
+    domains.sort_by(|a, b| (family(a.language), &a.domain).cmp(&(family(b.language), &b.domain)));
+    let silent_defaults = head
+        .graph
+        .states
+        .sites
+        .iter()
+        .filter(|s| changed.binary_search(&s.function).is_ok() && head.silent_site(s))
+        .cloned()
+        .collect();
+    StatesDelta {
+        domains,
+        silent_defaults,
     }
 }
 
@@ -524,6 +663,16 @@ fn insight_key(i: &Insight, rename: &HashMap<&str, &str>) -> String {
         Insight::HotPath { node: n, .. } => format!("hot_path|{}", node(n)),
         Insight::Waiting { node: n, on, .. } => format!("waiting|{}|{}", node(n), on.join(",")),
         Insight::NeverObserved { node: n } => format!("never_observed|{}", node(n)),
+        Insight::UnhandledValues {
+            node: n,
+            domain,
+            missing,
+            ..
+        } => format!(
+            "unhandled_values|{}|{domain}|{}",
+            node(n),
+            missing.join(",")
+        ),
     }
 }
 

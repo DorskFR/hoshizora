@@ -92,6 +92,7 @@ impl Adapter for SfcAdapter {
             lines: common::line_count(source),
             imports: vec![],
             symbols: vec![],
+            domains: vec![],
         };
         for (flavor, script) in blocks {
             TsAdapter(flavor).parse_into(&script, &mut facts)?;

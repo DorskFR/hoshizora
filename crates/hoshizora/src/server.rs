@@ -15,7 +15,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use futures::Stream;
-use hoshizora_model::api::{AddProject, Insights, NodeDetail, Project, ProjectStatus, Source};
+use hoshizora_model::api::{
+    AddProject, Insights, NodeDetail, Project, ProjectStatus, Source, StatesReport,
+};
 use hoshizora_model::{EdgeKind, Graph, Insight, LiveEvent, Node, NodeStats, RuntimeSpan};
 use hoshizora_runtime::route::{ProjectCandidate, project_for_span};
 use hoshizora_runtime::{NodeLookup, Runtime, RuntimeConfig, Trace, otlp};
@@ -144,6 +146,7 @@ fn project_routes<Q: GraphQueries + 'static>(prefix: &str) -> Router<Arc<AppStat
         .route(&p("/dead"), get(dead::<Q>))
         .route(&p("/effects"), get(effects::<Q>))
         .route(&p("/insights"), get(insights::<Q>))
+        .route(&p("/states"), get(states::<Q>))
         .route(&p("/runtime/stats"), get(runtime_stats::<Q>))
         .route(&p("/runtime/traces"), get(runtime_traces::<Q>))
         .route(&p("/runtime/traces/{trace_id}"), get(runtime_trace::<Q>))
@@ -312,6 +315,7 @@ pub fn slim_graph(graph: &Graph) -> Graph {
         meta: graph.meta.clone(),
         nodes,
         edges,
+        states: hoshizora_model::States::default(),
     }
 }
 
@@ -500,6 +504,18 @@ async fn insights<Q: GraphQueries>(Proj(state): Proj<Q>) -> Json<Insights> {
     })
 }
 
+#[derive(Deserialize)]
+struct StatesParams {
+    domain: Option<String>,
+}
+
+async fn states<Q: GraphQueries>(
+    Proj(state): Proj<Q>,
+    Query(p): Query<StatesParams>,
+) -> Json<StatesReport> {
+    Json(state.queries.states(p.domain.as_deref()))
+}
+
 pub fn all_insights<Q: GraphQueries>(state: &ProjectState<Q>) -> Vec<Insight> {
     let statics = state.queries.static_insights();
     state
@@ -665,8 +681,10 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
-    use hoshizora_model::api::{Impact, SearchHit, Story, Subgraph};
-    use hoshizora_model::{Confidence, Edge, EffectKind, Effects, NodeKind, Span};
+    use hoshizora_model::api::{DomainReport, Impact, SearchHit, Story, Subgraph};
+    use hoshizora_model::{
+        Confidence, Edge, EffectKind, Effects, Language, NodeKind, Span, StateDomain,
+    };
     use http_body_util::BodyExt;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
@@ -867,6 +885,26 @@ mod tests {
                 line: 3,
                 observed_calls_per_parent: None,
             }]
+        }
+        fn states(&self, domain: Option<&str>) -> StatesReport {
+            let d = StateDomain {
+                id: "domain:src/lib.rs#Status".into(),
+                name: "Status".into(),
+                file: "src/lib.rs".into(),
+                language: Language::Rust,
+                values: vec![],
+                span: Span::default(),
+            };
+            StatesReport {
+                domains: domain
+                    .is_none_or(|q| q == d.name)
+                    .then_some(DomainReport {
+                        domain: d,
+                        sites: vec![],
+                    })
+                    .into_iter()
+                    .collect(),
+            }
         }
     }
 
@@ -1269,6 +1307,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _) = get_json(&app, "/api/effects?kind=nope").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, states) = get_json(&app, "/api/states").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(states["domains"][0]["name"], "Status");
+        let (_, states) = get_json(&app, "/api/states?domain=Nope").await;
+        assert_eq!(states["domains"].as_array().unwrap().len(), 0);
 
         for uri in ["/", "/some/spa/route"] {
             let res = app
