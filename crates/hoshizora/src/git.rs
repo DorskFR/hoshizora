@@ -1,5 +1,6 @@
 //! Shallow clones and updates of project repositories through the `git` binary.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -170,6 +171,93 @@ pub async fn head(opts: &GitOptions, dest: &Path) -> anyhow::Result<String> {
     run(opts, cmd, "rev-parse").await
 }
 
+/// Extracts `rev` of a local repository into `dest` with `git archive | tar`, without touching
+/// the repository's worktree or index.
+pub fn archive(repo: &Path, rev: &str, dest: &Path) -> anyhow::Result<()> {
+    validate_ref(rev)?;
+    std::fs::create_dir_all(dest)?;
+    let mut git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["archive", "--format=tar", rev])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running git archive")?;
+    let stdout = git.stdout.take().context("git archive stdout")?;
+    let tar = std::process::Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(dest)
+        .stdin(stdout)
+        .stderr(Stdio::piped())
+        .output()
+        .context("running tar")?;
+    let git = git.wait_with_output()?;
+    if !git.status.success() {
+        bail!(
+            "git archive {rev} failed: {}",
+            String::from_utf8_lossy(&git.stderr).trim()
+        );
+    }
+    if !tar.status.success() {
+        bail!(
+            "extracting {rev} failed: {}",
+            String::from_utf8_lossy(&tar.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Head-side line ranges (inclusive) of every hunk between two revisions, by file.
+pub fn changed_lines(
+    repo: &Path,
+    base: &str,
+    head: &str,
+) -> anyhow::Result<BTreeMap<String, Vec<(u32, u32)>>> {
+    validate_ref(base)?;
+    validate_ref(head)?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--unified=0", "--no-color", base, head])
+        .stdin(Stdio::null())
+        .output()
+        .context("running git diff")?;
+    if !out.status.success() {
+        bail!(
+            "git diff {base} {head} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(parse_hunks(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_hunks(diff: &str) -> BTreeMap<String, Vec<(u32, u32)>> {
+    let mut out: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+    let mut file: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            file = path.strip_prefix("b/").map(str::to_owned);
+        } else if let (Some(f), Some(rest)) = (&file, line.strip_prefix("@@ ")) {
+            let Some(plus) = rest.split(' ').find_map(|w| w.strip_prefix('+')) else {
+                continue;
+            };
+            let (start, count) = match plus.split_once(',') {
+                Some((s, c)) => (s.parse().unwrap_or(0), c.parse().unwrap_or(0)),
+                None => (plus.parse().unwrap_or(0), 1u32),
+            };
+            if count > 0 {
+                out.entry(f.clone())
+                    .or_default()
+                    .push((start, start + count - 1));
+            }
+        }
+    }
+    out
+}
+
 fn base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -237,6 +325,14 @@ mod tests {
         validate_url("file:///tmp/x", true).unwrap();
         assert!(validate_ref("--upload-pack=x").is_err());
         assert!(validate_ref("main").is_ok());
+    }
+
+    #[test]
+    fn hunks_to_head_ranges() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3 +3,2 @@ fn x\n+a\n+b\n@@ -10,2 +12 @@\n-c\n+d\n@@ -20 +21,0 @@\n-e\ndiff --git a/gone.rs b/gone.rs\n--- a/gone.rs\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-x\n";
+        let ranges = parse_hunks(diff);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges["src/a.rs"], vec![(3, 4), (12, 12)]);
     }
 
     #[test]

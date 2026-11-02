@@ -53,9 +53,23 @@ kind = "db_read"
 [[effect]]
 id = "python.sqlalchemy.orm_write"
 language = "python"
-match = ["*.add", "*.add_all", "*.merge", "*.delete", "*.commit", "*.flush", "sqlalchemy.insert", "sqlalchemy.update", "sqlalchemy.delete", "insert", "update", "delete"]
+match = ["*.add", "*.add_all", "*.merge", "*.commit", "*.flush", "sqlalchemy.insert", "sqlalchemy.update", "insert", "update"]
 requires_import = "sqlalchemy"
 kind = "db_write"
+
+[[effect]]
+id = "python.sqlalchemy.delete"
+language = "python"
+match = ["*.delete", "sqlalchemy.delete", "delete"]
+requires_import = "sqlalchemy"
+kind = "db_delete"
+
+[[effect]]
+id = "python.sqlalchemy.begin"
+language = "python"
+match = ["*.begin", "*.begin_nested"]
+requires_import = "sqlalchemy"
+kind = "lock"
 
 [[effect]]
 id = "python.psycopg"
@@ -66,12 +80,26 @@ kind = "db"
 target = "sql"
 
 [[effect]]
+id = "python.psycopg.transaction"
+language = "python"
+match = ["*.transaction"]
+requires_import = "psycopg"
+kind = "lock"
+
+[[effect]]
 id = "python.asyncpg"
 language = "python"
 match = ["*.fetch", "*.fetchrow", "*.fetchval", "*.execute", "*.executemany", "*.copy_records_to_table"]
 requires_import = "asyncpg"
 kind = "db"
 target = "sql"
+
+[[effect]]
+id = "python.asyncpg.transaction"
+language = "python"
+match = ["*.transaction"]
+requires_import = "asyncpg"
+kind = "lock"
 
 [[effect]]
 id = "python.sqlite3"
@@ -90,9 +118,23 @@ kind = "db_read"
 [[effect]]
 id = "python.django.write"
 language = "python"
-match = ["*.save", "*.delete", "*.objects.create", "*.objects.update", "*.objects.bulk_create", "*.objects.bulk_update", "*.objects.get_or_create", "*.objects.update_or_create", "*.objects.filter.update", "*.objects.filter.delete"]
+match = ["*.save", "*.objects.create", "*.objects.update", "*.objects.bulk_create", "*.objects.bulk_update", "*.objects.get_or_create", "*.objects.update_or_create", "*.objects.filter.update"]
 requires_import = "django"
 kind = "db_write"
+
+[[effect]]
+id = "python.django.delete"
+language = "python"
+match = ["*.delete", "*.objects.filter.delete"]
+requires_import = "django"
+kind = "db_delete"
+
+[[effect]]
+id = "python.django.transaction"
+language = "python"
+match = ["transaction.atomic", "django.db.transaction.atomic"]
+requires_import = "django"
+kind = "lock"
 
 [[effect]]
 id = "python.redis.read"

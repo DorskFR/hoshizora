@@ -40,6 +40,18 @@ Function facts: signature, params with types, return type, docstring, span, asyn
 cyclomatic / cognitive complexity, loop nesting depth, recursion, direct + propagated effects,
 `confidence` per edge (`exact` from SCIP/runtime, `name` from heuristic resolution).
 
+Effects: `network`, `db_read`, `db_write`, `db_delete`, `fs_read`, `fs_write`, `process`,
+`spawn`, `join`, `lock`, `publish`, `subscribe`, `sleep`, `blocking`. SQL strings decide
+between the three `db_*` kinds (a `DELETE` is a `db_delete`; both writes and deletes draw a
+`writes` edge to the table), `BEGIN` / `FOR UPDATE` add a `lock`, and pack rules map ORM
+calls and transaction begins the same way.
+
+States, three levels: (1) declared value domains and the branch sites on them, with what each
+site misses; (2) table columns written with string literals, their values, readers and the
+domains covering them, so a new status value shows the readers without a case for it; (3) the
+`read_then_write` insight: a table read then written across an await with no transaction or
+lock, the check-then-act race.
+
 ## Questions the graph answers
 
 | Question | Static | Runtime |

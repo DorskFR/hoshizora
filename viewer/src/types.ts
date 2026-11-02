@@ -43,6 +43,7 @@ export type EffectKind =
   | "network"
   | "db_read"
   | "db_write"
+  | "db_delete"
   | "fs_read"
   | "fs_write"
   | "process"
@@ -58,6 +59,7 @@ export const EFFECT_KINDS: readonly EffectKind[] = [
   "network",
   "db_read",
   "db_write",
+  "db_delete",
   "fs_read",
   "fs_write",
   "process",
@@ -272,7 +274,23 @@ export type Insight =
       line: number;
       observed_calls_per_parent: number | null;
     }
-  | { kind: "never_observed"; node: string };
+  | { kind: "never_observed"; node: string }
+  | {
+      kind: "unhandled_values";
+      node: string;
+      line: number;
+      domain: string;
+      missing: string[];
+      default: "none" | "throws" | "returns_empty" | "other";
+    }
+  | {
+      kind: "read_then_write";
+      node: string;
+      table: string;
+      read_line: number;
+      write_line: number;
+      write: "writes" | "deletes";
+    };
 
 export interface Insights {
   insights: Insight[];

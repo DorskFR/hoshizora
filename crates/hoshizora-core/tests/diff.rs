@@ -141,7 +141,7 @@ fn added_modified_effects_tables_insights_and_impact() {
         .iter()
         .find(|d| d.entrypoint == "fn:src/main.rs#main")
         .expect("main gains the write");
-    assert_eq!(main_delta.added, vec!["db_write:observations"]);
+    assert_eq!(main_delta.added, vec!["db_delete:observations"]);
     assert!(main_delta.removed.is_empty());
     assert!(
         report
@@ -158,14 +158,15 @@ fn added_modified_effects_tables_insights_and_impact() {
     );
     assert_eq!(
         report.tests_effect_delta[0].added,
-        vec!["db_write:observations"]
+        vec!["db_delete:observations"]
     );
 
     let observations = &report.tables_touched["observations"];
     assert_eq!(
-        observations.db_write,
+        observations.db_delete,
         vec!["fn:src/db.rs#delete_observations"]
     );
+    assert!(observations.db_write.is_empty());
     assert!(observations.db_read.is_empty());
     assert!(!report.tables_touched.contains_key("stars"));
 
@@ -419,4 +420,97 @@ fn unchanged_domains_produce_no_states_delta() {
     let report = diff(&base.index(), &head.index());
     assert!(report.states.domains.is_empty());
     assert!(report.states.silent_defaults.is_empty());
+}
+
+const JOBS_BASE: &str = r#"
+import { Pool } from "pg";
+const pool = new Pool();
+
+export async function finish(id: string) {
+  await pool.query("UPDATE jobs SET status = 'done' WHERE id = $1", [id]);
+}
+
+export async function live() {
+  return pool.query("SELECT id FROM jobs WHERE status IN ('queued', 'running')");
+}
+"#;
+
+const JOBS_HEAD: &str = r#"
+import { Pool } from "pg";
+const pool = new Pool();
+
+export async function finish(id: string) {
+  await pool.query("UPDATE jobs SET status = 'done' WHERE id = $1", [id]);
+}
+
+export async function cancel(id: string) {
+  await pool.query("UPDATE jobs SET status = 'cancelled' WHERE id = $1", [id]);
+}
+
+export async function live() {
+  return pool.query("SELECT id FROM jobs WHERE status IN ('queued', 'running')");
+}
+"#;
+
+const STATUS: &str = r#"
+export type Status = "queued" | "running" | "done" | "cancelled";
+
+export function label(status: Status): string {
+  switch (status) {
+    case "queued":
+      return "q";
+    case "running":
+      return "r";
+    case "done":
+      return "d";
+    default:
+      return "";
+  }
+}
+"#;
+
+#[test]
+fn new_column_value_lists_readers_without_a_case_for_it() {
+    let base = Tree::new("column-base");
+    base.write("web/package.json", "{ \"name\": \"web\" }")
+        .write("web/src/jobs.ts", JOBS_BASE)
+        .write("web/src/status.ts", STATUS);
+    let head = Tree::new("column-head");
+    head.write("web/package.json", "{ \"name\": \"web\" }")
+        .write("web/src/jobs.ts", JOBS_HEAD)
+        .write("web/src/status.ts", STATUS);
+    let report = diff(&base.index(), &head.index());
+
+    assert_eq!(
+        report.states.columns.len(),
+        1,
+        "{:?}",
+        report.states.columns
+    );
+    let delta = &report.states.columns[0];
+    assert_eq!(
+        (delta.table.as_str(), delta.column.as_str()),
+        ("jobs", "status")
+    );
+    assert_eq!(delta.added, vec!["cancelled"]);
+    assert!(delta.removed.is_empty());
+    let unhandled: Vec<(&str, u32, Vec<&str>)> = delta
+        .unhandled
+        .iter()
+        .map(|u| {
+            (
+                u.function.as_str(),
+                u.line,
+                u.values.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        unhandled,
+        vec![
+            ("fn:web/src/jobs.ts#live", 14, vec!["cancelled"]),
+            ("fn:web/src/status.ts#label", 5, vec!["cancelled"]),
+        ]
+    );
+    assert!(report.states.domains.is_empty());
 }

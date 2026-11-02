@@ -477,3 +477,105 @@ fn enum_messages_become_topics_when_sent_and_matched() {
         .collect();
     assert_eq!(published, vec!["FrameDown::Command"]);
 }
+
+#[test]
+fn middleware_after_the_last_registration_is_not_a_handler() {
+    let rs = Language::Rust;
+    let ts = Language::TypeScript;
+    let idx = build(vec![
+        file(
+            "api/src/main.rs",
+            rs,
+            "api",
+            vec![],
+            vec![
+                func(
+                    "router",
+                    10,
+                    vec![
+                        args(
+                            recv(call("Router::new().route", 11), "Router::new()"),
+                            &["/stars"],
+                        ),
+                        call("get", 11),
+                        call("handlers::list_stars", 11),
+                        args(recv(call("route", 12), "_"), &["/catalog/summary"]),
+                        call("get", 12),
+                        call("handlers::catalog_summary", 12),
+                        recv(call("layer", 13), "_"),
+                        call("TraceLayer::new_for_http", 13),
+                        call("make_span_with", 13),
+                        call("telemetry::http_server_span", 13),
+                        recv(call("layer", 14), "_"),
+                        call("middleware::from_fn", 14),
+                        call("telemetry::authenticate", 14),
+                        recv(call("fallback", 15), "_"),
+                        call("any", 15),
+                        call("handlers::not_found", 15),
+                        args(recv(call("route", 20), "_"), &["/upload"]),
+                        call("post", 22),
+                        call("handlers::upload", 22),
+                        recv(call("layer", 22), "_"),
+                        call("DefaultBodyLimit::max", 22),
+                        call("body_limit", 22),
+                    ],
+                ),
+                func("list_stars", 40, vec![]),
+                func("catalog_summary", 50, vec![]),
+                func("http_server_span", 60, vec![]),
+                func("authenticate", 70, vec![]),
+                func("not_found", 80, vec![]),
+                func("upload", 90, vec![]),
+                sync(func("body_limit", 100, vec![])),
+            ],
+        ),
+        file(
+            "web/src/app.ts",
+            ts,
+            "web/src/app",
+            vec![],
+            vec![
+                func(
+                    "start",
+                    1,
+                    vec![
+                        args(recv(call("app.get", 2), "app"), &["/users"]),
+                        call("listUsers", 2),
+                        recv(call("app.use", 3), "app"),
+                        call("requestLogger", 3),
+                    ],
+                ),
+                func("listUsers", 20, vec![]),
+                func("requestLogger", 30, vec![]),
+            ],
+        ),
+    ]);
+    for (route, handler) in [
+        ("route:GET /stars", "fn:api/src/main.rs#list_stars"),
+        (
+            "route:GET /catalog/summary",
+            "fn:api/src/main.rs#catalog_summary",
+        ),
+        ("route:POST /upload", "fn:api/src/main.rs#upload"),
+        ("route:GET /users", "fn:web/src/app.ts#listUsers"),
+    ] {
+        assert!(
+            edge(&idx, route, handler).is_some_and(|e| e.kind == EdgeKind::Handles),
+            "{route} keeps its handler {handler}"
+        );
+    }
+    for middleware in [
+        "fn:api/src/main.rs#http_server_span",
+        "fn:api/src/main.rs#authenticate",
+        "fn:api/src/main.rs#not_found",
+        "fn:api/src/main.rs#body_limit",
+        "fn:web/src/app.ts#requestLogger",
+    ] {
+        assert!(
+            idx.incoming(middleware)
+                .into_iter()
+                .all(|e| e.kind != EdgeKind::Handles),
+            "{middleware} is middleware, not a handler"
+        );
+    }
+}

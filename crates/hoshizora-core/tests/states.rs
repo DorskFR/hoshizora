@@ -184,3 +184,71 @@ fn graph_json_round_trips_states() {
     assert_eq!(back.states, g.states);
     assert_eq!(serde_json::to_string(&back).unwrap(), json);
 }
+
+#[test]
+fn columns_written_with_literals_link_readers_and_covering_domains() {
+    let g = graph();
+    let cols: Vec<(&str, &str)> = g
+        .states
+        .columns
+        .iter()
+        .map(|c| (c.table.as_str(), c.column.as_str()))
+        .collect();
+    assert_eq!(cols, vec![("jobs", "kind"), ("jobs", "status")]);
+
+    let status = &g.states.columns[1];
+    let values: Vec<(&str, Vec<(&str, u32)>)> = status
+        .values
+        .iter()
+        .map(|v| {
+            (
+                v.value.as_str(),
+                v.writers
+                    .iter()
+                    .map(|w| (w.function.as_str(), w.line))
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            ("active", vec![("fn:src/jobs/store.ts#start", 6)]),
+            ("done", vec![("fn:src/jobs/store.ts#finish", 10)]),
+            ("paused", vec![("fn:src/jobs/store.ts#enqueue", 14)]),
+        ]
+    );
+    let readers: Vec<(&str, u32, Vec<&str>)> = status
+        .readers
+        .iter()
+        .map(|r| {
+            (
+                r.function.as_str(),
+                r.line,
+                r.values.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        readers,
+        vec![
+            ("fn:src/jobs/store.ts#byUser", 22, vec!["done"]),
+            ("fn:src/jobs/store.ts#live", 18, vec!["active", "paused"]),
+            ("fn:src/jobs/store.ts#start", 6, vec!["paused"]),
+        ]
+    );
+    assert_eq!(
+        status.domains,
+        vec![
+            "domain:api/src/lib.rs#Status",
+            "domain:src/status.ts#Status"
+        ]
+    );
+    assert!(g.states.columns[0].domains.is_empty());
+
+    let report = Index::new(g.clone()).states(Some("jobs.status"));
+    assert_eq!(report.columns.len(), 1);
+    assert_eq!(report.columns[0].column, "status");
+    let report = Index::new(g).states(Some("Kind"));
+    assert!(report.columns.is_empty());
+}

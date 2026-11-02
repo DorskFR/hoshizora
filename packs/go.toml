@@ -18,6 +18,13 @@ kind = "db"
 target = "sql"
 
 [[effect]]
+id = "go.database_sql.begin"
+language = "go"
+match = ["*.Begin", "*.BeginTx"]
+requires_import = "database/sql"
+kind = "lock"
+
+[[effect]]
 id = "go.sqlx"
 language = "go"
 match = ["*.Select", "*.Get", "*.SelectContext", "*.GetContext", "*.Queryx", "*.QueryRowx", "*.NamedExec", "*.NamedQuery", "*.MustExec", "*.Exec", "*.ExecContext", "*.Query", "*.QueryRow"]
@@ -28,10 +35,17 @@ target = "sql"
 [[effect]]
 id = "go.pgx"
 language = "go"
-match = ["*.Query", "*.QueryRow", "*.Exec", "*.SendBatch", "*.CopyFrom", "*.Begin"]
+match = ["*.Query", "*.QueryRow", "*.Exec", "*.SendBatch", "*.CopyFrom"]
 requires_import = "pgx"
 kind = "db"
 target = "sql"
+
+[[effect]]
+id = "go.pgx.begin"
+language = "go"
+match = ["*.Begin", "*.BeginTx", "*.BeginFunc"]
+requires_import = "pgx"
+kind = "lock"
 
 [[effect]]
 id = "go.gorm.read"
@@ -44,10 +58,25 @@ target = "sql"
 [[effect]]
 id = "go.gorm.write"
 language = "go"
-match = ["*.Create", "*.Save", "*.Update", "*.Updates", "*.UpdateColumn", "*.UpdateColumns", "*.Delete", "*.FirstOrCreate", "*.Exec", "*.AutoMigrate", "*.Transaction"]
+match = ["*.Create", "*.Save", "*.Update", "*.Updates", "*.UpdateColumn", "*.UpdateColumns", "*.FirstOrCreate", "*.Exec", "*.AutoMigrate"]
 requires_import = "gorm"
 kind = "db_write"
 target = "sql"
+
+[[effect]]
+id = "go.gorm.delete"
+language = "go"
+match = ["*.Delete"]
+requires_import = "gorm"
+kind = "db_delete"
+target = "sql"
+
+[[effect]]
+id = "go.gorm.transaction"
+language = "go"
+match = ["*.Transaction", "*.Begin"]
+requires_import = "gorm"
+kind = "lock"
 
 [[effect]]
 id = "go.redis.read"

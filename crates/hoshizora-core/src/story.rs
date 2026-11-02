@@ -385,7 +385,10 @@ fn is_story_effect(kind: EffectKind) -> bool {
 }
 
 fn is_db(kind: EffectKind) -> bool {
-    matches!(kind, EffectKind::DbRead | EffectKind::DbWrite)
+    matches!(
+        kind,
+        EffectKind::DbRead | EffectKind::DbWrite | EffectKind::DbDelete
+    )
 }
 
 fn push_link(links: &mut Vec<StoryLink>, link: StoryLink) {

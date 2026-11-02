@@ -314,6 +314,7 @@ fn is_io_child(lookup: &dyn NodeLookup, child: &RuntimeSpan) -> bool {
                     EffectKind::Network
                         | EffectKind::DbRead
                         | EffectKind::DbWrite
+                        | EffectKind::DbDelete
                         | EffectKind::Publish
                 )
             };

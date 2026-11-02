@@ -13,6 +13,15 @@ use hoshizora_model::{
 };
 
 use crate::packs::Packs;
+use crate::sql::ColumnLiteral;
+
+/// Column literals one SQL call writes or tests, by function and line.
+pub(crate) struct SqlSite {
+    pub function: usize,
+    pub line: u32,
+    pub assignments: Vec<ColumnLiteral>,
+    pub conditions: Vec<ColumnLiteral>,
+}
 
 pub(crate) struct FnRec {
     pub node: usize,
@@ -80,6 +89,7 @@ pub(crate) struct Ctx<'a> {
     pub module_files: HashMap<String, Vec<usize>>,
     pub counters: BTreeMap<&'static str, u32>,
     pub warnings: Vec<String>,
+    pub sql_sites: Vec<SqlSite>,
 }
 
 impl<'a> Ctx<'a> {
@@ -174,6 +184,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
         module_files: HashMap::new(),
         counters: BTreeMap::new(),
         warnings: Vec::new(),
+        sql_sites: Vec::new(),
     };
 
     packages::build(&mut ctx);

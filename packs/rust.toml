@@ -34,9 +34,16 @@ kind = "db"
 target = "sql"
 
 [[effect]]
+id = "rust.sqlx.begin"
+language = "rust"
+match = ["*.begin"]
+requires_import = "sqlx"
+kind = "lock"
+
+[[effect]]
 id = "rust.sqlx.transaction"
 language = "rust"
-match = ["*.begin", "*.commit", "*.rollback"]
+match = ["*.commit", "*.rollback"]
 requires_import = "sqlx"
 kind = "db_write"
 
@@ -51,9 +58,16 @@ target = "sql"
 [[effect]]
 id = "rust.diesel.write"
 language = "rust"
-match = ["diesel::insert_into", "diesel::update", "diesel::delete", "diesel::replace_into", "*.insert_into", "*.on_conflict"]
+match = ["diesel::insert_into", "diesel::update", "diesel::replace_into", "*.insert_into", "*.on_conflict"]
 requires_import = "diesel"
 kind = "db_write"
+
+[[effect]]
+id = "rust.diesel.delete"
+language = "rust"
+match = ["diesel::delete"]
+requires_import = "diesel"
+kind = "db_delete"
 
 [[effect]]
 id = "rust.sea_orm.read"
@@ -65,9 +79,16 @@ kind = "db_read"
 [[effect]]
 id = "rust.sea_orm.write"
 language = "rust"
-match = ["*::insert", "*::insert_many", "*::update", "*::update_many", "*::delete", "*::delete_many", "*.insert", "*.update", "*.delete", "*.save", "*.exec"]
+match = ["*::insert", "*::insert_many", "*::update", "*::update_many", "*.insert", "*.update", "*.save", "*.exec"]
 requires_import = "sea_orm"
 kind = "db_write"
+
+[[effect]]
+id = "rust.sea_orm.delete"
+language = "rust"
+match = ["*::delete", "*::delete_many", "*.delete", "*.delete_many"]
+requires_import = "sea_orm"
+kind = "db_delete"
 
 [[effect]]
 id = "rust.redis.read"

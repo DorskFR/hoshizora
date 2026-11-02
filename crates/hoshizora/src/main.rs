@@ -61,9 +61,15 @@ enum Command {
         /// Holds `projects.json`, clones (`repos/`) and graphs (`graphs/`).
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
-        /// Git URL or local path to register at startup; repeatable.
-        #[arg(long = "project")]
+        /// Project to register at startup, `[name=]<url>[@ref]` or a local path; repeatable,
+        /// or comma-separated in `HOSHIZORA_PROJECTS`. Already registered URLs and paths are
+        /// kept as they are.
+        #[arg(long = "project", env = "HOSHIZORA_PROJECTS", value_delimiter = ',')]
         projects: Vec<String>,
+        /// JSON array of `{url, ref?, name?, services?}` or `{path, name?}` entries to register
+        /// at startup, same rules as `--project`.
+        #[arg(long, env = "HOSHIZORA_PROJECTS_FILE")]
+        projects_file: Option<PathBuf>,
         /// Bind address; use 0.0.0.0 inside a container.
         #[arg(long, default_value = "127.0.0.1")]
         host: std::net::IpAddr,
@@ -87,6 +93,22 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Extra packs used when indexing a source tree.
+        #[arg(long)]
+        packs: Option<PathBuf>,
+    },
+    /// Score diff reports against known review corrections (see docs/coverage.md).
+    Coverage {
+        /// JSON file of cases: repo + base/head revs or prebuilt graphs, plus locations.
+        #[arg(long)]
+        cases: PathBuf,
+        /// Write the JSON report here; the table always goes to stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Where revisions are extracted and indexed (default: a `hoshizora-coverage` dir in
+        /// the system temp dir); reused across runs.
+        #[arg(long)]
+        scratch: Option<PathBuf>,
+        /// Extra packs used when indexing.
         #[arg(long)]
         packs: Option<PathBuf>,
     },
@@ -161,6 +183,7 @@ fn main() -> anyhow::Result<()> {
             root,
             data_dir,
             projects,
+            projects_file,
             host,
             port,
             otlp_port,
@@ -171,6 +194,7 @@ fn main() -> anyhow::Result<()> {
             root,
             data_dir,
             projects,
+            projects_file,
             host,
             port,
             otlp_port,
@@ -183,6 +207,17 @@ fn main() -> anyhow::Result<()> {
             output,
             packs,
         } => cmd_diff(&base, &head, output.as_deref(), packs.as_deref()),
+        Command::Coverage {
+            cases,
+            output,
+            scratch,
+            packs,
+        } => cmd_coverage(
+            &cases,
+            output.as_deref(),
+            scratch.as_deref(),
+            packs.as_deref(),
+        ),
         Command::Query { graph, query } => cmd_query(&graph, query),
     }
 }
@@ -279,6 +314,7 @@ struct ServeArgs {
     root: Option<PathBuf>,
     data_dir: PathBuf,
     projects: Vec<String>,
+    projects_file: Option<PathBuf>,
     host: std::net::IpAddr,
     port: u16,
     otlp_port: u16,
@@ -299,10 +335,18 @@ async fn cmd_serve(args: ServeArgs) -> anyhow::Result<()> {
     if restored > 0 {
         tracing::info!(projects = restored, "restored projects.json");
     }
+    let mut specs = args
+        .projects
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| projects::parse_spec(s).with_context(|| format!("--project {s}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some(file) = &args.projects_file {
+        specs.extend(projects::load_specs_file(file)?);
+    }
     let legacy = args.graph.clone().or_else(|| {
         let default = PathBuf::from(DEFAULT_GRAPH);
-        (restored == 0 && args.projects.is_empty() && (default.exists() || args.reindex))
-            .then_some(default)
+        (restored == 0 && specs.is_empty() && (default.exists() || args.reindex)).then_some(default)
     });
     if let Some(graph_path) = legacy {
         serve_legacy_graph(
@@ -313,18 +357,13 @@ async fn cmd_serve(args: ServeArgs) -> anyhow::Result<()> {
             args.packs.as_deref(),
         )?;
     }
-    for spec in &args.projects {
-        let project = if projects::is_url(spec) {
-            state
-                .add_git(hoshizora_model::api::AddProject {
-                    url: spec.clone(),
-                    ..Default::default()
-                })
-                .map_err(|e| anyhow::anyhow!("--project {spec}: {}", e.message))?
-        } else {
-            state.add_path(Path::new(spec), None)?
-        };
-        tracing::info!(project = project.id, status = ?project.status, "registered");
+    for spec in specs {
+        match state.register(spec.clone()) {
+            Ok(project) => {
+                tracing::info!(project = project.id, status = ?project.status, "registered")
+            }
+            Err(e) => tracing::error!(error = %e, "registering {spec:?}"),
+        }
     }
     server::spawn_stats_ticker(Arc::clone(&state));
     let app = server::router(Arc::clone(&state));
@@ -426,6 +465,135 @@ fn serve_legacy_graph(
     };
     state.insert_ready(project, GraphIndex::new(graph), root, Some(0));
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CasesFile {
+    List(Vec<CaseSpec>),
+    Wrapped { cases: Vec<CaseSpec> },
+}
+
+/// Either `repo` + `base` + `head` revisions, or `base_graph` + `head_graph` files (`repo` is
+/// then optional and only used to derive `in_diff` from `git diff`).
+#[derive(serde::Deserialize)]
+struct CaseSpec {
+    name: Option<String>,
+    repo: Option<PathBuf>,
+    base: Option<String>,
+    head: Option<String>,
+    base_graph: Option<PathBuf>,
+    head_graph: Option<PathBuf>,
+    locations: Vec<CaseLocation>,
+}
+
+#[derive(serde::Deserialize)]
+struct CaseLocation {
+    file: String,
+    line: u32,
+    in_diff: Option<bool>,
+}
+
+fn cmd_coverage(
+    cases_path: &Path,
+    output: Option<&Path>,
+    scratch: Option<&Path>,
+    packs: Option<&Path>,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(cases_path)
+        .with_context(|| format!("reading {}", cases_path.display()))?;
+    let specs = match serde_json::from_str::<CasesFile>(&text)
+        .with_context(|| format!("parsing {}", cases_path.display()))?
+    {
+        CasesFile::List(c) | CasesFile::Wrapped { cases: c } => c,
+    };
+    let scratch = scratch.map_or_else(
+        || std::env::temp_dir().join("hoshizora-coverage"),
+        Path::to_path_buf,
+    );
+    let mut results = Vec::with_capacity(specs.len());
+    for (i, spec) in specs.into_iter().enumerate() {
+        let name = spec
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("case-{}", i + 1));
+        let started = Instant::now();
+        let result =
+            coverage_case(&name, &spec, &scratch, packs).with_context(|| format!("case {name}"))?;
+        tracing::info!(case = name, elapsed = ?started.elapsed(), "scored");
+        results.push(result);
+    }
+    let report = hoshizora_core::coverage::Report {
+        summary: hoshizora_core::coverage::summarize(&results),
+        cases: results,
+    };
+    if let Some(path) = output {
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    }
+    print!("{}", hoshizora_core::coverage::table(&report));
+    if output.is_none() {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
+    Ok(())
+}
+
+fn coverage_case(
+    name: &str,
+    spec: &CaseSpec,
+    scratch: &Path,
+    packs: Option<&Path>,
+) -> anyhow::Result<hoshizora_core::coverage::CaseResult> {
+    let graph_for = |rev: Option<&str>, graph: Option<&Path>, side: &str| match (graph, rev) {
+        (Some(path), _) => hoshizora_core::load(path).with_context(|| path.display().to_string()),
+        (None, Some(rev)) => {
+            let repo = spec
+                .repo
+                .as_deref()
+                .context("`repo` is required with revisions")?;
+            let dir = scratch.join(projects::path_slug(repo)).join(rev);
+            if !dir.join(".hoshizora-archived").exists() {
+                let _ = std::fs::remove_dir_all(&dir);
+                git::archive(repo, rev, &dir)?;
+                std::fs::write(dir.join(".hoshizora-archived"), "")?;
+            }
+            build_graph(&dir, packs)
+        }
+        (None, None) => anyhow::bail!("{side} needs a revision or a graph file"),
+    };
+    let base = Index::new(graph_for(
+        spec.base.as_deref(),
+        spec.base_graph.as_deref(),
+        "base",
+    )?);
+    let head = Index::new(graph_for(
+        spec.head.as_deref(),
+        spec.head_graph.as_deref(),
+        "head",
+    )?);
+    let report = hoshizora_core::diff(&base, &head);
+    let needs_hunks = spec.locations.iter().any(|l| l.in_diff.is_none());
+    let hunks = match (&spec.repo, &spec.base, &spec.head) {
+        (Some(repo), Some(base), Some(head)) if needs_hunks => {
+            git::changed_lines(repo, base, head)?
+        }
+        _ => Default::default(),
+    };
+    let locations: Vec<_> = spec
+        .locations
+        .iter()
+        .map(|l| hoshizora_core::coverage::Location {
+            in_diff: l.in_diff.unwrap_or_else(|| {
+                hunks
+                    .get(&l.file)
+                    .is_some_and(|ranges| ranges.iter().any(|&(a, b)| a <= l.line && l.line <= b))
+            }),
+            file: l.file.clone(),
+            line: l.line,
+        })
+        .collect();
+    Ok(hoshizora_core::coverage::evaluate(
+        name, &head, &report, &locations,
+    ))
 }
 
 fn cmd_query(graph_path: &Path, query: QueryCommand) -> anyhow::Result<()> {

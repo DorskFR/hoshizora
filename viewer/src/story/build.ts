@@ -21,6 +21,7 @@ const SIGNIFICANT: ReadonlySet<EffectKind> = new Set<EffectKind>([
   "network",
   "db_read",
   "db_write",
+  "db_delete",
   "fs_write",
   "process",
   "spawn",

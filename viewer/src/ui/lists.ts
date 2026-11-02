@@ -10,6 +10,8 @@ const INSIGHT_LABELS: Partial<Record<string, string>> = {
   parallelisable: "Parallelisable",
   io_in_loop: "I/O in loop",
   never_observed: "Never observed",
+  unhandled_values: "Unhandled values",
+  read_then_write: "Read then write across await",
 };
 
 const INSIGHTS_PER_GROUP = 40;
@@ -178,6 +180,10 @@ function describeKnown(i: Insight): string {
       return `${i.effect} at L${i.line}${i.observed_calls_per_parent ? ` · ${i.observed_calls_per_parent.toFixed(1)} calls/parent` : ""}`;
     case "never_observed":
       return "reachable statically, never seen at runtime";
+    case "unhandled_values":
+      return `${i.domain}: ${i.missing.join(", ")} fall into the ${i.default} default at L${i.line}`;
+    case "read_then_write":
+      return `reads ${i.table} at L${i.read_line}, ${i.write} it at L${i.write_line} with no transaction or lock`;
     default:
       return extraFields(i);
   }

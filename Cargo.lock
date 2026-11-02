@@ -630,7 +630,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hoshizora"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "hoshizora-adapters"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hoshizora-model",
@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "hoshizora-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hoshizora-adapters",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "hoshizora-model"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "hoshizora-runtime"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "flate2",

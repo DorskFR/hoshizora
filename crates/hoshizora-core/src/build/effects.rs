@@ -6,8 +6,8 @@ use hoshizora_model::{
     CallSite, Confidence, Edge, EdgeKind, Effect, EffectKind, Language, NodeKind,
 };
 
-use super::Ctx;
 use super::resolve::{callee_segments, resolve_call};
+use super::{Ctx, SqlSite};
 use crate::packs::{EffectRule, RouteStyle, RuleKind, Target};
 use crate::pattern::Pattern;
 use crate::sql;
@@ -295,12 +295,28 @@ fn builder_routes(ctx: &mut Ctx) {
                             .any(|c| p.matches(c) || p.matches(&format!("_.{c}")))
                     })
                 });
-            // Arguments of a multi-line registration run until the next registration.
+            // Arguments of a multi-line registration run until the next registration or
+            // the first middleware/state/fallback attachment. `post(h).layer(limit)` keeps
+            // its line: the layer decorates the handler written before it.
             let window_end = body
                 .calls
                 .iter()
-                .filter(|c| c.line > call.line && literal_path(c).is_some())
-                .map(|c| c.line)
+                .filter(|c| c.line > call.line)
+                .filter_map(|c| {
+                    if literal_path(c).is_some() {
+                        Some(c.line)
+                    } else if attaches_middleware(c) {
+                        let after_handler = decorates_handler(c)
+                            && body.calls.iter().any(|m| {
+                                m.line == c.line
+                                    && m.receiver.is_none()
+                                    && method_from_name(&m.name).is_some()
+                            });
+                        Some(if after_handler { c.line + 1 } else { c.line })
+                    } else {
+                        None
+                    }
+                })
                 .min()
                 .unwrap_or(u32::MAX)
                 .min(call.line + REGISTRATION_WINDOW);
@@ -390,6 +406,42 @@ fn builder_routes(ctx: &mut Ctx) {
 
 /// Lines a route registration's arguments may span.
 const REGISTRATION_WINDOW: u32 = 12;
+
+/// Calls whose arguments wrap or configure a router rather than handle a route:
+/// axum `.layer`/`.with_state`/`.fallback`, tower `make_span_with`, express `app.use`,
+/// chi/gin `.Use`, FastAPI `add_middleware`.
+const MIDDLEWARE_CALLS: &[&str] = &[
+    "layer",
+    "route_layer",
+    "with_state",
+    "fallback",
+    "fallback_service",
+    "method_not_allowed_fallback",
+    "make_span_with",
+    "on_request",
+    "on_response",
+    "on_failure",
+    "from_fn",
+    "from_fn_with_state",
+    "map_request",
+    "map_response",
+    "wrap",
+    "wrap_fn",
+    "use",
+    "Use",
+    "With",
+    "add_middleware",
+    "middleware",
+];
+
+fn attaches_middleware(call: &CallSite) -> bool {
+    MIDDLEWARE_CALLS.contains(&call.name.as_str())
+}
+
+/// Wraps whatever precedes it in the chain instead of taking a handler argument.
+fn decorates_handler(call: &CallSite) -> bool {
+    matches!(call.name.as_str(), "layer" | "route_layer" | "with_state")
+}
 
 fn known_routes(ctx: &Ctx) -> Vec<RouteRef> {
     ctx.nodes
@@ -535,17 +587,38 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                     }
                     Target::Sql => {
                         if let Some(facts) = call.string_args.iter().find_map(|a| sql::analyse(a)) {
-                            if rule.kind == RuleKind::Db {
-                                kind = if facts.is_write() {
-                                    EffectKind::DbWrite
-                                } else {
-                                    EffectKind::DbRead
-                                };
+                            if facts.transaction {
+                                kind = EffectKind::Lock;
+                            } else if rule.kind == RuleKind::Db {
+                                kind = facts.kind();
                             }
-                            let mut names = facts.writes.clone();
+                            let mut names: Vec<String> = facts.changed().cloned().collect();
                             names.extend(facts.reads.iter().cloned());
                             names.dedup();
-                            target = Some(names.join(","));
+                            if !names.is_empty() {
+                                target = Some(names.join(","));
+                            }
+                            if facts.locks
+                                && seen.insert((EffectKind::Lock, call.line, rule.id.clone()))
+                            {
+                                direct.push(Effect {
+                                    kind: EffectKind::Lock,
+                                    target: target.clone(),
+                                    via: call.callee.clone(),
+                                    line: call.line,
+                                    loop_depth: call.loop_depth,
+                                    awaited: call.awaited,
+                                    rule: rule.id.clone(),
+                                });
+                            }
+                            if !facts.assignments.is_empty() || !facts.conditions.is_empty() {
+                                ctx.sql_sites.push(SqlSite {
+                                    function: f,
+                                    line: call.line,
+                                    assignments: facts.assignments.clone(),
+                                    conditions: facts.conditions.clone(),
+                                });
+                            }
                             for t in &facts.reads {
                                 let table =
                                     ctx.synthetic(NodeKind::Table, format!("table:{t}"), t.clone());
@@ -558,7 +631,7 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                                     Confidence::Heuristic,
                                 );
                             }
-                            for t in &facts.writes {
+                            for t in facts.changed() {
                                 let table =
                                     ctx.synthetic(NodeKind::Table, format!("table:{t}"), t.clone());
                                 effect_edge(
