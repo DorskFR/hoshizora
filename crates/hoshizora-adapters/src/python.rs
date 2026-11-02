@@ -57,6 +57,9 @@ const SPEC: BodySpec = BodySpec {
     spawn: &[],
     call: call_info,
     expand: None,
+    idents: &["identifier"],
+    binders: &[("assignment", "left"), ("augmented_assignment", "left")],
+    mutable: &[],
 };
 
 fn string_arg(node: Node, source: &str) -> Option<String> {

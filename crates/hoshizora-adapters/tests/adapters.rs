@@ -1055,3 +1055,84 @@ fn go_domains_and_discriminations() {
     assert_eq!(s.handled, vec!["Active", "Paused", "done"]);
     assert_eq!(s.default, DefaultKind::Throws);
 }
+
+#[test]
+fn rust_call_data_flow() {
+    let src = r#"
+impl Repo {
+    async fn album_list(&self, kind: &Kind) -> Result<Vec<Row>> {
+        let (sql, args) = album_page_sql(kind);
+        let ids = args.fetch_ids(&self.pool, &sql).await?;
+        let v: Vec<Id> = ids.into_iter().map(|i| wrap(i)).collect();
+        sqlx::query_scalar("SELECT 1").bind(kind).fetch_optional(&mut *tx).await?;
+        self.albums(&v, Opts { ids }).await
+    }
+}
+"#;
+    let facts = RustAdapter.parse("src/a.rs", src, "crate").unwrap();
+    let f = sym(&facts, "Repo::album_list");
+    let sql = call(f, "album_page_sql");
+    assert_eq!(sql.binds, vec!["sql", "args"]);
+    assert_eq!(sql.uses, vec!["kind"]);
+    let fetch = call(f, "args.fetch_ids");
+    assert_eq!(fetch.binds, vec!["ids"]);
+    assert_eq!(fetch.uses, vec!["args", "self", "sql"]);
+    let collect = call(f, "collect");
+    assert_eq!(collect.binds, vec!["v"]);
+    assert!(
+        collect.uses.contains(&"ids".to_string()),
+        "{:?}",
+        collect.uses
+    );
+    let scalar = call(f, "sqlx::query_scalar");
+    assert!(scalar.binds.is_empty());
+    assert_eq!(scalar.uses, vec!["kind", "tx"]);
+    assert_eq!(scalar.mutates, vec!["tx"]);
+    let albums = call(f, "self.albums");
+    assert!(albums.binds.is_empty());
+    assert_eq!(albums.uses, vec!["self", "v", "ids"]);
+}
+
+#[test]
+fn typescript_call_data_flow() {
+    let src = r#"
+async function load(api: Api, id: string) {
+    const { rows, total } = await api.list(id);
+    let decor = await api.decor(rows.map((r) => r.id));
+    decor = await fetch(`/x/${total}`);
+    return decor;
+}
+"#;
+    let facts = TsAdapter(Flavor::TypeScript)
+        .parse("src/a.ts", src, "src/a")
+        .unwrap();
+    let f = sym(&facts, "load");
+    let list = call(f, "api.list");
+    assert_eq!(list.binds, vec!["rows", "total"]);
+    assert_eq!(list.uses, vec!["api", "id"]);
+    let decor = call(f, "api.decor");
+    assert_eq!(decor.binds, vec!["decor"]);
+    assert_eq!(decor.uses, vec!["api", "rows", "r"]);
+    let fetch = call(f, "fetch");
+    assert_eq!(fetch.binds, vec!["decor"]);
+    assert_eq!(fetch.uses, vec!["total"]);
+}
+
+#[test]
+fn python_and_go_call_data_flow() {
+    let py = "async def load(api, id):\n    rows = await api.list(id=id, key=K)\n    a, b = await api.decor(rows)\n    return a\n";
+    let facts = PythonAdapter.parse("a.py", py, "a").unwrap();
+    let f = sym(&facts, "load");
+    assert_eq!(call(f, "api.list").binds, vec!["rows"]);
+    assert_eq!(call(f, "api.list").uses, vec!["api", "id", "K"]);
+    assert_eq!(call(f, "api.decor").binds, vec!["a", "b"]);
+    assert_eq!(call(f, "api.decor").uses, vec!["api", "rows"]);
+
+    let go = "package a\nfunc load(c *Client, id string) {\n\trows, err := c.List(ctx, id)\n\tout = c.Decor(rows)\n}\n";
+    let facts = GoAdapter.parse("a.go", go, "a").unwrap();
+    let f = sym(&facts, "load");
+    assert_eq!(call(f, "c.List").binds, vec!["rows", "err"]);
+    assert_eq!(call(f, "c.List").uses, vec!["c", "ctx", "id"]);
+    assert_eq!(call(f, "c.Decor").binds, vec!["out"]);
+    assert_eq!(call(f, "c.Decor").uses, vec!["c", "rows"]);
+}

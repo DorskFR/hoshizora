@@ -66,6 +66,18 @@ const SPEC: BodySpec = BodySpec {
     spawn: &[],
     call: call_info,
     expand: None,
+    idents: &[
+        "identifier",
+        "this",
+        "shorthand_property_identifier",
+        "shorthand_property_identifier_pattern",
+    ],
+    binders: &[
+        ("variable_declarator", "name"),
+        ("assignment_expression", "left"),
+        ("augmented_assignment_expression", "left"),
+    ],
+    mutable: &[],
 };
 
 fn string_arg(node: Node, source: &str) -> Option<String> {

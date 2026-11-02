@@ -179,4 +179,15 @@ pub struct CallSite {
     pub conditional: bool,
     /// The call is made inside a closure/lambda passed somewhere (spawned work, callbacks).
     pub in_closure: bool,
+    /// Names bound by the statement the call belongs to: `let (a, b) = …`, `const {x} = …`,
+    /// `x = …`, `a, err := …`.
+    #[serde(default)]
+    pub binds: Vec<String>,
+    /// Identifiers the whole expression chain around the call reads: receiver, arguments,
+    /// captured closure variables, struct literal fields, format arguments.
+    #[serde(default)]
+    pub uses: Vec<String>,
+    /// Subset of `uses` passed as a mutable borrow (`&mut tx`).
+    #[serde(default)]
+    pub mutates: Vec<String>,
 }

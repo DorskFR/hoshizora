@@ -88,7 +88,7 @@ pub fn runtime_insights(
             } => {
                 let out = Insight::Inefficient {
                     node: node.clone(),
-                    self_p95_nanos: self_p95.get(node).copied().unwrap_or(0),
+                    self_p95_nanos: self_p95.get(node).copied(),
                     complexity: complexity.clone(),
                     reasons: reasons.clone(),
                 };
@@ -144,7 +144,7 @@ pub fn runtime_insights(
             reasons.extend(function.complexity.basis.iter().cloned());
             strong.push(Insight::Inefficient {
                 node: node.clone(),
-                self_p95_nanos: *p95,
+                self_p95_nanos: Some(*p95),
                 complexity: function.complexity.time.clone(),
                 reasons,
             });
@@ -408,6 +408,7 @@ mod tests {
             },
             fan_in: 0,
             fan_out: 0,
+            flows: vec![],
         }
     }
 
@@ -778,7 +779,7 @@ mod tests {
                 },
             ] => {
                 assert_eq!(node, "fn:a.rs#heavy");
-                assert_eq!(*self_p95_nanos, 50 * MS);
+                assert_eq!(*self_p95_nanos, Some(50 * MS));
                 assert_eq!(complexity, "O(n^2)");
                 assert!(reasons.iter().any(|r| r.contains("cyclomatic 15")));
             }
@@ -801,7 +802,7 @@ mod tests {
 
         let static_ineff = Insight::Inefficient {
             node: "fn:a.rs#heavy".into(),
-            self_p95_nanos: 0,
+            self_p95_nanos: None,
             complexity: "O(n^2)".into(),
             reasons: vec!["nested loops (depth 2)".into()],
         };
@@ -814,7 +815,7 @@ mod tests {
             ineff,
             vec![&Insight::Inefficient {
                 node: "fn:a.rs#heavy".into(),
-                self_p95_nanos: 50 * MS,
+                self_p95_nanos: Some(50 * MS),
                 complexity: "O(n^2)".into(),
                 reasons: vec!["nested loops (depth 2)".into()],
             }],

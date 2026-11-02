@@ -11,6 +11,7 @@ use hoshizora_model::{
     CallSite, Confidence, Edge, EdgeKind, FileFacts, Language, NodeKind, SymbolKind,
 };
 
+use super::analysis::is_test_file;
 use super::packages::{self, normalise};
 use super::{Ctx, FileScope, ImportTarget, effects};
 
@@ -389,7 +390,7 @@ pub(crate) fn calls(ctx: &mut Ctx) {
         let spawned = spawned_calls(ctx, f, &body.calls);
         let from = ctx.fns[f].node;
         for (ci, call) in body.calls.iter().enumerate() {
-            let targets = resolve_call(ctx, f, call);
+            let (targets, receiver_type) = resolve_call_typed(ctx, f, call);
             let kind = if spawned[ci] {
                 EdgeKind::Spawns
             } else {
@@ -413,6 +414,9 @@ pub(crate) fn calls(ctx: &mut Ctx) {
                 edge.awaited = call.awaited;
                 if let Some(receiver) = &call.receiver {
                     edge.attrs.insert("receiver".into(), receiver.clone());
+                }
+                if let Some(ty) = &receiver_type {
+                    edge.attrs.insert("receiver_type".into(), ty.clone());
                 }
                 if candidates > 1 {
                     edge.attrs
@@ -548,6 +552,82 @@ fn is_self(segment: &str) -> bool {
 }
 
 pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usize, Confidence)> {
+    resolve_call_typed(ctx, f, call).0
+}
+
+/// Receiver the adapter could not name: the result of a chained expression.
+const EXPR_RECEIVER: &str = "<expr>";
+
+/// Whether a call edge carries evidence for its target beyond a bare name: an exact
+/// resolution, or a method call whose receiver type is known (`self`, a parameter, a field
+/// chain), and no competing candidates.
+pub(crate) fn trusted_call(edge: &Edge) -> bool {
+    if edge.attrs.contains_key("candidates") {
+        return false;
+    }
+    match edge.confidence {
+        Confidence::Exact => true,
+        Confidence::Name => match edge.attrs.get("receiver") {
+            None => true,
+            Some(r) => is_self(r) || edge.attrs.contains_key("receiver_type"),
+        },
+        _ => false,
+    }
+}
+
+/// A trusted call, or a single-candidate name match on a free function, a field chain, or a
+/// binding named after the target's type (`scheduler.start()` → `Scheduler::start`). Method
+/// calls on other bindings or on an unnamed expression result are left out: `m.start()` and
+/// `caps.get(0).unwrap().start()` are regex methods, not the project's `start`.
+pub(crate) fn plausible_call(edge: &Edge) -> bool {
+    if trusted_call(edge) {
+        return true;
+    }
+    if edge.confidence != Confidence::Name || edge.attrs.contains_key("candidates") {
+        return false;
+    }
+    match edge.attrs.get("receiver") {
+        None => true,
+        Some(r) if r == EXPR_RECEIVER => false,
+        Some(r) => r.contains('.') || receiver_names_type(r, &edge.to),
+    }
+}
+
+/// `scheduler` ↔ `Scheduler::start`, `repository` ↔ `MatchingRepository::find`.
+fn receiver_names_type(receiver: &str, target: &str) -> bool {
+    let Some(symbol) = target.rsplit('#').next() else {
+        return false;
+    };
+    let Some((ty, _)) = symbol.rsplit_once("::").or_else(|| symbol.rsplit_once('.')) else {
+        return false;
+    };
+    let ty = ty.to_ascii_lowercase();
+    let receiver: String = receiver
+        .chars()
+        .filter(|c| *c != '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    receiver.len() >= 3 && (ty.ends_with(&receiver) || receiver.ends_with(&ty))
+}
+
+/// Targets of a call plus the type (or imported module) the receiver was resolved through,
+/// when one was known.
+pub(crate) fn resolve_call_typed(
+    ctx: &mut Ctx,
+    f: usize,
+    call: &CallSite,
+) -> (Vec<(usize, Confidence)>, Option<String>) {
+    let mut receiver_type = None;
+    let targets = resolve_targets(ctx, f, call, &mut receiver_type);
+    (targets, receiver_type)
+}
+
+fn resolve_targets(
+    ctx: &mut Ctx,
+    f: usize,
+    call: &CallSite,
+    receiver_type: &mut Option<String>,
+) -> Vec<(usize, Confidence)> {
     if call.callee.ends_with('!') || call.name.ends_with('!') {
         return Vec::new();
     }
@@ -617,10 +697,12 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
 
     // `this.field.method()` / `param.field.method()` through the field's declared type.
     if let Some(receiver) = &call.receiver
-        && let Some((base, field)) = receiver.rsplit_once('.')
-        && !base.contains('.')
+        && receiver.contains('.')
     {
-        let types = field_types(ctx, f, base, field);
+        let types = field_types(ctx, f, receiver);
+        if !types.is_empty() {
+            *receiver_type = Some(types.join(","));
+        }
         let mut cands: Vec<usize> = types
             .iter()
             .filter_map(|ty| type_methods(ctx, ty, &name))
@@ -649,6 +731,7 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
             && (is_self(&segments[0]) || segments[0] == parent_name))
             || call.receiver.as_deref().is_some_and(is_self);
         if on_self {
+            *receiver_type = Some(parent_name.clone());
             let cands = in_file(ctx, scope.file, &[parent_name.clone(), name.clone()], "\0");
             if !cands.is_empty() {
                 return limited(ctx, &scope, cands, Confidence::Exact, false);
@@ -666,6 +749,7 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
         && let Some(ty) = param.ty.as_deref().map(type_short_name)
         && let Some(cands) = type_methods(ctx, &ty, &name)
     {
+        *receiver_type = Some(ty);
         let confidence = if cands.len() == 1 {
             Confidence::Exact
         } else {
@@ -686,11 +770,18 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
         if ctx.type_by_name.contains_key(qualifier)
             && let Some(cands) = type_methods(ctx, qualifier, &name)
         {
+            *receiver_type = Some(qualifier.clone());
             return limited(ctx, &scope, cands, Confidence::Name, true);
         }
         if is_type_name(qualifier) {
             return Vec::new();
         }
+    }
+
+    if let Some(r) = &call.receiver
+        && ctx.scopes[fi].bindings.contains_key(r)
+    {
+        *receiver_type = Some(r.clone());
     }
 
     let elsewhere = call.receiver.as_deref().is_some_and(|r| !is_self(r))
@@ -700,13 +791,22 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
             && !ctx.scopes[fi].bindings.contains_key(r)
             && !(language == Language::Go && ctx.package_names.contains_key(r))
     });
+    let bare = call.receiver.is_none() && segments.len() == 1;
+    let from_test = is_test_file(&ctx.files[fi].path);
     let not_caller = |cands: Vec<usize>| -> Vec<usize> {
         cands
             .into_iter()
             .filter(|&c| !(elsewhere && c == f))
             .filter(|&c| !on_value || ctx.symbol(c).kind == SymbolKind::Method)
+            .filter(|&c| !bare || ctx.symbol(c).kind != SymbolKind::Method)
+            .filter(|&c| from_test || !is_test_file(&ctx.files[ctx.fns[c].file].path))
             .collect()
     };
+
+    let generic = ctx.packs.ignores_method(language, &name);
+    if generic && call.receiver.as_deref().is_some_and(|r| !is_self(r)) {
+        return Vec::new();
+    }
 
     if let Some(cands) = ctx.fn_by_file_name[fi].get(&name).cloned().map(not_caller)
         && !cands.is_empty()
@@ -715,7 +815,7 @@ pub(crate) fn resolve_call(ctx: &mut Ctx, f: usize, call: &CallSite) -> Vec<(usi
         return limited(ctx, &scope, cands, Confidence::Name, false);
     }
 
-    if (is_method || segments.len() == 1) && ctx.packs.ignores_method(language, &name) {
+    if (is_method || segments.len() == 1) && generic {
         return Vec::new();
     }
 
@@ -823,12 +923,15 @@ fn module_path_call(ctx: &Ctx, fi: usize, segments: &[String], name: &str) -> Op
     (!cands.is_empty()).then_some(cands)
 }
 
-/// Methods named `name` on the type of `base.field`, where `base` is `self`/`this` or a typed
-/// parameter and the field's type is declared or inferred from its initialiser.
-/// Short type names declared for `base.field`, where `base` is `self` or a typed parameter.
-fn field_types(ctx: &Ctx, f: usize, base: &str, field: &str) -> Vec<String> {
+/// Short type names declared for a field chain `base.field[.field…]`, where `base` is `self`
+/// or a typed parameter and each field's type is declared or inferred from its initialiser.
+fn field_types(ctx: &Ctx, f: usize, receiver: &str) -> Vec<String> {
     let fi = ctx.fns[f].file;
-    let base_types: Vec<usize> = if is_self(base) {
+    let mut segments = receiver.split('.');
+    let Some(base) = segments.next() else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<usize> = if is_self(base) {
         ctx.fns[f].parent_type.into_iter().collect()
     } else {
         let Some(ty) = ctx
@@ -843,11 +946,16 @@ fn field_types(ctx: &Ctx, f: usize, base: &str, field: &str) -> Vec<String> {
         };
         types_named(ctx, fi, &ty)
     };
-    base_types
-        .into_iter()
-        .filter_map(|t| ctx.type_fields.get(&t).and_then(|m| m.get(field)))
-        .map(|ty| type_short_name(ty.strip_suffix("()").unwrap_or(ty)))
-        .collect()
+    let mut names: Vec<String> = Vec::new();
+    for field in segments {
+        names = nodes
+            .iter()
+            .filter_map(|t| ctx.type_fields.get(t).and_then(|m| m.get(field)))
+            .map(|ty| type_short_name(ty.strip_suffix("()").unwrap_or(ty)))
+            .collect();
+        nodes = names.iter().flat_map(|n| types_named(ctx, fi, n)).collect();
+    }
+    names
 }
 
 /// Type nodes a name refers to from `fi`: through an import, in the file, else by name

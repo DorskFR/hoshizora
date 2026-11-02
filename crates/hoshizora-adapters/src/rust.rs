@@ -39,6 +39,13 @@ const SPEC: BodySpec = BodySpec {
     spawn: &[],
     call: call_info,
     expand: Some(expand_macro),
+    idents: &["identifier", "self", "shorthand_field_identifier"],
+    binders: &[
+        ("let_declaration", "pattern"),
+        ("assignment_expression", "left"),
+        ("compound_assignment_expr", "left"),
+    ],
+    mutable: &["mutable_specifier"],
 };
 
 /// Re-parses a macro's token tree as Rust expressions so calls inside `join!`, `select!`,
@@ -221,6 +228,9 @@ fn message_sites(body: Node, source: &str) -> Vec<CallSite> {
         awaited: false,
         conditional: false,
         in_closure: false,
+        binds: vec![],
+        uses: vec![],
+        mutates: vec![],
     };
     while let Some(node) = pending.pop() {
         match node.kind() {

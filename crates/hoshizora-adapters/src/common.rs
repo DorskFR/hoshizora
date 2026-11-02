@@ -4,6 +4,7 @@ use hoshizora_model::{
     Body, CallSite, DefaultKind, Discrimination, Span, Symbol, SymbolKind, Visibility,
 };
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Node, Parser, Tree};
 
@@ -178,6 +179,128 @@ pub struct BodySpec<'a> {
     pub call: fn(Node, &str) -> Option<CallInfo>,
     /// Calls hidden inside a node tree-sitter does not parse (Rust macro token trees).
     pub expand: Option<fn(Node, &str) -> Vec<CallSite>>,
+    /// Leaf kinds that name a variable (`identifier`, `self`, shorthand struct fields).
+    pub idents: &'a [&'a str],
+    /// Statements that bind names, with the field holding the pattern or target.
+    pub binders: &'a [(&'a str, &'a str)],
+    /// Child kinds marking a mutable borrow of the identifiers beside them (`&mut x`).
+    pub mutable: &'a [&'a str],
+}
+
+/// Fields whose identifier child names a member, callee or keyword rather than a variable.
+const MEMBER_FIELDS: &[&str] = &[
+    "field",
+    "property",
+    "attribute",
+    "name",
+    "function",
+    "macro",
+];
+
+/// Subtrees that spell a path or a type, never a variable.
+const PATH_KINDS: &[&str] = &[
+    "scoped_identifier",
+    "scoped_type_identifier",
+    "generic_type",
+    "type_arguments",
+    "qualified_type",
+];
+
+/// Outermost expression the call is part of: the chain of member accesses, calls, awaits
+/// and `?` it sits in.
+fn chain_top<'t>(node: Node<'t>, spec: &BodySpec) -> Node<'t> {
+    let mut cur = node;
+    while let Some(p) = cur.parent() {
+        if !spec.chain.contains(&p.kind()) && !spec.awaits.contains(&p.kind()) {
+            break;
+        }
+        cur = p;
+    }
+    cur
+}
+
+fn idents(node: Node, source: &str, spec: &BodySpec, out: &mut Vec<String>) {
+    if PATH_KINDS.contains(&node.kind()) {
+        return;
+    }
+    if spec.idents.contains(&node.kind()) {
+        let t = text(node, source);
+        if !out.iter().any(|o| o == t) {
+            out.push(t.to_owned());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let child = cursor.node();
+        let member = cursor
+            .field_name()
+            .is_some_and(|f| MEMBER_FIELDS.contains(&f))
+            && spec.idents.contains(&child.kind());
+        if !member {
+            idents(child, source, spec, out);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn mutated(node: Node, source: &str, spec: &BodySpec, out: &mut Vec<String>) {
+    if spec.mutable.is_empty() {
+        return;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+    if children.iter().any(|c| spec.mutable.contains(&c.kind())) {
+        idents(node, source, spec, out);
+        return;
+    }
+    for child in children {
+        mutated(child, source, spec, out);
+    }
+}
+
+/// Names bound by the statement enclosing `top`, if that statement is a binder.
+fn binds(top: Node, source: &str, spec: &BodySpec) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = top;
+    while let Some(p) = cur.parent() {
+        if spec.stop.contains(&p.kind()) {
+            break;
+        }
+        if let Some((_, field)) = spec.binders.iter().find(|(k, _)| *k == p.kind()) {
+            if let Some(target) = p.child_by_field_name(field)
+                && target.id() != cur.id()
+            {
+                idents(target, source, spec, &mut out);
+            }
+            break;
+        }
+        cur = p;
+    }
+    out
+}
+
+struct DataFlow {
+    binds: Vec<String>,
+    uses: Vec<String>,
+    mutates: Vec<String>,
+}
+
+fn data_flow(top: Node, source: &str, spec: &BodySpec) -> DataFlow {
+    let mut uses = Vec::new();
+    idents(top, source, spec, &mut uses);
+    let mut mutates = Vec::new();
+    mutated(top, source, spec, &mut mutates);
+    DataFlow {
+        binds: binds(top, source, spec),
+        uses,
+        mutates,
+    }
 }
 
 const NOT_A_FUNCTION: &[&str] = &[
@@ -232,17 +355,13 @@ pub fn analyze_nodes_with(
         cyclomatic: 1,
         ..Body::default()
     };
-    let last_stmt = nodes.last().map(|n| n.id());
+    let mut scope = Scope {
+        last_stmt: nodes.last().map(|n| n.id()),
+        is_ref,
+        flows: HashMap::new(),
+    };
     for child in nodes {
-        walk(
-            *child,
-            source,
-            spec,
-            State::default(),
-            &mut out,
-            last_stmt,
-            is_ref,
-        );
+        walk(*child, source, spec, State::default(), &mut out, &mut scope);
     }
     out.cyclomatic = 1 + out.branches + out.loops;
     out.calls.sort_by_key(|c| c.line);
@@ -292,14 +411,21 @@ pub fn merge_module_symbol(symbols: &mut Vec<Symbol>, extra: Symbol) {
     }
 }
 
+/// Per-body walk state: the final statement (whose exit is not early), the reference
+/// filter, and data flow cached per expression chain.
+struct Scope<'a> {
+    last_stmt: Option<usize>,
+    is_ref: &'a dyn Fn(&str) -> bool,
+    flows: HashMap<usize, DataFlow>,
+}
+
 fn walk(
     node: Node,
     source: &str,
     spec: &BodySpec,
     mut st: State,
     out: &mut Body,
-    last_stmt: Option<usize>,
-    is_ref: &dyn Fn(&str) -> bool,
+    scope: &mut Scope,
 ) {
     let kind = node.kind();
     if spec.stop.contains(&kind) {
@@ -329,7 +455,7 @@ fn walk(
             out.branches += 1;
         }
     }
-    if spec.early_exits.contains(&kind) && Some(node.id()) != last_stmt {
+    if spec.early_exits.contains(&kind) && Some(node.id()) != scope.last_stmt {
         out.early_exits += 1;
     }
     if spec.spawn.contains(&kind) {
@@ -345,25 +471,30 @@ fn walk(
             .child_by_field_name("arguments")
             .or_else(|| child_of_kind(node, "token_tree"))
             .unwrap_or(node);
-        out.calls.push(site(
-            callee,
-            info.receiver,
-            info.string_args,
-            at,
-            awaited,
-            st,
-        ));
+        let top = chain_top(node, spec);
+        let flow = scope
+            .flows
+            .entry(top.id())
+            .or_insert_with(|| data_flow(top, source, spec));
+        let mut call = site(callee, info.receiver, info.string_args, at, awaited, st);
+        call.binds = flow.binds.clone();
+        call.uses = flow.uses.clone();
+        call.mutates = flow.mutates.clone();
+        out.calls.push(call);
         if let Some(expand) = spec.expand {
             for mut c in expand(node, source) {
                 c.loop_depth += st.loop_depth;
                 c.conditional |= st.conditional;
                 c.in_closure |= st.in_closure;
                 c.awaited |= awaited;
+                c.binds = flow.binds.clone();
+                c.uses = flow.uses.clone();
+                c.mutates = flow.mutates.clone();
                 out.calls.push(c);
             }
         }
         if let Some(args) = node.child_by_field_name("arguments") {
-            emit_refs(&named_children(args), source, spec, st, out, is_ref);
+            emit_refs(&named_children(args), source, spec, st, out, scope.is_ref);
         }
     }
     if spec.ref_containers.contains(&kind) {
@@ -371,7 +502,7 @@ fn walk(
             Some(v) => vec![v],
             None => named_children(node),
         };
-        emit_refs(&elements, source, spec, st, out, is_ref);
+        emit_refs(&elements, source, spec, st, out, scope.is_ref);
     }
     let is_cond = spec.conditionals.contains(&kind);
     let guard = node.child_by_field_name("condition").map(|n| n.id());
@@ -380,7 +511,7 @@ fn walk(
         if is_cond && guard != Some(child.id()) {
             cst.conditional = true;
         }
-        walk(child, source, spec, cst, out, last_stmt, is_ref);
+        walk(child, source, spec, cst, out, scope);
     }
 }
 
@@ -418,6 +549,9 @@ fn site(
         awaited,
         conditional: st.conditional,
         in_closure: st.in_closure,
+        binds: vec![],
+        uses: vec![],
+        mutates: vec![],
     }
 }
 

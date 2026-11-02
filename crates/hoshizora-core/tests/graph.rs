@@ -22,6 +22,9 @@ fn call(callee: &str, line: u32) -> CallSite {
         awaited: false,
         conditional: false,
         in_closure: false,
+        binds: vec![],
+        uses: vec![],
+        mutates: vec![],
     }
 }
 

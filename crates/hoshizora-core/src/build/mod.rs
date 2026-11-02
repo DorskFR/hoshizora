@@ -1,15 +1,15 @@
 pub(crate) mod analysis;
 mod effects;
 mod packages;
-mod resolve;
+pub(crate) mod resolve;
 mod states;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use hoshizora_model::{
-    Confidence, Edge, EdgeKind, Effects, FileFacts, FunctionInfo, GRAPH_VERSION, Graph, GraphMeta,
-    Language, Node, NodeId, NodeKind, Span, Symbol, SymbolKind,
+    CallSite, Confidence, Edge, EdgeKind, Effects, FileFacts, Flow, FunctionInfo, GRAPH_VERSION,
+    Graph, GraphMeta, Language, Node, NodeId, NodeKind, Span, Symbol, SymbolKind,
 };
 
 use crate::packs::Packs;
@@ -344,6 +344,7 @@ fn build_files_and_symbols(ctx: &mut Ctx) {
                     },
                     fan_in: 0,
                     fan_out: 0,
+                    flows: flows(&body.calls),
                 }),
                 effects: Effects::default(),
                 entrypoint: None,
@@ -426,6 +427,84 @@ pub(crate) fn qualified(file: &FileFacts, local_name: &str) -> String {
     format!("{}{sep}{local_name}", file.module)
 }
 
-pub(crate) fn span_lines(span: Span) -> u32 {
+pub(crate) fn flows(calls: &[CallSite]) -> Vec<Flow> {
+    let mut out: Vec<Flow> = Vec::new();
+    let mut awaited_lines: HashSet<u32> = HashSet::new();
+    for c in calls {
+        let barrier = is_barrier(c);
+        if !(c.awaited || barrier || !c.binds.is_empty() || !c.mutates.is_empty()) {
+            continue;
+        }
+        if c.awaited {
+            awaited_lines.insert(c.line);
+        }
+        let flow = match out.iter_mut().find(|f| f.line == c.line) {
+            Some(f) => f,
+            None => {
+                out.push(Flow {
+                    line: c.line,
+                    ..Flow::default()
+                });
+                out.last_mut().expect("just pushed")
+            }
+        };
+        flow.conditional |= c.conditional;
+        flow.barrier |= barrier;
+        for (into, from) in [
+            (&mut flow.binds, &c.binds),
+            (&mut flow.uses, &c.uses),
+            (&mut flow.mutates, &c.mutates),
+        ] {
+            for name in from {
+                if !into.contains(name) {
+                    into.push(name.clone());
+                }
+            }
+        }
+    }
+    for f in &mut out {
+        if !awaited_lines.contains(&f.line) {
+            f.uses.clear();
+        }
+    }
+    out.sort_by_key(|f| f.line);
+    out
+}
+
+fn is_barrier(call: &CallSite) -> bool {
+    let name = call.name.as_str();
+    matches!(
+        name,
+        "commit"
+            | "rollback"
+            | "begin"
+            | "begin_transaction"
+            | "start_transaction"
+            | "transaction"
+            | "savepoint"
+            | "lock"
+            | "acquire"
+            | "release"
+            | "send"
+            | "flush"
+            | "sync"
+            | "sync_all"
+            | "shutdown"
+            | "close"
+    ) || name.starts_with("lock_")
+        || name.ends_with("_lock")
+        || name.ends_with("Transaction")
+        || name.ends_with("Lock")
+        || call.string_args.iter().any(|a| {
+            a.split_whitespace().next().is_some_and(|t| {
+                matches!(
+                    t.to_ascii_uppercase().as_str(),
+                    "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "END" | "LOCK"
+                )
+            })
+        })
+}
+
+fn span_lines(span: Span) -> u32 {
     span.end_line.saturating_sub(span.start_line) + 1
 }

@@ -96,10 +96,12 @@ pub struct NodeStats {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Insight {
-    /// High self time per call on a node with high static complexity.
+    /// High self time per call on a node with high static complexity. `self_p95_nanos` is
+    /// `None` until runtime spans cover the node.
     Inefficient {
         node: NodeId,
-        self_p95_nanos: u64,
+        #[serde(default)]
+        self_p95_nanos: Option<u64>,
         complexity: String,
         reasons: Vec<String>,
     },

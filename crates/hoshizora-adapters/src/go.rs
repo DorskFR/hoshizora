@@ -47,6 +47,13 @@ const SPEC: BodySpec = BodySpec {
     spawn: &["go_statement"],
     call: call_info,
     expand: None,
+    idents: &["identifier"],
+    binders: &[
+        ("short_var_declaration", "left"),
+        ("assignment_statement", "left"),
+        ("var_spec", "name"),
+    ],
+    mutable: &[],
 };
 
 fn string_arg(node: Node, source: &str) -> Option<String> {

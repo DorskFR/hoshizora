@@ -7,6 +7,7 @@ use hoshizora_model::{
 };
 
 use super::Ctx;
+use super::resolve::{plausible_call, trusted_call};
 
 /// Edge kinds along which control and effects flow.
 pub const FLOW_KINDS: &[EdgeKind] = &[
@@ -37,7 +38,7 @@ pub fn effect_bit(kind: EffectKind) -> u16 {
     1 << ALL_EFFECTS.iter().position(|k| *k == kind).unwrap_or(0)
 }
 
-fn is_test_file(path: &str) -> bool {
+pub(crate) fn is_test_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.starts_with("test_")
         || name.ends_with("_test.py")
@@ -154,6 +155,7 @@ fn is_export_file(language: Language, path: &str, in_lib_crate: bool) -> bool {
 struct CallInfo {
     target: usize,
     loop_depth: u32,
+    trusted: bool,
 }
 
 const SORT_NAMES: &[&str] = &[
@@ -227,6 +229,7 @@ pub(crate) fn complexity(ctx: &mut Ctx) {
         out[ff].push(CallInfo {
             target: tf,
             loop_depth: e.loop_depth,
+            trusted: trusted_call(e),
         });
         fan_out[ff].insert(tf);
         fan_in[tf].insert(ff);
@@ -253,7 +256,8 @@ pub(crate) fn complexity(ctx: &mut Ctx) {
 }
 
 /// Polynomial exponent of a function's running time, with an `exponential` flag for branching
-/// recursion. Cycles other than direct self-calls contribute nothing (treated as unknown).
+/// recursion. Only calls inside a loop, through a trusted edge, add their callee's exponent;
+/// cycles other than direct self-calls contribute nothing (treated as unknown).
 fn exponent(
     ctx: &Ctx,
     f: usize,
@@ -274,7 +278,7 @@ fn exponent(
     let mut exponential = false;
 
     for call in &out[f] {
-        if call.target == f {
+        if call.target == f || call.loop_depth == 0 || !call.trusted {
             continue;
         }
         let (k, e) = exponent(ctx, call.target, out, memo, on_stack);
@@ -337,7 +341,7 @@ fn describe(
         if call.target == f {
             continue;
         }
-        if call.loop_depth > 0 && noted.insert(call.target) {
+        if call.loop_depth > 0 && call.trusted && noted.insert(call.target) {
             let (k, _) = memo[call.target].unwrap_or((0, false));
             if k > 0 {
                 basis.push(format!(
@@ -466,7 +470,12 @@ pub(crate) fn transitive(ctx: &mut Ctx) {
         | effect_bit(EffectKind::Join);
     let mut callers: Vec<Vec<(usize, EdgeKind)>> = vec![Vec::new(); n];
     for (e, &(from, to)) in ctx.edges.iter().zip(&ctx.edge_ends) {
-        if FLOW_KINDS.contains(&e.kind) && !e.attrs.contains_key("candidates") {
+        let trusted = if matches!(e.kind, EdgeKind::Calls | EdgeKind::Spawns) {
+            plausible_call(e)
+        } else {
+            !e.attrs.contains_key("candidates")
+        };
+        if FLOW_KINDS.contains(&e.kind) && trusted {
             callers[to].push((from, e.kind));
         }
     }
