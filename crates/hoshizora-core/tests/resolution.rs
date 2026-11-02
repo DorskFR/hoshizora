@@ -579,3 +579,96 @@ fn middleware_after_the_last_registration_is_not_a_handler() {
         );
     }
 }
+
+/// `next.run(req)` on a parameter of an external type is a method call: it must not bind to
+/// a free `run` by name. Calls through an imported module namespace still do.
+#[test]
+fn value_receivers_do_not_bind_free_functions_by_name() {
+    let idx = build(vec![
+        file(
+            "api/src/main.rs",
+            Language::Rust,
+            "api/src/main",
+            vec![],
+            vec![func("run", 1, vec![])],
+        ),
+        file(
+            "api/src/telemetry.rs",
+            Language::Rust,
+            "api/src/telemetry",
+            vec![],
+            vec![with_params(
+                func(
+                    "http_server_span",
+                    1,
+                    vec![recv(call("next.run", 3), "next")],
+                ),
+                &[("req", "Request"), ("next", "Next")],
+            )],
+        ),
+        file(
+            "web/src/api.ts",
+            Language::TypeScript,
+            "web/src/api",
+            vec![],
+            vec![func("load", 1, vec![])],
+        ),
+        file(
+            "web/src/page.ts",
+            Language::TypeScript,
+            "web/src/page",
+            vec![Import {
+                alias: Some("api".into()),
+                ..import("./api", &[])
+            }],
+            vec![func("render", 1, vec![recv(call("api.load", 2), "api")])],
+        ),
+        file(
+            "svc/util.py",
+            Language::Python,
+            "svc/util",
+            vec![],
+            vec![func("f", 1, vec![])],
+        ),
+        file(
+            "svc/main.py",
+            Language::Python,
+            "svc/main",
+            vec![import("util", &[])],
+            vec![func("main", 1, vec![recv(call("util.f", 2), "util")])],
+        ),
+        file(
+            "cmd/pkg/pkg.go",
+            Language::Go,
+            "cmd/pkg",
+            vec![],
+            vec![func("F", 1, vec![])],
+        ),
+        file(
+            "cmd/main.go",
+            Language::Go,
+            "cmd",
+            vec![import("example.com/cmd/pkg", &[])],
+            vec![func("main", 1, vec![recv(call("pkg.F", 2), "pkg")])],
+        ),
+    ]);
+    assert!(
+        edge(
+            &idx,
+            "fn:api/src/telemetry.rs#http_server_span",
+            "fn:api/src/main.rs#run"
+        )
+        .is_none(),
+        "next.run() does not bind the free fn run"
+    );
+    for (from, to) in [
+        ("fn:web/src/page.ts#render", "fn:web/src/api.ts#load"),
+        ("fn:svc/main.py#main", "fn:svc/util.py#f"),
+        ("fn:cmd/main.go#main", "fn:cmd/pkg/pkg.go#F"),
+    ] {
+        assert!(
+            edge(&idx, from, to).is_some_and(|e| e.kind == EdgeKind::Calls),
+            "{from} still calls {to} through the module namespace"
+        );
+    }
+}
