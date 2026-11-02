@@ -9,7 +9,10 @@ import type {
   NodeDetail,
   NodeStats,
   Project,
+  Purged,
+  PurgeReport,
   SearchHit,
+  Storage,
   Story,
   Subgraph,
   TraceSummary,
@@ -38,6 +41,11 @@ export interface ProjectsApi {
   add(body: AddProject): Promise<Project>;
   reindex(id: string): Promise<Project>;
   remove(id: string): Promise<void>;
+  /** Deletes the clone, keeps the project and its graph; reindex clones again. */
+  purge(id: string): Promise<Purged>;
+  purgeAll(): Promise<PurgeReport>;
+  /** `null` when the server predates `/api/storage`. */
+  storage(): Promise<Storage | null>;
   backend(id: string | null): Backend;
 }
 
@@ -156,6 +164,20 @@ export class HttpProjects implements ProjectsApi {
   }
   remove(id: string) {
     return request<void>(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+  purge(id: string) {
+    return request<Purged>(`/api/projects/${encodeURIComponent(id)}/purge`, { method: "POST" });
+  }
+  purgeAll() {
+    return request<PurgeReport>("/api/purge", { method: "POST" });
+  }
+  async storage() {
+    try {
+      return await request<Storage>("/api/storage");
+    } catch (err) {
+      if (err instanceof HttpError && (err.status === 404 || err.status === 405)) return null;
+      throw err;
+    }
   }
   backend(id: string | null) {
     return new HttpBackend(apiBase(id));

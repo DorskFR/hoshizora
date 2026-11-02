@@ -16,7 +16,8 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use futures::Stream;
 use hoshizora_model::api::{
-    AddProject, Insights, NodeDetail, Project, ProjectStatus, Source, StatesReport,
+    AddProject, Insights, NodeDetail, Project, ProjectStatus, PurgeReport, Purged, Source,
+    StatesReport, Storage,
 };
 use hoshizora_model::{EdgeKind, Graph, Insight, LiveEvent, Node, NodeStats, RuntimeSpan};
 use hoshizora_runtime::route::{ProjectCandidate, project_for_span};
@@ -120,6 +121,9 @@ pub fn router<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) -> Router {
             "/api/projects/{project}/reindex",
             post(reindex_project::<Q>),
         )
+        .route("/api/projects/{project}/purge", post(purge_project::<Q>))
+        .route("/api/purge", post(purge_all::<Q>))
+        .route("/api/storage", get(storage::<Q>))
         .layer(CompressionLayer::new());
     Router::new()
         .merge(api)
@@ -207,6 +211,22 @@ impl AppError {
             project_status: Some(status),
         }
     }
+
+    pub fn gone(msg: impl ToString) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            message: msg.to_string(),
+            project_status: None,
+        }
+    }
+
+    pub fn internal(msg: impl ToString) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.to_string(),
+            project_status: None,
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -262,6 +282,35 @@ async fn reindex_project<Q: GraphQueries>(
 ) -> Result<(StatusCode, Json<Project>), AppError> {
     let id = path_param(&params, "project")?;
     state.reindex(&id).map(|p| (StatusCode::ACCEPTED, Json(p)))
+}
+
+async fn purge_project<Q: GraphQueries + 'static>(
+    State(state): State<Arc<AppState<Q>>>,
+    params: RawPathParams,
+) -> Result<Json<Purged>, AppError> {
+    let id = path_param(&params, "project")?;
+    tokio::task::spawn_blocking(move || state.purge(&id))
+        .await
+        .map_err(|e| AppError::internal(format!("purge task panicked: {e}")))?
+        .map(Json)
+}
+
+async fn purge_all<Q: GraphQueries + 'static>(
+    State(state): State<Arc<AppState<Q>>>,
+) -> Result<Json<PurgeReport>, AppError> {
+    tokio::task::spawn_blocking(move || state.purge_all())
+        .await
+        .map(Json)
+        .map_err(|e| AppError::internal(format!("purge task panicked: {e}")))
+}
+
+async fn storage<Q: GraphQueries + 'static>(
+    State(state): State<Arc<AppState<Q>>>,
+) -> Result<Json<Storage>, AppError> {
+    tokio::task::spawn_blocking(move || state.storage())
+        .await
+        .map(Json)
+        .map_err(|e| AppError::internal(format!("storage task panicked: {e}")))
 }
 
 #[derive(Deserialize)]
@@ -370,8 +419,14 @@ async fn source<Q: GraphQueries>(
 ) -> Result<Json<Source>, AppError> {
     let start = p.start.unwrap_or(1).max(1);
     let end = p.end.unwrap_or(u32::MAX).max(start);
+    if !state.root.exists() {
+        return Err(AppError::gone(SOURCE_UNAVAILABLE));
+    }
     read_source(&state.root, &p.file, start, end).map(Json)
 }
+
+pub const SOURCE_UNAVAILABLE: &str =
+    "source not available: the project's checkout is missing (purged clone); reindex to restore it";
 
 /// Reads lines `start..=end` (1-based) of `file`, which must stay inside `root`.
 pub fn read_source(root: &Path, file: &str, start: u32, end: u32) -> Result<Source, AppError> {
@@ -1867,5 +1922,181 @@ mod tests {
         assert!(!app_state.repo_dir(&id).exists());
         assert!(!app_state.graph_path(&id).exists());
         assert!(app_state.list().is_empty());
+    }
+
+    async fn post_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let res = app
+            .clone()
+            .oneshot(Request::post(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn purges_clones_keeps_graphs_and_reindex_restores_them() {
+        let dir = temp_dir();
+        let work = dir.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "one"]);
+        let bare = dir.join("origin.git");
+        git(
+            &dir,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let local = dir.join("local");
+        std::fs::create_dir_all(local.join("src")).unwrap();
+        std::fs::write(local.join("src/lib.rs"), "pub fn gamma() {}\n").unwrap();
+
+        let indexer: crate::projects::Indexer =
+            Arc::new(|root: &Path| crate::build_graph(root, None));
+        let make_state = || {
+            AppState::<crate::queries::GraphIndex>::new(
+                dir.join("data"),
+                Arc::clone(&indexer),
+                RuntimeConfig::default(),
+                crate::git::GitOptions {
+                    allow_file_urls: true,
+                    timeout: Some(Duration::from_secs(60)),
+                    ..Default::default()
+                },
+            )
+        };
+        let app_state = make_state();
+        let app = router(Arc::clone(&app_state));
+        let git_id = app_state
+            .add_git(AddProject {
+                url: format!("file://{}", bare.display()),
+                r#ref: Some("main".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .id;
+        let path_id = app_state.add_path(&local, None).unwrap().id;
+        let wait = |s: &Arc<AppState<crate::queries::GraphIndex>>| {
+            let s = Arc::clone(s);
+            async move {
+                for _ in 0..400 {
+                    let all = s.list();
+                    if all
+                        .iter()
+                        .all(|p| matches!(p.status, ProjectStatus::Ready | ProjectStatus::Failed))
+                    {
+                        return all;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("never finished")
+            }
+        };
+        for p in wait(&app_state).await {
+            assert_eq!(p.status, ProjectStatus::Ready, "{:?}", p.error);
+        }
+        let repo = app_state.repo_dir(&git_id);
+        assert!(repo.join("src/lib.rs").exists());
+
+        let (status, storage) = get_json(&app, "/api/storage").await;
+        assert_eq!(status, StatusCode::OK, "{storage}");
+        let entry = |s: &serde_json::Value, id: &str| {
+            s["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let before = entry(&storage, &git_id);
+        assert!(before["clone_bytes"].as_u64().unwrap() > 0, "{storage}");
+        assert!(before["graph_bytes"].as_u64().unwrap() > 0);
+        assert!(entry(&storage, &path_id)["clone_bytes"].is_null());
+        assert_eq!(storage["clone_bytes"], before["clone_bytes"]);
+        assert!(storage["disk"]["total_bytes"].as_u64().unwrap() > 0);
+
+        let (status, body) = post_json(&app, &format!("/api/projects/{path_id}/purge")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(local.join("src/lib.rs").exists());
+
+        let (status, purged) = post_json(&app, &format!("/api/projects/{git_id}/purge")).await;
+        assert_eq!(status, StatusCode::OK, "{purged}");
+        assert_eq!(purged["id"], git_id);
+        assert_eq!(purged["freed_bytes"], before["clone_bytes"]);
+        assert!(!repo.exists());
+        let p = app_state.get(&git_id).unwrap();
+        assert_eq!(p.status, ProjectStatus::Ready);
+        assert!(p.nodes > 0);
+        let (status, hits) =
+            get_json(&app, &format!("/api/projects/{git_id}/search?q=alpha")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!hits.as_array().unwrap().is_empty());
+        let (status, err) = get_json(
+            &app,
+            &format!("/api/projects/{git_id}/source?file=src/lib.rs"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{err}");
+        assert_eq!(err["error"], SOURCE_UNAVAILABLE);
+        let (_, storage) = get_json(&app, "/api/storage").await;
+        assert!(entry(&storage, &git_id)["clone_bytes"].is_null());
+        assert_eq!(storage["clone_bytes"], 0);
+        let (status, again) = post_json(&app, &format!("/api/projects/{git_id}/purge")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["freed_bytes"], 0);
+
+        let restarted = make_state();
+        assert_eq!(restarted.restore().unwrap(), 2);
+        let restored = restarted.get(&git_id).unwrap();
+        assert_eq!(
+            restored.status,
+            ProjectStatus::Ready,
+            "{:?}",
+            restored.error
+        );
+        assert!(!repo.exists());
+
+        let (status, _) = post_json(&app, &format!("/api/projects/{git_id}/reindex")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        for p in wait(&app_state).await {
+            assert_eq!(p.status, ProjectStatus::Ready, "{:?}", p.error);
+        }
+        assert!(repo.join("src/lib.rs").exists());
+        let (status, src) = get_json(
+            &app,
+            &format!("/api/projects/{git_id}/source?file=src/lib.rs"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{src}");
+        assert_eq!(src["text"], "pub fn alpha() {}");
+
+        let (status, report) = post_json(&app, "/api/purge").await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        let ids: Vec<&str> = report["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [git_id.as_str()]);
+        assert!(report["freed_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(report["freed_bytes"], report["projects"][0]["freed_bytes"]);
+        assert!(!repo.exists());
+        assert!(local.join("src/lib.rs").exists());
+        assert_eq!(
+            app_state.get(&path_id).unwrap().status,
+            ProjectStatus::Ready
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

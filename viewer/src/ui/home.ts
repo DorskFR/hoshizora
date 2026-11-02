@@ -1,5 +1,5 @@
 import type { ProjectsApi } from "../api";
-import type { Project } from "../types";
+import type { Project, ProjectStorage, Storage } from "../types";
 import { clear, h } from "./dom";
 
 const POLL_MS = 1500;
@@ -25,6 +25,18 @@ function ago(iso: string | null): string {
   return `${Math.round(s / 86400)} d ago`;
 }
 
+function bytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
 function compact(n: number): string {
   return n >= 10_000
     ? `${Math.round(n / 1000)}k`
@@ -37,11 +49,14 @@ function compact(n: number): string {
 export class ProjectHome {
   readonly el: HTMLElement;
   private readonly list: HTMLElement;
+  private readonly usage: HTMLElement;
+  private readonly purgeAllBtn: HTMLButtonElement;
   private readonly error: HTMLElement;
   private readonly url: HTMLInputElement;
   private readonly ref: HTMLInputElement;
   private readonly addBtn: HTMLButtonElement;
   private projects: Project[] = [];
+  private storage: Storage | null = null;
   private timer = 0;
   private openWhenReady: string | null = null;
 
@@ -67,6 +82,23 @@ export class ProjectHome {
     this.addBtn = h("button", { class: "primary", type: "submit" }, "Add repository");
     this.error = h("p", { class: "error small", hidden: true });
     this.list = h("div", { class: "project-list" });
+    this.usage = h("span", { class: "small muted", hidden: true });
+    this.purgeAllBtn = h(
+      "button",
+      {
+        hidden: true,
+        title: "Delete every idle clone to free disk space; graphs stay and reindex clones again",
+        onclick: () => {
+          if (
+            confirm(
+              "Purge all clones? Projects and their graphs stay browsable; source is unavailable until each is reindexed.",
+            )
+          )
+            void this.act(() => this.api.purgeAll());
+        },
+      },
+      "Purge all clones",
+    );
     const form = h("form", { class: "add-form" }, this.url, this.ref, this.addBtn);
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
@@ -87,7 +119,18 @@ export class ProjectHome {
         ),
       ),
       h("section", { class: "home-add" }, h("h3", null, "Add a repository"), form, this.error),
-      h("section", null, h("h3", null, "Projects"), this.list),
+      h(
+        "section",
+        null,
+        h(
+          "div",
+          { class: "row projects-head" },
+          h("h3", null, "Projects"),
+          this.usage,
+          this.purgeAllBtn,
+        ),
+        this.list,
+      ),
     );
   }
 
@@ -103,7 +146,10 @@ export class ProjectHome {
   private async refresh(): Promise<void> {
     window.clearTimeout(this.timer);
     try {
-      this.projects = (await this.api.list()) ?? [];
+      [this.projects, this.storage] = await Promise.all([
+        this.api.list().then((p) => p ?? []),
+        this.api.storage().catch(() => null),
+      ]);
     } catch (err) {
       this.showError(`Cannot list projects: ${(err as Error).message}`);
     }
@@ -156,8 +202,24 @@ export class ProjectHome {
     await this.refresh();
   }
 
+  private storageOf(id: string): ProjectStorage | undefined {
+    return this.storage?.projects.find((s) => s.id === id);
+  }
+
+  private renderUsage(): void {
+    const s = this.storage;
+    this.usage.hidden = !s;
+    this.purgeAllBtn.hidden = !s;
+    if (!s) return;
+    const parts = [`clones ${bytes(s.clone_bytes)}`, `graphs ${bytes(s.graph_bytes)}`];
+    if (s.disk) parts.push(`${bytes(s.disk.free_bytes)} free of ${bytes(s.disk.total_bytes)}`);
+    this.usage.textContent = parts.join(" · ");
+    this.purgeAllBtn.disabled = !s.projects.some((p) => p.clone_bytes !== null);
+  }
+
   private render(): void {
     clear(this.list);
+    this.renderUsage();
     if (!this.projects.length) {
       this.list.append(
         h("p", { class: "muted pad" }, "No projects yet. Paste a git URL above to index one."),
@@ -167,6 +229,8 @@ export class ProjectHome {
     for (const p of this.projects) {
       const ready = p.status === "ready";
       const busy = p.status === "cloning" || p.status === "indexing";
+      const usage = this.storageOf(p.id);
+      const hasClone = usage?.clone_bytes != null;
       const card = h(
         "article",
         { class: `project-card status-${p.status}` },
@@ -194,7 +258,24 @@ export class ProjectHome {
             p.commit && h("span", { class: "mono" }, p.commit.slice(0, 8)),
             p.indexed_at && h("span", null, `indexed ${ago(p.indexed_at)}`),
             ready && h("span", null, `${compact(p.nodes)} nodes · ${compact(p.edges)} edges`),
+            usage &&
+              h(
+                "span",
+                { title: "Disk used by this project's clone and graph" },
+                p.source.kind === "git"
+                  ? `clone ${hasClone ? bytes(usage.clone_bytes ?? 0) : "purged"} · graph ${bytes(usage.graph_bytes)}`
+                  : `graph ${bytes(usage.graph_bytes)}`,
+              ),
           ),
+          p.source.kind === "git" &&
+            usage &&
+            !hasClone &&
+            !busy &&
+            h(
+              "div",
+              { class: "small muted" },
+              "Clone purged: source is not available until the project is reindexed.",
+            ),
           p.error && h("div", { class: "error small" }, p.error),
         ),
         h(
@@ -214,6 +295,24 @@ export class ProjectHome {
             },
             "Reindex",
           ),
+          p.source.kind === "git" &&
+            h(
+              "button",
+              {
+                disabled: busy || !hasClone,
+                title:
+                  "Delete the clone to free disk space; the graph stays and reindex clones again",
+                onclick: () => {
+                  if (
+                    confirm(
+                      `Purge the clone of ${p.name}? The graph stays browsable; source is unavailable until it is reindexed.`,
+                    )
+                  )
+                    void this.act(() => this.api.purge(p.id));
+                },
+              },
+              "Purge clone",
+            ),
           h(
             "button",
             {

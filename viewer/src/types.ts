@@ -369,3 +369,27 @@ export interface AddProject {
   name?: string | null;
   services?: string[];
 }
+
+export interface Purged {
+  id: string;
+  freed_bytes: number;
+}
+
+export interface PurgeReport {
+  projects: Purged[];
+  freed_bytes: number;
+}
+
+export interface ProjectStorage {
+  id: string;
+  /** `null` when the project has no clone (a path project, or a purged one). */
+  clone_bytes: number | null;
+  graph_bytes: number;
+}
+
+export interface Storage {
+  projects: ProjectStorage[];
+  clone_bytes: number;
+  graph_bytes: number;
+  disk: { total_bytes: number; free_bytes: number } | null;
+}

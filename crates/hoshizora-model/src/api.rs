@@ -193,3 +193,39 @@ pub struct AddProject {
     #[serde(default)]
     pub services: Vec<String>,
 }
+
+/// A clone deleted by `POST /api/projects/{project}/purge`; the project and its graph stay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Purged {
+    pub id: String,
+    pub freed_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PurgeReport {
+    pub projects: Vec<Purged>,
+    pub freed_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectStorage {
+    pub id: String,
+    /// `None` when the project has no clone (a path project, or a purged one).
+    pub clone_bytes: Option<u64>,
+    pub graph_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskSpace {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// Bytes the data dir holds per project, plus the filesystem it lives on.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Storage {
+    pub projects: Vec<ProjectStorage>,
+    pub clone_bytes: u64,
+    pub graph_bytes: u64,
+    pub disk: Option<DiskSpace>,
+}
