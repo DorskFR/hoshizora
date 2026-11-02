@@ -2,6 +2,7 @@
 //! output is the language-neutral `Graph` served by the API.
 
 mod build;
+pub mod diff;
 mod index;
 pub mod packs;
 pub mod pattern;
@@ -15,6 +16,7 @@ use std::path::Path;
 use hoshizora_model::{FileFacts, Graph};
 
 pub use build::analysis::{ALL_EFFECTS, FLOW_KINDS};
+pub use diff::{DiffReport, diff};
 pub use index::{DEFAULT_FLOW_KINDS, FLOW_NODE_LIMIT, Index};
 pub use packs::Packs;
 pub use store::save_with;

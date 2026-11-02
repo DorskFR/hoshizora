@@ -110,7 +110,7 @@ fn rust_axum_handler() {
     assert!(query.awaited);
     assert!(!query.conditional);
     let fetch = call(refresh, "fetch_one");
-    assert!(fetch.awaited && fetch.loop_depth == 1 && fetch.receiver.is_none());
+    assert!(fetch.awaited && fetch.loop_depth == 1 && fetch.receiver.as_deref() == Some("<expr>"));
     let warn = call(refresh, "tracing::warn!");
     assert!(warn.conditional);
     assert_eq!(warn.string_args, vec!["inactive {}"]);

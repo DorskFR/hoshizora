@@ -300,6 +300,23 @@ fn attributes(node: Node, source: &str) -> Vec<String> {
         .collect()
 }
 
+fn struct_fields(node: Node, source: &str) -> Vec<Param> {
+    let Some(body) = node.child_by_field_name("body") else {
+        return vec![];
+    };
+    named_children(body)
+        .into_iter()
+        .filter(|c| c.kind() == "field_declaration")
+        .filter_map(|c| {
+            Some(Param {
+                name: field_text(c, "name", source)?,
+                ty: field_text(c, "type", source).map(|t| strip_ws(&t)),
+                default: None,
+            })
+        })
+        .collect()
+}
+
 fn params(node: Node, source: &str) -> Vec<Param> {
     let Some(list) = node.child_by_field_name("parameters") else {
         return vec![];
@@ -389,12 +406,17 @@ impl Ctx<'_> {
                     .map(|a| collapse_ws(text(a, self.source))),
             );
         }
+        let fields = if node.kind() == "struct_item" {
+            struct_fields(node, self.source)
+        } else {
+            vec![]
+        };
         self.symbols.push(Symbol {
             kind,
             local_name: name.clone(),
             parent: None,
             signature: header(node, self.source, "body"),
-            params: vec![],
+            params: fields,
             returns: field_text(node, "type", self.source),
             doc: doc(node, self.source),
             span: span(node),

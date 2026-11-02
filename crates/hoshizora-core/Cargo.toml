@@ -12,5 +12,8 @@ serde_json.workspace = true
 anyhow.workspace = true
 toml = "1.1"
 
+[dev-dependencies]
+hoshizora-adapters.workspace = true
+
 [lints]
 workspace = true

@@ -51,7 +51,8 @@ pub(crate) struct Ctx<'a> {
     pub edge_set: HashSet<(usize, usize, EdgeKind, Option<u32>)>,
     pub fns: Vec<FnRec>,
     /// Number of call sites per function that resolve to the function itself.
-    pub self_calls: Vec<u32>,
+    /// Line and conditional flag of each call a function makes to itself.
+    pub self_calls: Vec<Vec<(u32, bool)>>,
     pub file_nodes: Vec<usize>,
     pub package_of_file: Vec<usize>,
     pub scopes: Vec<FileScope>,
