@@ -124,6 +124,9 @@ pub struct CallInfo {
     pub string_args: Vec<String>,
 }
 
+/// Receiver recorded for a method called on an expression (`a.b()?.c()`, `f(x).c()`).
+pub const EXPR_RECEIVER: &str = "<expr>";
+
 impl CallInfo {
     /// Method call on `receiver`; a computed receiver (`a.b().c`, `xs[0].f`) is dropped so the
     /// callee is just the method name.
@@ -132,7 +135,7 @@ impl CallInfo {
         match receiver.map(|r| strip_ws(&r)) {
             Some(r) if r.contains(['(', '[', '{', '?', '!']) => Self {
                 callee: last_segment(&callee),
-                receiver: None,
+                receiver: Some(EXPR_RECEIVER.to_owned()),
                 string_args,
             },
             receiver => Self {

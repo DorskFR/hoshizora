@@ -280,10 +280,10 @@ fn exponent(
         exponential |= e;
         exp = exp.max(k + call.loop_depth);
     }
-    match ctx.self_calls[f] {
+    match ctx.self_calls[f].len() {
         0 => {}
-        1 => exp = exp.max(1),
-        _ => exponential = true,
+        _ if branching(&ctx.self_calls[f]) => exponential = true,
+        _ => exp = exp.max(1),
     }
     if let Some(b) = body
         && b.calls.iter().any(|c| {
@@ -347,11 +347,15 @@ fn describe(
             }
         }
     }
-    let recursive = ctx.self_calls[f] > 0;
-    match ctx.self_calls[f] {
-        0 => {}
-        1 => basis.push("self-recursive".to_owned()),
-        n => basis.push(format!("branching recursion ({n} self-calls)")),
+    let self_calls = &ctx.self_calls[f];
+    let recursive = !self_calls.is_empty();
+    if branching(self_calls) {
+        basis.push(format!(
+            "branching recursion ({} self-calls)",
+            self_calls.len()
+        ));
+    } else if recursive {
+        basis.push("self-recursive".to_owned());
     }
     let sort_depth = body
         .calls
@@ -688,4 +692,15 @@ fn referenced_in_attributes(attributes: &str, name: &str) -> bool {
     attributes
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|word| word == name)
+}
+
+/// Two self-calls on one path (`f(n - 1) + f(n - 2)`, or two unconditional calls) branch;
+/// one call per match arm or per child does not.
+fn branching(self_calls: &[(u32, bool)]) -> bool {
+    let unconditional = self_calls.iter().filter(|(_, c)| !c).count();
+    let same_line = self_calls
+        .iter()
+        .enumerate()
+        .any(|(i, (l, _))| self_calls[i + 1..].iter().any(|(m, _)| m == l));
+    unconditional >= 2 || same_line
 }

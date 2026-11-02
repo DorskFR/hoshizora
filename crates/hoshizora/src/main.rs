@@ -79,6 +79,17 @@ enum Command {
         #[arg(long)]
         packs: Option<PathBuf>,
     },
+    /// Compare two revisions (source trees or graph files) and print JSON.
+    Diff {
+        base: PathBuf,
+        head: PathBuf,
+        /// Write the report here instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Extra packs used when indexing a source tree.
+        #[arg(long)]
+        packs: Option<PathBuf>,
+    },
     /// Query a graph and print JSON.
     Query {
         #[arg(long, default_value = DEFAULT_GRAPH)]
@@ -160,8 +171,48 @@ fn main() -> anyhow::Result<()> {
             reindex,
             packs,
         })),
+        Command::Diff {
+            base,
+            head,
+            output,
+            packs,
+        } => cmd_diff(&base, &head, output.as_deref(), packs.as_deref()),
         Command::Query { graph, query } => cmd_query(&graph, query),
     }
+}
+
+/// A directory is indexed like `hoshizora index`; anything else is loaded as a graph file.
+fn load_or_build(path: &Path, packs: Option<&Path>) -> anyhow::Result<hoshizora_model::Graph> {
+    if path.is_dir() {
+        build_graph(path, packs)
+    } else {
+        hoshizora_core::load(path).with_context(|| format!("loading {}", path.display()))
+    }
+}
+
+fn cmd_diff(
+    base: &Path,
+    head: &Path,
+    output: Option<&Path>,
+    packs: Option<&Path>,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let base = Index::new(load_or_build(base, packs)?);
+    let head = Index::new(load_or_build(head, packs)?);
+    let report = hoshizora_core::diff(&base, &head);
+    let json = serde_json::to_string_pretty(&report)?;
+    match output {
+        Some(path) => {
+            std::fs::write(path, json)?;
+            tracing::info!(
+                "diff written to {} in {:.2?}",
+                path.display(),
+                started.elapsed()
+            );
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
 }
 
 fn load_packs(extra: Option<&Path>) -> anyhow::Result<Packs> {

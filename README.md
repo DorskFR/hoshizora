@@ -67,7 +67,16 @@ hoshizora query effects db_write --target observations
 hoshizora query insights
 hoshizora query dead
 hoshizora query search  launch
+hoshizora diff ./base ./head                                   # what a change does
 ```
+
+`diff` takes two source trees or graph files and prints which functions were added, removed,
+modified (by body text, never by line numbers) or moved (same body elsewhere, or same name when
+unambiguous; `modified: true` when the body changed too), the effects each entrypoint gains or
+loses (tests in their own section), the readers and writers of every table the changed code
+touches, insights that appeared or went away, and for each changed function the nearest
+user-facing entrypoints (routes, UI handlers, jobs, CLI, main) with one shortest path each,
+capped at 10 with an `omitted` count.
 
 The HTTP API is documented in [`docs/api.md`](docs/api.md); the architecture in
 [`docs/architecture.md`](docs/architecture.md); prior art in
