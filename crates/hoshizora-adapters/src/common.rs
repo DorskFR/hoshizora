@@ -1,6 +1,8 @@
 //! Language-neutral tree walking shared by every adapter.
 
-use hoshizora_model::{Body, CallSite, Span, Symbol, SymbolKind, Visibility};
+use hoshizora_model::{
+    Body, CallSite, DefaultKind, Discrimination, Span, Symbol, SymbolKind, Visibility,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Node, Parser, Tree};
@@ -597,4 +599,314 @@ pub fn preceding_of_kind<'t>(node: Node<'t>, kind: &str, comment_kinds: &[&str])
     }
     found.reverse();
     found
+}
+
+/// Node kinds of an `if` / `else if` / `else` chain.
+pub struct ChainSpec<'a> {
+    pub ifs: &'a [&'a str],
+    /// `elif_clause`: carries its own `condition` and `consequence`.
+    pub elifs: &'a [&'a str],
+    /// `else_clause`: wraps a block or a further `if`.
+    pub elses: &'a [&'a str],
+}
+
+/// `(condition, body)` per arm of the chain starting at `node`, and the final `else` body.
+pub fn if_chain<'t>(
+    node: Node<'t>,
+    spec: &ChainSpec,
+) -> (Vec<(Node<'t>, Node<'t>)>, Option<Node<'t>>) {
+    let mut arms = Vec::new();
+    let mut else_body = None;
+    let mut cur = node;
+    'outer: loop {
+        if let (Some(c), Some(b)) = (
+            cur.child_by_field_name("condition"),
+            cur.child_by_field_name("consequence"),
+        ) {
+            arms.push((c, b));
+        }
+        let mut walker = cur.walk();
+        let alternatives: Vec<Node<'t>> = cur
+            .children_by_field_name("alternative", &mut walker)
+            .collect();
+        for alt in alternatives {
+            let k = alt.kind();
+            if spec.ifs.contains(&k) {
+                cur = alt;
+                continue 'outer;
+            }
+            if spec.elifs.contains(&k) {
+                if let (Some(c), Some(b)) = (
+                    alt.child_by_field_name("condition"),
+                    alt.child_by_field_name("consequence"),
+                ) {
+                    arms.push((c, b));
+                }
+                continue;
+            }
+            let inner = if spec.elses.contains(&k) {
+                alt.child_by_field_name("body")
+                    .or_else(|| named_children(alt).into_iter().next())
+            } else {
+                Some(alt)
+            };
+            match inner {
+                Some(i) if spec.ifs.contains(&i.kind()) => {
+                    cur = i;
+                    continue 'outer;
+                }
+                other => else_body = other,
+            }
+        }
+        break;
+    }
+    (arms, else_body)
+}
+
+/// One equality test of a subject against values: `x == A`, `x === 'a' || x === 'b'`,
+/// `x in ('a', 'b')`, `matches!(x, A | B)`.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Comparison {
+    pub subject: String,
+    pub hint: Option<String>,
+    pub values: Vec<String>,
+}
+
+impl Comparison {
+    pub fn new(subject: &str, values: Vec<Handled>) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let mut out = Self {
+            subject: strip_ws(subject),
+            ..Self::default()
+        };
+        out.extend(values);
+        Some(out)
+    }
+
+    pub fn extend(&mut self, values: Vec<Handled>) {
+        for v in values {
+            if self.hint.is_none() {
+                self.hint = v.hint;
+            }
+            if !self.values.contains(&v.value) {
+                self.values.push(v.value);
+            }
+        }
+    }
+
+    /// Joins two tests on the same subject (`a == X || a == Y`).
+    pub fn merge(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        let (mut a, b) = (a?, b?);
+        if a.subject != b.subject {
+            return None;
+        }
+        a.extend(
+            b.values
+                .into_iter()
+                .map(|value| Handled {
+                    hint: b.hint.clone(),
+                    value,
+                })
+                .collect(),
+        );
+        Some(a)
+    }
+}
+
+/// A value a branch handles, with the enum or namespace it was qualified with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Handled {
+    pub hint: Option<String>,
+    pub value: String,
+}
+
+impl Handled {
+    pub fn literal(value: String) -> Self {
+        Self { hint: None, value }
+    }
+
+    /// `Status::Active` / `Status.Active` → hint `Status`, value `Active`; `Self::A` and
+    /// lowercase namespaces (`self.kind`, `opts.mode`) are not members of a domain.
+    pub fn member(path: &str, sep: &str) -> Option<Self> {
+        let path = strip_ws(path);
+        let (ns, value) = path.rsplit_once(sep)?;
+        let ns = ns.rsplit(sep).next().unwrap_or(ns);
+        let typed = |s: &str| s.starts_with(|c: char| c.is_ascii_uppercase());
+        if !typed(ns) || value.is_empty() || value.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let hint = (!matches!(ns, "Self" | "Some" | "Ok" | "Err")).then(|| ns.to_owned());
+        if hint.is_none() && ns != "Self" {
+            return None;
+        }
+        Some(Self {
+            hint,
+            value: value.to_owned(),
+        })
+    }
+}
+
+const SWITCH_VALUE_SUBJECTS: usize = 80;
+
+/// Accumulates the switch-like sites of one function body.
+#[derive(Default)]
+pub struct Sites {
+    pub out: Vec<Discrimination>,
+    seen_ifs: Vec<usize>,
+}
+
+impl Sites {
+    pub fn push(&mut self, line: u32, cmp: Comparison, default: DefaultKind) {
+        if cmp.values.is_empty() {
+            return;
+        }
+        let mut subject = cmp.subject;
+        subject.truncate(SWITCH_VALUE_SUBJECTS);
+        self.out.push(Discrimination {
+            subject,
+            domain_hint: cmp.hint,
+            handled: cmp.values,
+            line,
+            default,
+        });
+    }
+
+    /// Records an `if` chain whose every arm compares the same subject; nested `if`s already
+    /// consumed as `else if` arms are skipped when met again by the walker.
+    pub fn if_chain(
+        &mut self,
+        node: Node,
+        source: &str,
+        spec: &ChainSpec,
+        compare: &dyn Fn(Node, &str) -> Option<Comparison>,
+        default_body: &dyn Fn(Node, &str) -> String,
+    ) {
+        if self.seen_ifs.contains(&node.id()) {
+            return;
+        }
+        let (arms, else_body) = if_chain(node, spec);
+        let mut cmp: Option<Comparison> = None;
+        for (i, (cond, _)) in arms.iter().enumerate() {
+            if i > 0
+                && let Some(p) = cond.parent()
+            {
+                self.seen_ifs.push(p.id());
+            }
+            let c = compare(*cond, source);
+            cmp = if i == 0 { c } else { Comparison::merge(cmp, c) };
+            if cmp.is_none() {
+                return;
+            }
+        }
+        let Some(cmp) = cmp else { return };
+        if arms.len() < 2 && cmp.values.len() < 2 {
+            return;
+        }
+        let default = match else_body {
+            Some(b) => classify_default(&default_body(b, source)),
+            None => DefaultKind::None,
+        };
+        self.push(line(node), cmp, default);
+    }
+}
+
+const THROW_PREFIXES: &[&str] = &[
+    "throw ",
+    "throw(",
+    "raise ",
+    "raise(",
+    "raise",
+    "panic!",
+    "panic(",
+    "unreachable!",
+    "todo!",
+    "unimplemented!",
+    "bail!",
+    "anyhow::bail!",
+    "return Err(",
+    "Err(",
+    "log.Fatal",
+    "process.exit(",
+    "os.Exit(",
+    "sys.exit(",
+    "assert ",
+    "assert(",
+];
+
+const EMPTY_RESULTS: &[&str] = &[
+    "",
+    "[]",
+    "{}",
+    "null",
+    "undefined",
+    "None",
+    "nil",
+    "nil,nil",
+    "()",
+    "\"\"",
+    "''",
+    "``",
+    "false",
+    "Vec::new()",
+    "vec![]",
+    "HashMap::new()",
+    "String::new()",
+    "Ok(())",
+    "Ok(None)",
+    "Ok(vec![])",
+    "Default::default()",
+    "0",
+];
+
+/// See [`DefaultKind`] for the rules. `body` is the catch-all's source text.
+pub fn classify_default(body: &str) -> DefaultKind {
+    let mut t = collapse_ws(body);
+    loop {
+        let trimmed = t.trim_matches([' ', ';']);
+        match trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            Some(inner) => t = inner.trim().to_owned(),
+            None => {
+                t = trimmed.to_owned();
+                break;
+            }
+        }
+    }
+    let stripped = strip_ws(&t);
+    if stripped.is_empty() || matches!(stripped.as_str(), "break" | "continue" | "pass" | "return")
+    {
+        return DefaultKind::ReturnsEmpty;
+    }
+    if THROW_PREFIXES.iter().any(|p| t.starts_with(p))
+        || t.strip_prefix("return ")
+            .is_some_and(|r| THROW_PREFIXES.iter().any(|p| r.starts_with(p)))
+        || never_call(&t)
+    {
+        return DefaultKind::Throws;
+    }
+    let value = stripped
+        .strip_prefix("return")
+        .map(|r| r.trim_end_matches(';'))
+        .unwrap_or(stripped.as_str())
+        .trim_end_matches(';');
+    let value = value.trim_end_matches("break").trim_end_matches(';');
+    if EMPTY_RESULTS.contains(&value) {
+        return DefaultKind::ReturnsEmpty;
+    }
+    DefaultKind::Other
+}
+
+/// A call whose name says the branch is unreachable (`assertNever(x)`, `exhaustiveCheck(x)`).
+fn never_call(t: &str) -> bool {
+    let Some(paren) = t.find('(') else {
+        return false;
+    };
+    let name = last_segment(t[..paren].trim().rsplit(' ').next().unwrap_or("")).to_lowercase();
+    name.contains("never")
+        || name.contains("unreachable")
+        || name.contains("exhaustive")
+        || name.contains("invalid")
+        || name.contains("unexpected")
+        || name.contains("unknown")
 }

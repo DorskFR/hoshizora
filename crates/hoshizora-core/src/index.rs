@@ -2,8 +2,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use hoshizora_model::api::{AffectedEntrypoint, FlowStep, Impact, SearchHit, Subgraph};
-use hoshizora_model::{Edge, EdgeKind, EffectKind, EntrypointKind, Graph, Insight, Node, NodeKind};
+use hoshizora_model::api::{
+    AffectedEntrypoint, DomainReport, FlowStep, Impact, SearchHit, StatesReport, Subgraph,
+};
+use hoshizora_model::{
+    DefaultKind, Edge, EdgeKind, EffectKind, EntrypointKind, Graph, Insight, Node, NodeKind,
+};
 
 /// Edge kinds followed by `flow` and `impact` when none are given.
 pub const DEFAULT_FLOW_KINDS: &[EdgeKind] = &[
@@ -392,8 +396,32 @@ impl Index {
         hits
     }
 
+    /// Every domain (or the one whose name or id is `domain`) with the sites branching on it.
+    pub fn states(&self, domain: Option<&str>) -> StatesReport {
+        let domains = self
+            .graph
+            .states
+            .domains
+            .iter()
+            .filter(|d| domain.is_none_or(|q| d.name == q || d.id == q))
+            .map(|d| DomainReport {
+                domain: d.clone(),
+                sites: self
+                    .graph
+                    .states
+                    .sites
+                    .iter()
+                    .filter(|s| s.domain == d.id)
+                    .cloned()
+                    .collect(),
+            })
+            .collect();
+        StatesReport { domains }
+    }
+
     /// Findings that need no runtime data: I/O in loops, blocking calls in async code,
-    /// sequential independent awaits, high-complexity hot candidates.
+    /// sequential independent awaits, high-complexity hot candidates, branches on a domain
+    /// whose catch-all silently swallows values they do not handle.
     pub fn static_insights(&self) -> Vec<Insight> {
         let mut out = Vec::new();
         for (i, n) in self.graph.nodes.iter().enumerate() {
@@ -403,7 +431,47 @@ impl Index {
             self.blocking(i, info, &mut out);
             self.complexity_candidate(n, info, &mut out);
         }
+        out.extend(self.unhandled_values());
         out
+    }
+
+    /// A site that handles fewer values than it misses is a projection (`_ => None` on one
+    /// variant of twenty), not a mapping that forgot some; a non-empty default with exactly
+    /// one value missing is that value's branch; tests are skipped.
+    pub(crate) fn silent_site(&self, s: &hoshizora_model::StateSite) -> bool {
+        let silent = match s.default {
+            DefaultKind::ReturnsEmpty => true,
+            DefaultKind::Other => s.missing.len() > 1,
+            DefaultKind::None | DefaultKind::Throws => false,
+        };
+        silent
+            && s.handled.len() >= s.missing.len()
+            && !self.idx(&s.function).is_some_and(|i| self.is_test(i))
+    }
+
+    fn unhandled_values(&self) -> Vec<Insight> {
+        let name_of: HashMap<&str, &str> = self
+            .graph
+            .states
+            .domains
+            .iter()
+            .map(|d| (d.id.as_str(), d.name.as_str()))
+            .collect();
+        self.graph
+            .states
+            .sites
+            .iter()
+            .filter(|s| self.silent_site(s))
+            .map(|s| Insight::UnhandledValues {
+                node: s.function.clone(),
+                line: s.line,
+                domain: name_of
+                    .get(s.domain.as_str())
+                    .map_or_else(|| s.domain.clone(), |n| (*n).to_owned()),
+                missing: s.missing.clone(),
+                default: s.default,
+            })
+            .collect()
     }
 
     /// Items in a function body that perform I/O: direct effects and calls into functions

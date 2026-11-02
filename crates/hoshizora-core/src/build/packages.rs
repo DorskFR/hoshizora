@@ -125,6 +125,7 @@ mod tests {
             lines: 1,
             imports: vec![],
             symbols: vec![],
+            domains: vec![],
         }
     }
 

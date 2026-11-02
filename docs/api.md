@@ -50,6 +50,7 @@ has its own runtime stats, traces, insights and `runtime/stream`.
 | GET | `/api/dead` | `Node[]` with `dead = true` |
 | GET | `/api/effects?kind=db_write&target=sessions` | `Node[]` with that direct effect |
 | GET | `/api/insights` | `Insights`: static + runtime findings |
+| GET | `/api/states?domain=` | `StatesReport`: value domains (enums, literal unions, `as const` lists, typed const blocks) with the branch sites linked to each — per site the function, line, subject, handled and missing values and what the catch-all does (`none`, `throws`, `returns_empty`, `other`). `domain` filters by name or id |
 
 ## Runtime
 

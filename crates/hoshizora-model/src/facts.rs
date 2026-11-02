@@ -29,6 +29,58 @@ pub struct FileFacts {
     pub lines: u32,
     pub imports: Vec<Import>,
     pub symbols: Vec<Symbol>,
+    /// Declared value sets: enums, literal unions, `as const` lists, typed const blocks.
+    #[serde(default)]
+    pub domains: Vec<Domain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Domain {
+    pub name: String,
+    pub values: Vec<DomainValue>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DomainValue {
+    /// Member name as declared (`Active`); the literal itself for unions and lists.
+    pub name: String,
+    /// Literal the member stands for (`"active"`, `2`), when written.
+    pub literal: Option<String>,
+}
+
+impl DomainValue {
+    pub fn matches(&self, handled: &str) -> bool {
+        self.name == handled || self.literal.as_deref() == Some(handled)
+    }
+}
+
+/// A branch on one subject expression against literal or member values: `switch`/`match`
+/// arms, or an `if`/`else if` chain of equality tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Discrimination {
+    /// Subject as written, whitespace removed.
+    pub subject: String,
+    /// Enum or namespace the handled values were qualified with (`Status` in `Status::Active`).
+    pub domain_hint: Option<String>,
+    /// Values with a branch of their own, unqualified, in source order.
+    pub handled: Vec<String>,
+    pub line: u32,
+    pub default: DefaultKind,
+}
+
+/// What the catch-all branch (`_`, `default`, final `else`) does. Classified from its text:
+/// `throws` for throw/raise/panic/unreachable/bail/`Err(..)`/assert-never style calls,
+/// `returns_empty` for an empty body or a bare `return`/`continue`/`break`/`pass` or a return
+/// of an empty value (`[]`, `{}`, `null`, `None`, `nil`, `()`, `Ok(())`, `Vec::new()`),
+/// `other` for anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultKind {
+    None,
+    Throws,
+    ReturnsEmpty,
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,6 +155,8 @@ pub struct Body {
     pub early_exits: u32,
     /// Closures / lambdas / arrow functions defined inside the body.
     pub closures: u32,
+    #[serde(default)]
+    pub discriminations: Vec<Discrimination>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,10 +1,14 @@
-use hoshizora_model::{FileFacts, Import, Language, Param, Symbol, SymbolKind, Visibility};
+use hoshizora_model::{
+    DefaultKind, Discrimination, Domain, DomainValue, FileFacts, Import, Language, Param, Symbol,
+    SymbolKind, Visibility,
+};
 use tree_sitter::Node;
 
 use crate::Adapter;
 use crate::common::{
-    self, BodySpec, CallInfo, all_children, clean_comment_lines, collapse_ws, field_text, header,
-    named_children, preceding_comments, span, string_args, strip_generics, text,
+    self, BodySpec, CallInfo, ChainSpec, Comparison, Handled, Sites, all_children,
+    clean_comment_lines, collapse_ws, field_text, header, named_children, preceding_comments, span,
+    string_args, strip_generics, strip_ws, text,
 };
 
 pub struct GoAdapter;
@@ -85,6 +89,144 @@ fn call_info(node: Node, source: &str) -> Option<CallInfo> {
     ))
 }
 
+const CHAIN: ChainSpec = ChainSpec {
+    ifs: &["if_statement"],
+    elifs: &[],
+    elses: &[],
+};
+
+/// Go domains are typed const blocks, so a handled value is a const name (`StatusActive`,
+/// `pkg.StatusActive`) or a literal.
+fn value(node: Node, source: &str) -> Option<Handled> {
+    match node.kind() {
+        "identifier" => {
+            let t = text(node, source);
+            t.starts_with(|c: char| c.is_ascii_uppercase())
+                .then(|| Handled::literal(t.to_owned()))
+        }
+        "selector_expression" => Some(Handled::literal(field_text(node, "field", source)?)),
+        "parenthesized_expression" => value(named_children(node).into_iter().next()?, source),
+        k if STRINGS.contains(&k) => Some(Handled::literal(common::string_value(
+            node,
+            source,
+            &[],
+            &[],
+        ))),
+        "int_literal" => Some(Handled::literal(text(node, source).to_owned())),
+        _ => None,
+    }
+}
+
+fn compare(node: Node, source: &str) -> Option<Comparison> {
+    match node.kind() {
+        "parenthesized_expression" => compare(named_children(node).into_iter().next()?, source),
+        "binary_expression" => {
+            let op = text(node.child_by_field_name("operator")?, source);
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            match op {
+                "||" => Comparison::merge(compare(left, source), compare(right, source)),
+                "==" => match (value(right, source), value(left, source)) {
+                    (Some(v), _) => Comparison::new(text(left, source), vec![v]),
+                    (None, Some(v)) => Comparison::new(text(right, source), vec![v]),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn switch_site(node: Node, source: &str, sites: &mut Sites) {
+    let Some(subject) = node.child_by_field_name("value") else {
+        return;
+    };
+    let mut cmp = Comparison {
+        subject: strip_ws(text(subject, source)),
+        ..Comparison::default()
+    };
+    let mut default = DefaultKind::None;
+    for case in named_children(node) {
+        match case.kind() {
+            "expression_case" => {
+                let Some(list) = case.child_by_field_name("value") else {
+                    return;
+                };
+                let Some(values) = named_children(list)
+                    .into_iter()
+                    .map(|v| value(v, source))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return;
+                };
+                cmp.extend(values);
+            }
+            "default_case" => {
+                let stmts: Vec<&str> = named_children(case)
+                    .into_iter()
+                    .map(|b| text(b, source))
+                    .collect();
+                default = common::classify_default(&stmts.join(" "));
+            }
+            _ => {}
+        }
+    }
+    sites.push(common::line(node), cmp, default);
+}
+
+fn discriminations(body: Node, source: &str) -> Vec<Discrimination> {
+    let mut sites = Sites::default();
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "expression_switch_statement" => switch_site(node, source, &mut sites),
+            "if_statement" => sites.if_chain(node, source, &CHAIN, &compare, &|b, s| {
+                text(b, s).to_owned()
+            }),
+            _ => {}
+        }
+        pending.extend(named_children(node).into_iter().rev());
+    }
+    sites.out
+}
+
+/// `const ( A Status = "a"; B Status = "b" )` and iota blocks where only the first spec is
+/// typed: one domain named after the type.
+fn const_domain(node: Node, source: &str) -> Option<Domain> {
+    let specs: Vec<Node> = named_children(node)
+        .into_iter()
+        .filter(|c| c.kind() == "const_spec")
+        .collect();
+    let ty = field_text(*specs.first()?, "type", source)?;
+    let mut values = Vec::new();
+    for spec in &specs {
+        match field_text(*spec, "type", source) {
+            Some(t) if t != ty => return None,
+            _ => {}
+        }
+        let mut walker = spec.walk();
+        for name in spec.children_by_field_name("name", &mut walker) {
+            let literal = spec
+                .child_by_field_name("value")
+                .and_then(|v| named_children(v).into_iter().next())
+                .and_then(|v| {
+                    (STRINGS.contains(&v.kind()) || v.kind() == "int_literal")
+                        .then(|| common::string_value(v, source, &[], &[]))
+                });
+            values.push(DomainValue {
+                name: text(name, source).to_owned(),
+                literal,
+            });
+        }
+    }
+    (values.len() >= 2).then_some(Domain {
+        name: ty,
+        values,
+        span: span(node),
+    })
+}
+
 fn doc(node: Node, source: &str) -> Option<String> {
     let lines: Vec<&str> = preceding_comments(node, &["comment"], &[])
         .into_iter()
@@ -138,6 +280,7 @@ struct Ctx<'a> {
     source: &'a str,
     symbols: Vec<Symbol>,
     imports: Vec<Import>,
+    domains: Vec<Domain>,
 }
 
 impl Ctx<'_> {
@@ -170,9 +313,11 @@ impl Ctx<'_> {
             visibility: visibility(&name),
             attributes: vec![],
             implements: vec![],
-            body: node
-                .child_by_field_name("body")
-                .map(|b| common::analyze_body(b, src, &SPEC)),
+            body: node.child_by_field_name("body").map(|b| {
+                let mut body = common::analyze_body(b, src, &SPEC);
+                body.discriminations = discriminations(b, src);
+                body
+            }),
             name,
         });
     }
@@ -231,6 +376,7 @@ impl Ctx<'_> {
                 }
             }
             "const_declaration" => {
+                self.domains.extend(const_domain(node, self.source));
                 for s in named_children(node)
                     .into_iter()
                     .filter(|s| s.kind() == "const_spec")
@@ -284,6 +430,7 @@ impl Adapter for GoAdapter {
             source,
             symbols: vec![],
             imports: vec![],
+            domains: vec![],
         };
         for item in all_children(tree.root_node()) {
             ctx.item(item);
@@ -313,6 +460,7 @@ impl Adapter for GoAdapter {
             lines: common::line_count(source),
             imports: ctx.imports,
             symbols: ctx.symbols,
+            domains: ctx.domains,
         })
     }
 }

@@ -2,6 +2,7 @@ pub(crate) mod analysis;
 mod effects;
 mod packages;
 mod resolve;
+mod states;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -186,6 +187,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
     analysis::complexity(&mut ctx);
     analysis::transitive(&mut ctx);
     analysis::dead(&mut ctx);
+    let states = states::build(&mut ctx);
 
     let mut languages: Vec<Language> = files.iter().map(|f| f.language).collect();
     languages.sort();
@@ -207,6 +209,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
         },
         nodes: ctx.nodes,
         edges: ctx.edges,
+        states,
     }
 }
 

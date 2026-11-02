@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use hoshizora_core::{Index, Packs, diff};
-use hoshizora_model::Insight;
+use hoshizora_model::{DefaultKind, Insight};
 
 struct Tree {
     root: PathBuf,
@@ -320,4 +320,103 @@ fn graph_files_are_accepted_as_inputs() {
     );
     assert_eq!(from_files, diff(&base.index(), &head.index()));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+const STATUS_BASE: &str = "export type Status = 'active' | 'paused';\n";
+const STATUS_HEAD: &str = "export type Status = 'active' | 'paused' | 'deleting';\n";
+const BADGE: &str = r#"import { Status } from "./status";
+
+export function badge(status: Status): string[] {
+  switch (status) {
+    case "active":
+      return ["green"];
+    case "paused":
+      return ["grey"];
+    default:
+      return [];
+  }
+}
+
+export function strict(status: Status): string {
+  switch (status) {
+    case "active":
+      return "a";
+    case "paused":
+      return "p";
+    default:
+      throw new Error(status);
+  }
+}
+"#;
+const NEW_FN: &str = r#"import { Status } from "./status";
+
+export function colour(status: Status): string {
+  if (status === "active" || status === "deleting") {
+    return "x";
+  } else {
+    return "";
+  }
+}
+"#;
+
+#[test]
+fn added_domain_value_lists_sites_anywhere_that_do_not_handle_it() {
+    let base = Tree::new("states-base");
+    base.write("src/status.ts", STATUS_BASE)
+        .write("src/badge.ts", BADGE);
+    let head = Tree::new("states-head");
+    head.write("src/status.ts", STATUS_HEAD)
+        .write("src/badge.ts", BADGE)
+        .write("src/colour.ts", NEW_FN);
+    let report = diff(&base.index(), &head.index());
+
+    assert_eq!(report.states.domains.len(), 1);
+    let d = &report.states.domains[0];
+    assert_eq!(d.domain, "Status");
+    assert_eq!(d.added, vec!["deleting"]);
+    assert!(d.removed.is_empty());
+    let unhandled: Vec<(&str, &[String])> = d
+        .unhandled
+        .iter()
+        .map(|u| (u.site.function.as_str(), u.values.as_slice()))
+        .collect();
+    assert_eq!(
+        unhandled,
+        vec![
+            ("fn:src/badge.ts#badge", &["deleting".to_owned()][..]),
+            ("fn:src/badge.ts#strict", &["deleting".to_owned()][..]),
+        ]
+    );
+    assert_eq!(
+        report.states.domains[0].unhandled[0].site.default,
+        DefaultKind::ReturnsEmpty
+    );
+
+    let silent: Vec<&str> = report
+        .states
+        .silent_defaults
+        .iter()
+        .map(|s| s.function.as_str())
+        .collect();
+    assert_eq!(silent, vec!["fn:src/colour.ts#colour"]);
+    assert_eq!(report.states.silent_defaults[0].missing, vec!["paused"]);
+
+    let new_unhandled = report.insights.new.iter().any(|i| {
+        matches!(i, Insight::UnhandledValues { node, missing, .. }
+            if node == "fn:src/badge.ts#badge" && missing == &["deleting".to_owned()])
+    });
+    assert!(new_unhandled, "{:?}", report.insights.new);
+}
+
+#[test]
+fn unchanged_domains_produce_no_states_delta() {
+    let base = Tree::new("states-same-base");
+    base.write("src/status.ts", STATUS_HEAD)
+        .write("src/badge.ts", BADGE);
+    let head = Tree::new("states-same-head");
+    head.write("src/status.ts", STATUS_HEAD)
+        .write("src/badge.ts", BADGE);
+    let report = diff(&base.index(), &head.index());
+    assert!(report.states.domains.is_empty());
+    assert!(report.states.silent_defaults.is_empty());
 }

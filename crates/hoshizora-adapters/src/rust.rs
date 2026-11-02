@@ -1,13 +1,15 @@
 use hoshizora_model::{
-    CallSite, FileFacts, Import, Language, Param, Symbol, SymbolKind, Visibility,
+    CallSite, DefaultKind, Domain, DomainValue, FileFacts, Import, Language, Param, Symbol,
+    SymbolKind, Visibility,
 };
 use tree_sitter::Node;
 
 use crate::Adapter;
 use crate::common::{
-    self, BodySpec, CallInfo, all_children, child_of_kind, clean_comment_lines, collapse_ws,
-    field_text, has_child_kind, header, last_segment, named_children, preceding_comments,
-    preceding_of_kind, span, string_args, strip_generics, strip_ws, text,
+    self, BodySpec, CallInfo, ChainSpec, Comparison, Handled, Sites, all_children, child_of_kind,
+    clean_comment_lines, collapse_ws, field_text, has_child_kind, header, last_segment,
+    named_children, preceding_comments, preceding_of_kind, span, string_args, strip_generics,
+    strip_ws, text,
 };
 
 pub struct RustAdapter;
@@ -281,6 +283,199 @@ fn message_sites(body: Node, source: &str) -> Vec<CallSite> {
     out
 }
 
+const CHAIN: ChainSpec = ChainSpec {
+    ifs: &["if_expression"],
+    elifs: &[],
+    elses: &["else_clause"],
+};
+
+const LITERALS: &[&str] = &["string_literal", "integer_literal", "char_literal"];
+
+fn literal(node: Node, source: &str) -> Option<String> {
+    LITERALS
+        .contains(&node.kind())
+        .then(|| common::string_value(node, source, &[], &[]))
+}
+
+/// Values a pattern stands for; `None` when the pattern is not a plain value or wildcard
+/// (tuples, ranges, `Some(..)`), which disqualifies the whole site.
+fn pattern_values(node: Node, source: &str, out: &mut Vec<Handled>) -> Option<bool> {
+    match node.kind() {
+        "match_pattern" | "or_pattern" => {
+            let mut wildcard = false;
+            let guard = node.child_by_field_name("condition");
+            for c in all_children(node) {
+                if (c.is_named() || c.kind() == "_") && guard != Some(c) {
+                    wildcard |= pattern_values(c, source, out)?;
+                }
+            }
+            Some(wildcard)
+        }
+        "_" => Some(true),
+        "identifier" => {
+            let t = text(node, source);
+            if t.starts_with(|c: char| c.is_ascii_uppercase()) {
+                out.push(Handled::literal(t.to_owned()));
+                Some(false)
+            } else {
+                Some(true)
+            }
+        }
+        "scoped_identifier" => {
+            out.push(Handled::member(&strip_generics(text(node, source)), "::")?);
+            Some(false)
+        }
+        "tuple_struct_pattern" | "struct_pattern" => {
+            out.push(Handled::member(&variant_path(node, source)?, "::")?);
+            Some(false)
+        }
+        k if LITERALS.contains(&k) => {
+            out.push(Handled::literal(literal(node, source)?));
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// `x == S::A`, `a == 1 || a == 2`, `matches!(x, A | B)`, `let S::A = x`.
+fn compare(node: Node, source: &str) -> Option<Comparison> {
+    match node.kind() {
+        "parenthesized_expression" => compare(named_children(node).into_iter().next()?, source),
+        "binary_expression" => {
+            let op = text(node.child_by_field_name("operator")?, source);
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            match op {
+                "||" => Comparison::merge(compare(left, source), compare(right, source)),
+                "==" => {
+                    let value = |n: Node| {
+                        literal(n, source).map(Handled::literal).or_else(|| {
+                            (n.kind() == "scoped_identifier")
+                                .then(|| Handled::member(text(n, source), "::"))
+                                .flatten()
+                        })
+                    };
+                    match (value(right), value(left)) {
+                        (Some(v), _) => Comparison::new(text(left, source), vec![v]),
+                        (None, Some(v)) => Comparison::new(text(right, source), vec![v]),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        "let_condition" => {
+            let mut values = Vec::new();
+            let wildcard =
+                pattern_values(node.child_by_field_name("pattern")?, source, &mut values)?;
+            if wildcard {
+                return None;
+            }
+            Comparison::new(text(node.child_by_field_name("value")?, source), values)
+        }
+        "macro_invocation" => {
+            if last_segment(text(node.child_by_field_name("macro")?, source)) != "matches" {
+                return None;
+            }
+            let tokens = text(child_of_kind(node, "token_tree")?, source);
+            let inner = tokens.get(1..tokens.len() - 1)?;
+            let (subject, pats) = inner.split_once(',')?;
+            let padded = format!(
+                "fn __m(x: i32) {{ match x {{ {} => 1, _ => 2 }} }}",
+                pats.trim()
+            );
+            let tree = common::parse_tree(&tree_sitter_rust::LANGUAGE.into(), &padded).ok()?;
+            let mut arm = None;
+            let mut pending = vec![tree.root_node()];
+            while let Some(n) = pending.pop() {
+                if n.kind() == "match_arm" {
+                    arm = Some(n);
+                    break;
+                }
+                pending.extend(named_children(n).into_iter().rev());
+            }
+            let mut values = Vec::new();
+            let wildcard =
+                pattern_values(arm?.child_by_field_name("pattern")?, &padded, &mut values)?;
+            if wildcard {
+                return None;
+            }
+            Comparison::new(subject, values)
+        }
+        _ => None,
+    }
+}
+
+fn match_site(node: Node, source: &str, sites: &mut Sites) {
+    let Some(subject) = node.child_by_field_name("value") else {
+        return;
+    };
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cmp = Comparison {
+        subject: strip_ws(text(subject, source)),
+        ..Comparison::default()
+    };
+    let mut default = DefaultKind::None;
+    for arm in named_children(body) {
+        if arm.kind() != "match_arm" {
+            continue;
+        }
+        let Some(pat) = arm.child_by_field_name("pattern") else {
+            continue;
+        };
+        let mut values = Vec::new();
+        let Some(wildcard) = pattern_values(pat, source, &mut values) else {
+            return;
+        };
+        cmp.extend(values);
+        if wildcard && pat.child_by_field_name("condition").is_none() {
+            default = arm
+                .child_by_field_name("value")
+                .map_or(DefaultKind::Other, |v| {
+                    common::classify_default(text(v, source))
+                });
+        }
+    }
+    sites.push(common::line(node), cmp, default);
+}
+
+fn discriminations(body: Node, source: &str) -> Vec<hoshizora_model::Discrimination> {
+    let mut sites = Sites::default();
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "match_expression" => match_site(node, source, &mut sites),
+            "if_expression" => sites.if_chain(node, source, &CHAIN, &compare, &|b, s| {
+                text(b, s).to_owned()
+            }),
+            _ => {}
+        }
+        pending.extend(named_children(node).into_iter().rev());
+    }
+    sites.out
+}
+
+fn enum_domain(node: Node, source: &str) -> Option<Domain> {
+    let body = node.child_by_field_name("body")?;
+    let values: Vec<DomainValue> = named_children(body)
+        .into_iter()
+        .filter(|c| c.kind() == "enum_variant")
+        .filter_map(|c| {
+            Some(DomainValue {
+                name: field_text(c, "name", source)?,
+                literal: None,
+            })
+        })
+        .collect();
+    (values.len() >= 2).then_some(Domain {
+        name: field_text(node, "name", source)?,
+        values,
+        span: span(node),
+    })
+}
+
 fn doc(node: Node, source: &str) -> Option<String> {
     let lines: Vec<&str> = preceding_comments(node, COMMENTS, &["attribute_item"])
         .into_iter()
@@ -356,6 +551,7 @@ struct Ctx<'a> {
     source: &'a str,
     symbols: Vec<Symbol>,
     imports: Vec<Import>,
+    domains: Vec<Domain>,
     trait_impls: Vec<(String, String)>,
 }
 
@@ -388,6 +584,7 @@ impl Ctx<'_> {
                 let mut body = common::analyze_body(b, self.source, &SPEC);
                 body.calls.extend(message_sites(b, self.source));
                 body.calls.sort_by_key(|c| c.line);
+                body.discriminations = discriminations(b, self.source);
                 body
             }),
             name,
@@ -396,6 +593,9 @@ impl Ctx<'_> {
 
     fn plain(&mut self, node: Node, kind: SymbolKind) {
         let name = field_text(node, "name", self.source).unwrap_or_default();
+        if node.kind() == "enum_item" {
+            self.domains.extend(enum_domain(node, self.source));
+        }
         let mut attrs = attributes(node, self.source);
         if let Some(body) = node.child_by_field_name("body") {
             attrs.extend(
@@ -547,6 +747,7 @@ impl Adapter for RustAdapter {
             source,
             symbols: vec![],
             imports: vec![],
+            domains: vec![],
             trait_impls: vec![],
         };
         for item in all_children(tree.root_node()) {
@@ -568,6 +769,7 @@ impl Adapter for RustAdapter {
             lines: common::line_count(source),
             imports: ctx.imports,
             symbols: ctx.symbols,
+            domains: ctx.domains,
         })
     }
 }
