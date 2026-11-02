@@ -11,13 +11,13 @@ pub trait ProjectCandidate {
 
 /// Index of the project `span` goes to: the one owning its `service.name`, else `hint`
 /// (from the `x-hoshizora-project` header or `?project=`), else the one its code location
-/// resolves in, else the first project. `None` only when there are no projects or the hint
-/// names an unknown project.
+/// resolves in, else the only project. `Ok(None)` when several projects exist and none
+/// claims the span.
 pub fn project_for_span<P: ProjectCandidate>(
     span: &RuntimeSpan,
     hint: Option<&str>,
     projects: &[P],
-) -> Result<usize, RouteError> {
+) -> Result<Option<usize>, RouteError> {
     if projects.is_empty() {
         return Err(RouteError::NoProjects);
     }
@@ -25,15 +25,19 @@ pub fn project_for_span<P: ProjectCandidate>(
         .iter()
         .position(|p| p.services().iter().any(|s| s == &span.service))
     {
-        return Ok(i);
+        return Ok(Some(i));
     }
     if let Some(hint) = hint.map(str::trim).filter(|h| !h.is_empty()) {
         return projects
             .iter()
             .position(|p| p.id() == hint)
+            .map(Some)
             .ok_or_else(|| RouteError::UnknownProject(hint.to_string()));
     }
-    Ok(projects.iter().position(|p| p.locates(span)).unwrap_or(0))
+    Ok(projects
+        .iter()
+        .position(|p| p.locates(span))
+        .or((projects.len() == 1).then_some(0)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,25 +95,40 @@ mod tests {
     }
 
     #[test]
-    fn service_then_hint_then_location_then_first() {
+    fn service_then_hint_then_location() {
         let projects = vec![
             P("a", vec![], false),
             P("b", vec!["api".into()], false),
             P("c", vec![], true),
         ];
-        assert_eq!(project_for_span(&span("api"), Some("a"), &projects), Ok(1));
-        assert_eq!(project_for_span(&span("web"), Some("a"), &projects), Ok(0));
+        assert_eq!(
+            project_for_span(&span("api"), Some("a"), &projects),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            project_for_span(&span("web"), Some("a"), &projects),
+            Ok(Some(0))
+        );
         assert_eq!(
             project_for_span(&span("web"), Some("zz"), &projects),
             Err(RouteError::UnknownProject("zz".into()))
         );
-        assert_eq!(project_for_span(&span("web"), None, &projects), Ok(2));
-        assert_eq!(project_for_span(&span("web"), Some(" "), &projects), Ok(2));
-        let none = vec![P("a", vec![], false)];
-        assert_eq!(project_for_span(&span("web"), None, &none), Ok(0));
+        assert_eq!(project_for_span(&span("web"), None, &projects), Ok(Some(2)));
+        assert_eq!(
+            project_for_span(&span("web"), Some(" "), &projects),
+            Ok(Some(2))
+        );
         assert_eq!(
             project_for_span(&span("web"), None, &Vec::<P>::new()),
             Err(RouteError::NoProjects)
         );
+    }
+
+    #[test]
+    fn unclaimed_span_goes_to_the_only_project_else_nowhere() {
+        let one = vec![P("a", vec![], false)];
+        assert_eq!(project_for_span(&span("web"), None, &one), Ok(Some(0)));
+        let two = vec![P("a", vec![], false), P("b", vec!["api".into()], false)];
+        assert_eq!(project_for_span(&span("web"), None, &two), Ok(None));
     }
 }

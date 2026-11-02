@@ -638,9 +638,11 @@ async fn traces_ingest<Q: GraphQueries>(
         .collect();
     let count = spans.len();
     let mut per_project: Vec<Vec<RuntimeSpan>> = vec![Vec::new(); candidates.len()];
+    let mut unplaced = 0usize;
     for span in spans {
         match project_for_span(&span, hint.as_deref(), &candidates) {
-            Ok(i) => per_project[i].push(span),
+            Ok(Some(i)) => per_project[i].push(span),
+            Ok(None) => unplaced += 1,
             Err(e) => return AppError::not_found(&e.to_string()).into_response(),
         }
     }
@@ -655,6 +657,9 @@ async fn traces_ingest<Q: GraphQueries>(
         for event in events {
             let _ = candidate.state.events.send(event);
         }
+    }
+    if unplaced > 0 {
+        tracing::debug!(spans = unplaced, "dropped spans no project claims");
     }
     tracing::debug!(spans = count, "ingested OTLP export");
     if content_type
@@ -1773,7 +1778,7 @@ mod tests {
             v.sort();
             v
         };
-        assert_eq!(ids(&ta), vec!["01".repeat(16), "05".repeat(16)]);
+        assert_eq!(ids(&ta), vec!["01".repeat(16)]);
         assert_eq!(
             ids(&tb),
             vec!["02".repeat(16), "03".repeat(16), "04".repeat(16)]
@@ -1789,7 +1794,7 @@ mod tests {
         while rx_b.try_recv().is_ok() {
             seen_b += 1;
         }
-        assert_eq!((seen_a, seen_b), (2, 3));
+        assert_eq!((seen_a, seen_b), (1, 3));
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
