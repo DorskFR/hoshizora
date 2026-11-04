@@ -180,7 +180,8 @@ pub async fn ls_remote(
         cmd.arg("HEAD");
     } else {
         cmd.arg(format!("refs/heads/{ref}", ref = r#ref))
-            .arg(format!("refs/tags/{ref}", ref = r#ref));
+            .arg(format!("refs/tags/{ref}", ref = r#ref))
+            .arg(format!("refs/tags/{ref}^{{}}", ref = r#ref));
     }
     let out = run(opts, cmd, "ls-remote").await?;
     Ok(parse_ls_remote(&out, r#ref))
@@ -388,6 +389,55 @@ mod tests {
         );
         assert_eq!(parse_ls_remote(out, "v3"), None);
         assert_eq!(parse_ls_remote("", "main"), None);
+    }
+
+    #[tokio::test]
+    async fn ls_remote_resolves_annotated_tag_to_its_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "hoshizora-lsremote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&["tag", "-a", "v1", "-m", "release"]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        assert_ne!(
+            git(&["rev-parse", "v1"]),
+            commit,
+            "tag object differs from commit"
+        );
+
+        let opts = GitOptions {
+            allow_file_urls: true,
+            ..Default::default()
+        };
+        let url = format!("file://{}", dir.display());
+        assert_eq!(ls_remote(&opts, &url, "v1").await.unwrap(), Some(commit));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

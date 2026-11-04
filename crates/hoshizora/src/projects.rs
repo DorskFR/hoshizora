@@ -1,6 +1,6 @@
 //! The project registry: `projects.json`, clones under `repos/`, graphs under `graphs/`, the
 //! background clone + index jobs that move a project to `ready`, and the periodic remote check
-//! that reindexes a git project when its tracked ref moves.
+//! that reindexes an opted-in git project when its tracked ref moves.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use anyhow::Context;
 use hoshizora_model::Graph;
 use hoshizora_model::api::{
     AddProject, DiskSpace, Project, ProjectSource, ProjectStatus, ProjectStorage, PurgeReport,
-    Purged, Storage,
+    Purged, Storage, UpdateProject,
 };
 use hoshizora_runtime::RuntimeConfig;
 
@@ -381,6 +381,7 @@ impl<Q: GraphQueries> AppState<Q> {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            auto_refresh: false,
         };
         self.write().push(ProjectEntry {
             project: project.clone(),
@@ -437,6 +438,7 @@ impl<Q: GraphQueries> AppState<Q> {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            auto_refresh: false,
         };
         self.write().push(ProjectEntry {
             project: project.clone(),
@@ -541,6 +543,7 @@ impl<Q: GraphQueries> AppState<Q> {
             .read()
             .iter()
             .filter(|e| matches!(e.project.source, ProjectSource::Git { .. }))
+            .filter(|e| e.project.auto_refresh)
             .map(|e| e.project.id.clone())
             .collect();
         for id in ids {
@@ -550,7 +553,7 @@ impl<Q: GraphQueries> AppState<Q> {
         }
     }
 
-    /// Checks every git project's remote every `interval`.
+    /// Checks the remote of every git project with `auto_refresh` every `interval`.
     pub fn spawn_refresh(self: &Arc<Self>, interval: Duration) {
         let state = Arc::clone(self);
         tokio::spawn(async move {
@@ -559,6 +562,27 @@ impl<Q: GraphQueries> AppState<Q> {
                 state.refresh_all().await;
             }
         });
+    }
+
+    pub fn update(&self, id: &str, req: UpdateProject) -> Result<Project, AppError> {
+        let project = {
+            let mut projects = self.write();
+            let entry = projects
+                .iter_mut()
+                .find(|e| e.project.id == id)
+                .ok_or_else(|| AppError::not_found("project"))?;
+            if let Some(on) = req.auto_refresh {
+                if on && matches!(entry.project.source, ProjectSource::Path { .. }) {
+                    return Err(AppError::bad_request(
+                        "a path project has no remote to refresh from",
+                    ));
+                }
+                entry.project.auto_refresh = on;
+            }
+            entry.project.clone()
+        };
+        self.persist();
+        Ok(project)
     }
 
     fn set_tracked_ref(&self, id: &str, r#ref: Option<String>) {
@@ -1305,6 +1329,7 @@ mod tests {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            auto_refresh: false,
         };
         let root = state.repo_dir(&id);
         state.insert_ready(
@@ -1371,6 +1396,37 @@ mod tests {
             "new ref queues a rebuild"
         );
         assert_eq!(state.list().len(), 1);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn periodic_check_skips_projects_not_opted_in() {
+        let remote = FakeRemote::new(&[("HEAD", "moved")]);
+        let state = fake_state(Arc::clone(&remote));
+        let off = ready_git(&state, "file:///nowhere/p/off", None, "abc");
+        let on = ready_git(&state, "file:///nowhere/p/on", None, "abc");
+
+        state.refresh_all().await;
+        assert_eq!(remote.calls(), 0, "nothing is checked by default");
+        assert!(
+            state
+                .list()
+                .iter()
+                .all(|p| p.status == ProjectStatus::Ready)
+        );
+
+        state
+            .update(
+                &on.id,
+                UpdateProject {
+                    auto_refresh: Some(true),
+                },
+            )
+            .unwrap();
+        state.refresh_all().await;
+        assert_eq!(remote.calls(), 1);
+        assert_eq!(state.get(&on.id).unwrap().status, ProjectStatus::Cloning);
+        assert_eq!(state.get(&off.id).unwrap().status, ProjectStatus::Ready);
         let _ = std::fs::remove_dir_all(&state.data_dir);
     }
 

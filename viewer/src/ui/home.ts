@@ -202,6 +202,23 @@ export class ProjectHome {
     await this.refresh();
   }
 
+  private autoRefreshToggle(p: Project): HTMLElement {
+    const toggle = h("input", {
+      type: "checkbox",
+      checked: p.auto_refresh ?? false,
+      onchange: () => void this.act(() => this.api.update(p.id, { auto_refresh: toggle.checked })),
+    });
+    return h(
+      "label",
+      {
+        class: "check small",
+        title: "Periodically check the remote and reindex when the tracked ref moves",
+      },
+      toggle,
+      " Auto-refresh",
+    );
+  }
+
   private storageOf(id: string): ProjectStorage | undefined {
     return this.storage?.projects.find((s) => s.id === id);
   }
@@ -295,6 +312,7 @@ export class ProjectHome {
             },
             "Reindex",
           ),
+          p.source.kind === "git" && this.autoRefreshToggle(p),
           p.source.kind === "git" &&
             h(
               "button",

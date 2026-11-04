@@ -51,9 +51,11 @@ A declared URL or path that is already registered keeps its clone and graph; its
 `name`, `services` and `ref` are merged in on every start (a changed `ref` queues a rebuild), so
 the flags are safe to keep when the data dir does persist.
 
-Git projects follow their remote: every `--refresh-interval` minutes (`HOSHIZORA_REFRESH_INTERVAL`,
-default 15, 0 disables) a `git ls-remote` compares the tracked ref with the indexed commit and
-rebuilds when it moved; rebuilds run one project at a time. A project without a declared `ref`
+Git projects can follow their remote. Auto-refresh is opt-in per project: tick it on the project
+card, or `PATCH /api/projects/{id}` with `{"auto_refresh": true}`; it is saved in `projects.json`.
+For opted-in projects, every `--refresh-interval` minutes (`HOSHIZORA_REFRESH_INTERVAL`, default 15,
+0 disables) a `git ls-remote` compares the tracked ref with the indexed commit and rebuilds when it
+moved; rebuilds run one project at a time. A project without a declared `ref`
 also follows the deployed code: when its spans carry a `service.version` and the remote has a
 tag `v<version>` or `<version>`, the project switches to that tag. `GET /api/projects` shows the
 declared `ref`, the `tracked_ref` adopted this way, the `indexed_ref`/`commit` the graph was built

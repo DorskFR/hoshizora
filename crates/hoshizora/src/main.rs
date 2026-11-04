@@ -84,8 +84,8 @@ enum Command {
         /// Extra packs used with `--reindex`.
         #[arg(long)]
         packs: Option<PathBuf>,
-        /// Minutes between remote checks of git projects (`git ls-remote`); a moved ref or a
-        /// new `service.version` tag triggers a rebuild. 0 disables the check.
+        /// Minutes between remote checks of git projects with auto-refresh enabled
+        /// (`git ls-remote`); a moved ref triggers a rebuild. 0 disables the check.
         #[arg(long, env = "HOSHIZORA_REFRESH_INTERVAL", default_value_t = 15)]
         refresh_interval: u64,
     },
@@ -528,6 +528,7 @@ fn serve_legacy_graph(
         tracked_ref: None,
         indexed_ref: None,
         seen_version: None,
+        auto_refresh: false,
     };
     state.insert_ready(project, GraphIndex::new(graph), root, Some(0));
     Ok(())

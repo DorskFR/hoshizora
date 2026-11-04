@@ -361,6 +361,12 @@ export interface Project {
   nodes: number;
   edges: number;
   services: string[];
+  /** Opt-in: the server's periodic remote check reindexes this git project when its ref moves. */
+  auto_refresh?: boolean;
+}
+
+export interface UpdateProject {
+  auto_refresh?: boolean;
 }
 
 export interface AddProject {

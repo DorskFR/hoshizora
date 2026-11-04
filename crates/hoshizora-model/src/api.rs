@@ -176,6 +176,9 @@ pub struct Project {
     /// Last `service.version` carried by spans routed to this project.
     #[serde(default)]
     pub seen_version: Option<String>,
+    /// Opt-in: the periodic remote check reindexes this git project when its ref moves.
+    #[serde(default)]
+    pub auto_refresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +204,13 @@ pub struct AddProject {
     pub name: Option<String>,
     #[serde(default)]
     pub services: Vec<String>,
+}
+
+/// Body of `PATCH /api/projects/{project}`; absent fields are left unchanged.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UpdateProject {
+    #[serde(default)]
+    pub auto_refresh: Option<bool>,
 }
 
 /// A clone deleted by `POST /api/projects/{project}/purge`; the project and its graph stay.
