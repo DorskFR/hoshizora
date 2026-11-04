@@ -165,6 +165,47 @@ pub async fn update(
     run(opts, cmd, "reset").await.map(drop)
 }
 
+/// Commit `ref` (a branch, tag or `HEAD`) points at on the remote, without a clone; `None`
+/// when the remote has no such ref. Annotated tags resolve to the tagged commit.
+pub async fn ls_remote(
+    opts: &GitOptions,
+    url: &str,
+    r#ref: &str,
+) -> anyhow::Result<Option<String>> {
+    validate_url(url, opts.allow_file_urls)?;
+    validate_ref(r#ref)?;
+    let mut cmd = command(opts, Some(url));
+    cmd.args(["ls-remote", "--quiet", "--"]).arg(url);
+    if r#ref == "HEAD" {
+        cmd.arg("HEAD");
+    } else {
+        cmd.arg(format!("refs/heads/{ref}", ref = r#ref))
+            .arg(format!("refs/tags/{ref}", ref = r#ref));
+    }
+    let out = run(opts, cmd, "ls-remote").await?;
+    Ok(parse_ls_remote(&out, r#ref))
+}
+
+fn parse_ls_remote(out: &str, r#ref: &str) -> Option<String> {
+    let lines: Vec<(&str, &str)> = out
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(sha, name)| (sha.trim(), name.trim()))
+        .collect();
+    let pick = |name: &str| {
+        lines
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(s, _)| (*s).to_string())
+    };
+    if r#ref == "HEAD" {
+        return pick("HEAD");
+    }
+    pick(&format!("refs/heads/{ref}", ref = r#ref))
+        .or_else(|| pick(&format!("refs/tags/{ref}^{{}}", ref = r#ref)))
+        .or_else(|| pick(&format!("refs/tags/{ref}", ref = r#ref)))
+}
+
 pub async fn head(opts: &GitOptions, dest: &Path) -> anyhow::Result<String> {
     let mut cmd = command(opts, None);
     cmd.current_dir(dest).args(["rev-parse", "HEAD"]);
@@ -333,6 +374,20 @@ mod tests {
         let ranges = parse_hunks(diff);
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges["src/a.rs"], vec![(3, 4), (12, 12)]);
+    }
+
+    #[test]
+    fn ls_remote_picks_branch_then_peeled_tag() {
+        let out = "aaa\trefs/heads/main\nbbb\trefs/tags/v1\nccc\trefs/tags/v1^{}\nddd\tHEAD\n";
+        assert_eq!(parse_ls_remote(out, "main").as_deref(), Some("aaa"));
+        assert_eq!(parse_ls_remote(out, "v1").as_deref(), Some("ccc"));
+        assert_eq!(parse_ls_remote(out, "HEAD").as_deref(), Some("ddd"));
+        assert_eq!(
+            parse_ls_remote("bbb\trefs/tags/v2\n", "v2").as_deref(),
+            Some("bbb")
+        );
+        assert_eq!(parse_ls_remote(out, "v3"), None);
+        assert_eq!(parse_ls_remote("", "main"), None);
     }
 
     #[test]

@@ -62,8 +62,8 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
         /// Project to register at startup, `[name=]<url>[@ref]` or a local path; repeatable,
-        /// or comma-separated in `HOSHIZORA_PROJECTS`. Already registered URLs and paths are
-        /// kept as they are.
+        /// or comma-separated in `HOSHIZORA_PROJECTS`. An already registered URL or path keeps
+        /// its clone and graph and takes the declared name, services and ref.
         #[arg(long = "project", env = "HOSHIZORA_PROJECTS", value_delimiter = ',')]
         projects: Vec<String>,
         /// JSON array of `{url, ref?, name?, services?}` or `{path, name?}` entries to register
@@ -84,6 +84,10 @@ enum Command {
         /// Extra packs used with `--reindex`.
         #[arg(long)]
         packs: Option<PathBuf>,
+        /// Minutes between remote checks of git projects (`git ls-remote`); a moved ref or a
+        /// new `service.version` tag triggers a rebuild. 0 disables the check.
+        #[arg(long, env = "HOSHIZORA_REFRESH_INTERVAL", default_value_t = 15)]
+        refresh_interval: u64,
     },
     /// Compare two revisions (source trees or graph files) and print JSON.
     Diff {
@@ -189,6 +193,7 @@ fn main() -> anyhow::Result<()> {
             otlp_port,
             reindex,
             packs,
+            refresh_interval,
         } => tokio::runtime::Runtime::new()?.block_on(cmd_serve(ServeArgs {
             graph,
             root,
@@ -200,6 +205,7 @@ fn main() -> anyhow::Result<()> {
             otlp_port,
             reindex,
             packs,
+            refresh_interval,
         })),
         Command::Diff {
             base,
@@ -320,6 +326,7 @@ struct ServeArgs {
     otlp_port: u16,
     reindex: bool,
     packs: Option<PathBuf>,
+    refresh_interval: u64,
 }
 
 async fn cmd_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -366,6 +373,9 @@ async fn cmd_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     }
     server::spawn_stats_ticker(Arc::clone(&state));
+    if args.refresh_interval > 0 {
+        state.spawn_refresh(std::time::Duration::from_secs(args.refresh_interval * 60));
+    }
     let app = server::router(Arc::clone(&state));
 
     let main_addr = SocketAddr::from((args.host, args.port));
@@ -393,15 +403,39 @@ async fn cmd_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     };
 
-    let main_srv = axum::serve(main, app.clone());
+    let main_srv = axum::serve(main, app.clone()).with_graceful_shutdown(shutdown_signal());
     match otlp {
         Some(l) => {
-            let otlp_srv = axum::serve(l, app);
+            let otlp_srv = axum::serve(l, app).with_graceful_shutdown(shutdown_signal());
             tokio::try_join!(main_srv.into_future(), otlp_srv.into_future())?;
         }
         None => main_srv.await?,
     }
+    server::persist_all_stats(&state);
+    tracing::info!("runtime stats saved");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler unavailable");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 /// `serve --graph X [--root Y]`: loads (or rebuilds) one graph and registers it as the first
@@ -462,6 +496,9 @@ fn serve_legacy_graph(
         nodes: 0,
         edges: 0,
         services: Vec::new(),
+        tracked_ref: None,
+        indexed_ref: None,
+        seen_version: None,
     };
     state.insert_ready(project, GraphIndex::new(graph), root, Some(0));
     Ok(())

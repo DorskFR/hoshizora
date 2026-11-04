@@ -65,9 +65,16 @@ pub fn normalise(request: ExportTraceServiceRequest) -> Vec<RuntimeSpan> {
             .get("service.name")
             .cloned()
             .unwrap_or_else(|| "unknown_service".to_string());
+        let version = resource_attrs.get("service.version");
         for scope_spans in resource_spans.scope_spans {
             for s in scope_spans.spans {
-                out.push(normalise_span(s, &service));
+                let mut span = normalise_span(s, &service);
+                if let Some(v) = version {
+                    span.attrs
+                        .entry("service.version".into())
+                        .or_insert_with(|| v.clone());
+                }
+                out.push(span);
             }
         }
     }
@@ -297,6 +304,7 @@ mod tests {
     "resource": {
       "attributes": [
         {"key": "service.name", "value": {"stringValue": "webui"}},
+        {"key": "service.version", "value": {"stringValue": "0.29.0-beta.1"}},
         {"key": "telemetry.sdk.language", "value": {"stringValue": "webjs"}},
         {"key": "process.pid", "value": {"intValue": "4242"}}
       ]
@@ -333,6 +341,7 @@ mod tests {
         assert_eq!(s.span_id, "051581bf3cb55c13");
         assert_eq!(s.parent_span_id, None);
         assert_eq!(s.service, "webui");
+        assert_eq!(s.attrs["service.version"], "0.29.0-beta.1");
         assert_eq!(s.kind, SpanKind::Client);
         assert_eq!(s.start_unix_nanos, 1_718_100_000_000_000_000);
         assert_eq!(s.duration_nanos(), 250_000_000);

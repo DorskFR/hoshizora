@@ -7,6 +7,10 @@ pub struct RuntimeConfig {
     pub max_traces: usize,
     /// Spans kept in memory across all traces.
     pub max_spans: usize,
+    /// Nodes with aggregates kept in memory; the least recently seen is dropped past this.
+    pub max_stats_nodes: usize,
+    /// How often aggregates are written to the data dir.
+    pub stats_persist_secs: u64,
     /// Sliding window for `rate_per_sec`.
     pub rate_window_secs: u64,
     /// HotPath: at least this many calls per second...
@@ -30,6 +34,8 @@ impl Default for RuntimeConfig {
         Self {
             max_traces: 2000,
             max_spans: 200_000,
+            max_stats_nodes: 10_000,
+            stats_persist_secs: 60,
             rate_window_secs: 60,
             hot_rate_per_sec: 50.0,
             hot_p95_nanos: 5_000_000,

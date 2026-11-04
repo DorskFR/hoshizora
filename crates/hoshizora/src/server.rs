@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use hoshizora_model::api::{
 };
 use hoshizora_model::{EdgeKind, Graph, Insight, LiveEvent, Node, NodeStats, RuntimeSpan};
 use hoshizora_runtime::route::{ProjectCandidate, project_for_span};
-use hoshizora_runtime::{NodeLookup, Runtime, RuntimeConfig, Trace, otlp};
+use hoshizora_runtime::{NodeLookup, Runtime, RuntimeConfig, StatsSnapshot, Trace, otlp};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -43,6 +44,7 @@ pub struct ProjectState<Q: GraphQueries> {
     /// the whole `ProjectState`.
     graph_json: Bytes,
     slim_graph_json: Bytes,
+    stats_restored: AtomicBool,
 }
 
 impl<Q: GraphQueries + 'static> ProjectState<Q> {
@@ -60,6 +62,7 @@ impl<Q: GraphQueries + 'static> ProjectState<Q> {
             root,
             graph_json,
             slim_graph_json,
+            stats_restored: AtomicBool::new(false),
         })
     }
 
@@ -74,6 +77,46 @@ impl<Q: GraphQueries + 'static> ProjectState<Q> {
         if !changed.is_empty() {
             let _ = self.events.send(LiveEvent::Stats { stats: changed });
         }
+    }
+
+    /// Merges the aggregates saved at `path` into the runtime, once per `ProjectState`.
+    pub fn restore_stats(&self, path: &Path) {
+        if self.stats_restored.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(snapshot) = StatsSnapshot::load(path) {
+            let added = self.runtime().import_stats(&snapshot);
+            tracing::info!(path = %path.display(), nodes = added, "restored runtime stats");
+        }
+    }
+
+    /// Writes the aggregates to `path`; nothing is written while there are none.
+    pub fn persist_stats(&self, path: &Path) {
+        let snapshot = self
+            .runtime()
+            .export_stats(hoshizora_runtime::now_unix_nanos());
+        if snapshot.nodes.is_empty() {
+            return;
+        }
+        if let Err(e) = snapshot.save(path) {
+            tracing::warn!(path = %path.display(), error = %e, "saving runtime stats");
+        }
+    }
+
+    fn stats_persist_secs(&self) -> u64 {
+        self.runtime().config().stats_persist_secs.max(1)
+    }
+}
+
+/// `<data_dir>/stats/<project>.json`.
+pub fn stats_path(data_dir: &Path, project: &str) -> PathBuf {
+    data_dir.join("stats").join(format!("{project}.json"))
+}
+
+/// Saves every ready project's aggregates.
+pub fn persist_all_stats<Q: GraphQueries + 'static>(state: &AppState<Q>) {
+    for (id, _, project) in state.candidates() {
+        project.persist_stats(&stats_path(&state.data_dir, &id));
     }
 }
 
@@ -166,14 +209,22 @@ fn cors() -> CorsLayer {
         .max_age(Duration::from_secs(3600))
 }
 
-/// Emits a `Stats` live event every second on every ready project while the server runs.
+/// Every second while the server runs: restores saved aggregates into projects that have not
+/// loaded them yet, emits a `Stats` live event per project, and periodically saves aggregates.
 pub fn spawn_stats_ticker<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks: u64 = 0;
         loop {
             tick.tick().await;
-            for project in state.ready_states() {
+            ticks += 1;
+            for (id, _, project) in state.candidates() {
+                let path = stats_path(&state.data_dir, &id);
+                project.restore_stats(&path);
                 project.publish_stats();
+                if ticks.is_multiple_of(project.stats_persist_secs()) {
+                    project.persist_stats(&path);
+                }
             }
         }
     });
@@ -650,6 +701,9 @@ async fn traces_ingest<Q: GraphQueries>(
         if spans.is_empty() {
             continue;
         }
+        if let Some(version) = spans.iter().find_map(|s| s.attrs.get("service.version")) {
+            state.note_version(&candidate.id, version);
+        }
         let events = candidate
             .state
             .runtime()
@@ -1026,6 +1080,9 @@ mod tests {
             nodes: 0,
             edges: 0,
             services: vec![],
+            tracked_ref: None,
+            indexed_ref: None,
+            seen_version: None,
         }
     }
 
@@ -1193,6 +1250,47 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[test]
+    fn stats_persist_and_restore_into_a_new_project_state() {
+        let app_state = app_state();
+        let root = temp_root();
+        app_state.insert_ready(path_project("fake", &root), Fake::new(), root.clone(), None);
+        let first = app_state.project_state(None).unwrap();
+        let path = stats_path(&app_state.data_dir, "fake");
+
+        first.persist_stats(&path);
+        assert!(!path.exists());
+
+        let span = RuntimeSpan {
+            trace_id: "t".into(),
+            span_id: "s".into(),
+            parent_span_id: None,
+            service: "svc".into(),
+            name: "op".into(),
+            kind: hoshizora_model::SpanKind::Internal,
+            start_unix_nanos: 0,
+            end_unix_nanos: 7,
+            error: false,
+            attrs: BTreeMap::new(),
+            node: Some(FN_ID.into()),
+            join: None,
+        };
+        first.runtime().ingest(vec![span], 7);
+        persist_all_stats(&app_state);
+        assert!(path.exists());
+
+        let second = ProjectState::new(Fake::new(), root, RuntimeConfig::default());
+        second.restore_stats(&path);
+        second.restore_stats(&path);
+        let stats = second.runtime().node_stats(FN_ID, 7).unwrap();
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.total_nanos, 7);
+        assert_eq!(second.runtime().traces(10).len(), 0);
+        let mut rx = second.events.subscribe();
+        second.publish_stats();
+        assert!(matches!(rx.try_recv().unwrap(), LiveEvent::Stats { stats } if stats.len() == 1));
     }
 
     #[tokio::test]
