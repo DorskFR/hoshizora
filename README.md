@@ -47,8 +47,17 @@ hoshizora serve --projects-file projects.json             # [{"url":..,"ref":..,
 HOSHIZORA_PROJECTS=https://github.com/a/b,https://github.com/c/d hoshizora serve
 ```
 
-A declared URL or path that is already registered is left as it is, so the flags are safe to
-keep when the data dir does persist.
+A declared URL or path that is already registered keeps its clone and graph; its declared
+`name`, `services` and `ref` are merged in on every start (a changed `ref` queues a rebuild), so
+the flags are safe to keep when the data dir does persist.
+
+Git projects follow their remote: every `--refresh-interval` minutes (`HOSHIZORA_REFRESH_INTERVAL`,
+default 15, 0 disables) a `git ls-remote` compares the tracked ref with the indexed commit and
+rebuilds when it moved; rebuilds run one project at a time. A project without a declared `ref`
+also follows the deployed code: when its spans carry a `service.version` and the remote has a
+tag `v<version>` or `<version>`, the project switches to that tag. `GET /api/projects` shows the
+declared `ref`, the `tracked_ref` adopted this way, the `indexed_ref`/`commit` the graph was built
+from and the last `seen_version`, so a stale graph is visible.
 
 Clones are only needed while indexing and for the source panel, so on a small volume they can be
 purged without losing anything: the project stays registered and its graph keeps being served,

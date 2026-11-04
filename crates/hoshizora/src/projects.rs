@@ -1,8 +1,12 @@
-//! The project registry: `projects.json`, clones under `repos/`, graphs under `graphs/`, and the
-//! background clone + index jobs that move a project to `ready`.
+//! The project registry: `projects.json`, clones under `repos/`, graphs under `graphs/`, the
+//! background clone + index jobs that move a project to `ready`, and the periodic remote check
+//! that reindexes a git project when its tracked ref moves.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use anyhow::Context;
 use hoshizora_model::Graph;
@@ -18,6 +22,41 @@ use crate::server::{AppError, ProjectState};
 
 pub type Indexer = Arc<dyn Fn(&Path) -> anyhow::Result<Graph> + Send + Sync>;
 
+/// Resolves a ref on a remote to a commit; the production implementation shells out to
+/// `git ls-remote`, tests answer from a table.
+pub trait Remote: Send + Sync {
+    fn ls_remote<'a>(
+        &'a self,
+        git: &'a GitOptions,
+        url: &'a str,
+        r#ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + 'a>>;
+}
+
+struct GitRemote;
+
+impl Remote for GitRemote {
+    fn ls_remote<'a>(
+        &'a self,
+        git: &'a GitOptions,
+        url: &'a str,
+        r#ref: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + 'a>> {
+        Box::pin(git::ls_remote(git, url, r#ref))
+    }
+}
+
+/// Outcome of one remote check of a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// Not a git project, or already cloning/indexing.
+    Skipped,
+    /// The tracked ref still points at the indexed commit.
+    Unchanged,
+    /// The ref moved (or a version tag was adopted); a rebuild is queued.
+    Reindexing,
+}
+
 pub struct ProjectEntry<Q: GraphQueries> {
     pub project: Project,
     /// Present once the graph is loaded; cleared while reindexing replaces it.
@@ -29,7 +68,11 @@ pub struct AppState<Q: GraphQueries> {
     pub git: GitOptions,
     config: RuntimeConfig,
     indexer: Indexer,
+    remote: Arc<dyn Remote>,
     projects: RwLock<Vec<ProjectEntry<Q>>>,
+    /// Clone + index jobs run one at a time: indexing a large repository is memory heavy.
+    index_slot: tokio::sync::Mutex<()>,
+    refresh_slot: tokio::sync::Mutex<()>,
 }
 
 impl<Q: GraphQueries> AppState<Q> {
@@ -39,12 +82,25 @@ impl<Q: GraphQueries> AppState<Q> {
         config: RuntimeConfig,
         git: GitOptions,
     ) -> Arc<Self> {
+        Self::with_remote(data_dir, indexer, config, git, Arc::new(GitRemote))
+    }
+
+    pub fn with_remote(
+        data_dir: PathBuf,
+        indexer: Indexer,
+        config: RuntimeConfig,
+        git: GitOptions,
+        remote: Arc<dyn Remote>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             data_dir,
             git,
             config,
             indexer,
+            remote,
             projects: RwLock::new(Vec::new()),
+            index_slot: tokio::sync::Mutex::new(()),
+            refresh_slot: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -77,10 +133,6 @@ impl<Q: GraphQueries> AppState<Q> {
             .iter()
             .find(|e| e.project.id == id)
             .map(|e| e.project.clone())
-    }
-
-    pub fn ready_states(&self) -> Vec<Arc<ProjectState<Q>>> {
-        self.read().iter().filter_map(|e| e.state.clone()).collect()
     }
 
     /// `(id, services, state)` of every project that can receive spans.
@@ -245,35 +297,66 @@ impl<Q: GraphQueries> AppState<Q> {
         project
     }
 
-    /// Registers a git project and starts cloning + indexing it. The same URL twice returns the
-    /// existing project.
+    /// Registers a git project and starts cloning + indexing it. Declaring a URL that is
+    /// already registered merges the declared name, services and ref into it (a changed ref
+    /// queues a rebuild) and leaves its clone and graph alone.
     pub fn add_git(self: &Arc<Self>, req: AddProject) -> Result<Project, AppError> {
         let url = req.url.trim().to_string();
         git::validate_url(&url, self.git.allow_file_urls).map_err(AppError::bad_request)?;
-        if let Some(r) = req.r#ref.as_deref() {
+        let declared_ref = req.r#ref.filter(|r| !r.is_empty());
+        if let Some(r) = declared_ref.as_deref() {
             git::validate_ref(r).map_err(AppError::bad_request)?;
         }
-        let existing = self.read().iter().find_map(|e| match &e.project.source {
-            ProjectSource::Git { url: u, .. }
-                if u.trim_end_matches('/') == url.trim_end_matches('/') =>
-            {
-                Some(e.project.clone())
+        let name = req.name.filter(|n| !n.trim().is_empty());
+        let merged = {
+            let mut projects = self.write();
+            let entry = projects.iter_mut().find(|e| match &e.project.source {
+                ProjectSource::Git { url: u, .. } => {
+                    u.trim_end_matches('/') == url.trim_end_matches('/')
+                }
+                ProjectSource::Path { .. } => false,
+            });
+            entry.map(|e| {
+                let mut changed = false;
+                let mut ref_changed = false;
+                if let Some(n) = &name
+                    && e.project.name != *n
+                {
+                    e.project.name = n.clone();
+                    changed = true;
+                }
+                if !req.services.is_empty() && e.project.services != req.services {
+                    e.project.services = req.services.clone();
+                    changed = true;
+                }
+                if let ProjectSource::Git { r#ref, .. } = &mut e.project.source
+                    && *r#ref != declared_ref
+                {
+                    *r#ref = declared_ref.clone();
+                    e.project.tracked_ref = None;
+                    changed = true;
+                    ref_changed = true;
+                }
+                (e.project.clone(), changed, ref_changed)
+            })
+        };
+        if let Some((existing, changed, ref_changed)) = merged {
+            if changed {
+                self.persist();
             }
-            _ => None,
-        });
-        if let Some(existing) = existing {
+            if ref_changed {
+                tracing::info!(project = existing.id, "declared ref changed, reindexing");
+                return Ok(self.reindex(&existing.id).unwrap_or(existing));
+            }
             return Ok(existing);
         }
         let id = self.unique_id(&git::slug_for_url(&url));
         let project = Project {
-            name: req
-                .name
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| id.clone()),
+            name: name.unwrap_or_else(|| id.clone()),
             id: id.clone(),
             source: ProjectSource::Git {
                 url,
-                r#ref: req.r#ref.filter(|r| !r.is_empty()),
+                r#ref: declared_ref,
             },
             status: ProjectStatus::Cloning,
             error: None,
@@ -282,6 +365,9 @@ impl<Q: GraphQueries> AppState<Q> {
             nodes: 0,
             edges: 0,
             services: req.services,
+            tracked_ref: None,
+            indexed_ref: None,
+            seen_version: None,
         };
         self.write().push(ProjectEntry {
             project: project.clone(),
@@ -301,11 +387,24 @@ impl<Q: GraphQueries> AppState<Q> {
         let path = path
             .canonicalize()
             .with_context(|| format!("project path {}", path.display()))?;
-        let existing = self.read().iter().find_map(|e| match &e.project.source {
-            ProjectSource::Path { path: p } if Path::new(p) == path => Some(e.project.clone()),
-            _ => None,
-        });
-        if let Some(existing) = existing {
+        let existing = {
+            let mut projects = self.write();
+            let entry = projects.iter_mut().find(|e| match &e.project.source {
+                ProjectSource::Path { path: p } => Path::new(p) == path,
+                ProjectSource::Git { .. } => false,
+            });
+            entry.map(|e| {
+                let renamed = name.as_ref().is_some_and(|n| e.project.name != *n);
+                if let (true, Some(n)) = (renamed, &name) {
+                    e.project.name = n.clone();
+                }
+                (e.project.clone(), renamed)
+            })
+        };
+        if let Some((existing, renamed)) = existing {
+            if renamed {
+                self.persist();
+            }
             return Ok(existing);
         }
         let id = self.unique_id(&path_slug(&path));
@@ -322,6 +421,9 @@ impl<Q: GraphQueries> AppState<Q> {
             nodes: 0,
             edges: 0,
             services: Vec::new(),
+            tracked_ref: None,
+            indexed_ref: None,
+            seen_version: None,
         };
         self.write().push(ProjectEntry {
             project: project.clone(),
@@ -330,6 +432,127 @@ impl<Q: GraphQueries> AppState<Q> {
         self.persist();
         self.spawn_job(id);
         Ok(project)
+    }
+
+    /// Records the `service.version` spans routed to `id` carry; a new version queues a remote
+    /// check so a git project without a declared ref can move to the matching tag.
+    pub fn note_version(self: &Arc<Self>, id: &str, version: &str) {
+        let changed = {
+            let mut projects = self.write();
+            match projects.iter_mut().find(|e| e.project.id == id) {
+                Some(e) if e.project.seen_version.as_deref() != Some(version) => {
+                    e.project.seen_version = Some(version.to_string());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !changed {
+            return;
+        }
+        self.persist();
+        let state = Arc::clone(self);
+        let id = id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = state.refresh_project(&id).await {
+                tracing::warn!(project = id, error = %e, "checking remote for new version");
+            }
+        });
+    }
+
+    /// Checks the remote of a git project: adopts the tag matching `seen_version` when the
+    /// project has no declared ref, then queues a rebuild if the tracked ref no longer points
+    /// at the indexed commit. Checks run one at a time.
+    pub async fn refresh_project(self: &Arc<Self>, id: &str) -> anyhow::Result<Refresh> {
+        let _slot = self.refresh_slot.lock().await;
+        let project = self.get(id).context("project was removed")?;
+        let ProjectSource::Git {
+            url,
+            r#ref: declared,
+        } = &project.source
+        else {
+            return Ok(Refresh::Skipped);
+        };
+        if busy(project.status) {
+            return Ok(Refresh::Skipped);
+        }
+        if declared.is_none()
+            && let Some(version) = &project.seen_version
+        {
+            let tags = version_tags(version);
+            if !tags
+                .iter()
+                .any(|t| project.tracked_ref.as_deref() == Some(t))
+            {
+                for tag in &tags {
+                    let Some(commit) = self.remote.ls_remote(&self.git, url, tag).await? else {
+                        continue;
+                    };
+                    tracing::info!(project = id, tag, version, "following deployed version");
+                    self.set_tracked_ref(id, Some(tag.clone()));
+                    if project.commit.as_deref() == Some(commit.as_str()) {
+                        return Ok(Refresh::Unchanged);
+                    }
+                    self.reindex(id)
+                        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+                    return Ok(Refresh::Reindexing);
+                }
+            }
+        }
+        let tracked = project
+            .tracked_ref
+            .as_deref()
+            .or(declared.as_deref())
+            .unwrap_or("HEAD");
+        let commit = self
+            .remote
+            .ls_remote(&self.git, url, tracked)
+            .await?
+            .with_context(|| format!("remote has no ref {tracked}"))?;
+        if project.commit.as_deref() == Some(commit.as_str()) {
+            return Ok(Refresh::Unchanged);
+        }
+        tracing::info!(
+            project = id,
+            r#ref = tracked,
+            commit,
+            "ref moved, reindexing"
+        );
+        self.reindex(id)
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+        Ok(Refresh::Reindexing)
+    }
+
+    pub async fn refresh_all(self: &Arc<Self>) {
+        let ids: Vec<String> = self
+            .read()
+            .iter()
+            .filter(|e| matches!(e.project.source, ProjectSource::Git { .. }))
+            .map(|e| e.project.id.clone())
+            .collect();
+        for id in ids {
+            if let Err(e) = self.refresh_project(&id).await {
+                tracing::warn!(project = id, error = %e, "checking remote");
+            }
+        }
+    }
+
+    /// Checks every git project's remote every `interval`.
+    pub fn spawn_refresh(self: &Arc<Self>, interval: Duration) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                state.refresh_all().await;
+            }
+        });
+    }
+
+    fn set_tracked_ref(&self, id: &str, r#ref: Option<String>) {
+        if let Some(entry) = self.write().iter_mut().find(|e| e.project.id == id) {
+            entry.project.tracked_ref = r#ref;
+        }
+        self.persist();
     }
 
     pub fn reindex(self: &Arc<Self>, id: &str) -> Result<Project, AppError> {
@@ -474,18 +697,22 @@ impl<Q: GraphQueries> AppState<Q> {
     }
 
     async fn run_job(self: &Arc<Self>, id: &str) -> anyhow::Result<()> {
+        let _slot = self.index_slot.lock().await;
         let project = self.get(id).context("project was removed")?;
         let root = self.root_of(&project);
         let mut commit = None;
+        let mut indexed_ref = None;
         if let ProjectSource::Git { url, r#ref } = &project.source {
+            let r#ref = project.tracked_ref.as_deref().or(r#ref.as_deref());
             self.set_status(id, ProjectStatus::Cloning, None);
             if root.join(".git").exists() {
-                git::update(&self.git, url, r#ref.as_deref(), &root).await?;
+                git::update(&self.git, url, r#ref, &root).await?;
             } else {
                 let _ = std::fs::remove_dir_all(&root);
-                git::clone(&self.git, url, r#ref.as_deref(), &root).await?;
+                git::clone(&self.git, url, r#ref, &root).await?;
             }
             commit = Some(git::head(&self.git, &root).await?);
+            indexed_ref = Some(r#ref.unwrap_or("HEAD").to_string());
         }
         if self.get(id).is_none() {
             anyhow::bail!("project was removed");
@@ -505,6 +732,9 @@ impl<Q: GraphQueries> AppState<Q> {
         })
         .await
         .context("index task panicked")??;
+        if let Ok(previous) = self.project_state(Some(id)) {
+            previous.persist_stats(&crate::server::stats_path(&self.data_dir, id));
+        }
         let mut projects = self.write();
         let entry = projects
             .iter_mut()
@@ -513,6 +743,7 @@ impl<Q: GraphQueries> AppState<Q> {
         entry.project.status = ProjectStatus::Ready;
         entry.project.error = None;
         entry.project.commit = commit;
+        entry.project.indexed_ref = indexed_ref;
         entry.project.indexed_at = Some(rfc3339_now());
         fill_counts(&mut entry.project, &state);
         entry.state = Some(state);
@@ -567,6 +798,16 @@ fn disk_space(path: &Path) -> Option<DiskSpace> {
 #[cfg(not(unix))]
 fn disk_space(_path: &Path) -> Option<DiskSpace> {
     None
+}
+
+/// Tags a deployed `service.version` may be published under, most conventional first.
+pub fn version_tags(version: &str) -> Vec<String> {
+    let version = version.trim();
+    let bare = version.trim_start_matches('v');
+    if git::validate_ref(bare).is_err() {
+        return Vec::new();
+    }
+    vec![format!("v{bare}"), bare.to_string()]
 }
 
 fn busy(status: ProjectStatus) -> bool {
@@ -889,6 +1130,17 @@ mod tests {
         let listed = state.list();
         assert_eq!(listed.len(), 2, "{listed:?}");
         assert_eq!(listed[0].name, "example");
+        let opts = GitOptions {
+            allow_file_urls: true,
+            ..Default::default()
+        };
+        let remote_main = git::ls_remote(&opts, &url, "main").await.unwrap();
+        assert_eq!(
+            remote_main,
+            git::ls_remote(&opts, &url, "HEAD").await.unwrap()
+        );
+        assert!(remote_main.is_some_and(|sha| sha.len() == 40));
+        assert_eq!(git::ls_remote(&opts, &url, "nope").await.unwrap(), None);
         assert!(
             matches!(&listed[0].source, ProjectSource::Git { r#ref: Some(r), .. } if r == "main")
         );
@@ -954,6 +1206,287 @@ mod tests {
             assert_eq!(graph.meta.indexer, hoshizora_core::INDEXER_VERSION);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FakeRemote {
+        refs: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeRemote {
+        fn new(refs: &[(&str, &str)]) -> Arc<Self> {
+            Arc::new(Self {
+                refs: std::sync::Mutex::new(
+                    refs.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                ),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn set(&self, r#ref: &str, commit: &str) {
+            self.refs
+                .lock()
+                .unwrap()
+                .insert(r#ref.into(), commit.into());
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Remote for FakeRemote {
+        fn ls_remote<'a>(
+            &'a self,
+            _git: &'a GitOptions,
+            _url: &'a str,
+            r#ref: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + 'a>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let found = self.refs.lock().unwrap().get(r#ref).cloned();
+            Box::pin(async move { Ok(found) })
+        }
+    }
+
+    fn fake_state(remote: Arc<FakeRemote>) -> Arc<AppState<crate::queries::GraphIndex>> {
+        let dir = std::env::temp_dir().join(format!(
+            "hoshizora-remote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        AppState::with_remote(
+            dir,
+            Arc::new(|_: &Path| Ok(Graph::default())),
+            RuntimeConfig::default(),
+            GitOptions {
+                allow_file_urls: true,
+                ..Default::default()
+            },
+            remote,
+        )
+    }
+
+    /// A ready git project at `commit`, inserted without cloning anything.
+    fn ready_git(
+        state: &Arc<AppState<crate::queries::GraphIndex>>,
+        url: &str,
+        r#ref: Option<&str>,
+        commit: &str,
+    ) -> Project {
+        let id = git::slug_for_url(url);
+        let project = Project {
+            name: id.clone(),
+            id: id.clone(),
+            source: ProjectSource::Git {
+                url: url.into(),
+                r#ref: r#ref.map(Into::into),
+            },
+            status: ProjectStatus::Ready,
+            error: None,
+            commit: Some(commit.into()),
+            indexed_at: None,
+            nodes: 0,
+            edges: 0,
+            services: Vec::new(),
+            tracked_ref: None,
+            indexed_ref: None,
+            seen_version: None,
+        };
+        let root = state.repo_dir(&id);
+        state.insert_ready(
+            project,
+            crate::queries::GraphIndex::new(Graph::default()),
+            root,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn declared_metadata_merges_into_existing_registration() {
+        let state = fake_state(FakeRemote::new(&[]));
+        let url = "file:///nowhere/a/b";
+        let existing = ready_git(&state, url, None, "abc");
+        assert!(existing.services.is_empty());
+
+        let merged = state
+            .add_git(AddProject {
+                url: url.into(),
+                r#ref: None,
+                name: Some("renamed".into()),
+                services: vec!["b".into()],
+            })
+            .unwrap();
+        assert_eq!(merged.id, existing.id);
+        assert_eq!(merged.name, "renamed");
+        assert_eq!(merged.services, vec!["b".to_string()]);
+        assert_eq!(merged.status, ProjectStatus::Ready, "same ref: no rebuild");
+        assert_eq!(merged.commit.as_deref(), Some("abc"));
+
+        let kept = state
+            .add_git(AddProject {
+                url: url.into(),
+                r#ref: None,
+                name: None,
+                services: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            kept.services,
+            vec!["b".to_string()],
+            "empty declaration keeps services"
+        );
+        assert_eq!(kept.name, "renamed");
+
+        let saved: Vec<Project> =
+            serde_json::from_slice(&std::fs::read(state.data_dir.join("projects.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved[0].services, vec!["b".to_string()]);
+
+        let repinned = state
+            .add_git(AddProject {
+                url: url.into(),
+                r#ref: Some("v2".into()),
+                name: None,
+                services: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(&repinned.source, ProjectSource::Git { r#ref: Some(r), .. } if r == "v2"));
+        assert_eq!(
+            repinned.status,
+            ProjectStatus::Cloning,
+            "new ref queues a rebuild"
+        );
+        assert_eq!(state.list().len(), 1);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn remote_check_reindexes_only_when_the_commit_moved() {
+        let remote = FakeRemote::new(&[("HEAD", "abc"), ("main", "m1")]);
+        let state = fake_state(Arc::clone(&remote));
+        let unpinned = ready_git(&state, "file:///nowhere/x/unpinned", None, "abc");
+        let pinned = ready_git(&state, "file:///nowhere/x/pinned", Some("main"), "m1");
+
+        assert_eq!(
+            state.refresh_project(&unpinned.id).await.unwrap(),
+            Refresh::Unchanged
+        );
+        assert_eq!(
+            state.refresh_project(&pinned.id).await.unwrap(),
+            Refresh::Unchanged
+        );
+        assert_eq!(remote.calls(), 2);
+        assert!(
+            state
+                .list()
+                .iter()
+                .all(|p| p.status == ProjectStatus::Ready)
+        );
+
+        remote.set("main", "m2");
+        assert_eq!(
+            state.refresh_project(&pinned.id).await.unwrap(),
+            Refresh::Reindexing
+        );
+        assert_eq!(
+            state.get(&pinned.id).unwrap().status,
+            ProjectStatus::Cloning
+        );
+        assert_eq!(
+            state.refresh_project(&pinned.id).await.unwrap(),
+            Refresh::Skipped,
+            "a project being rebuilt is not checked again"
+        );
+        assert_eq!(
+            state.get(&unpinned.id).unwrap().status,
+            ProjectStatus::Ready
+        );
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn seen_version_moves_an_unpinned_project_to_its_tag() {
+        let remote = FakeRemote::new(&[
+            ("HEAD", "abc"),
+            ("v1.2.0", "t1"),
+            ("2.0.0", "t2"),
+            ("main", "abc"),
+        ]);
+        let state = fake_state(Arc::clone(&remote));
+        let vee = ready_git(&state, "file:///nowhere/t/vee", None, "abc");
+        let bare = ready_git(&state, "file:///nowhere/t/bare", None, "abc");
+        let missing = ready_git(&state, "file:///nowhere/t/missing", None, "abc");
+        let pinned = ready_git(&state, "file:///nowhere/t/pinned", Some("main"), "abc");
+        for (p, v) in [
+            (&vee, "1.2.0"),
+            (&bare, "2.0.0"),
+            (&missing, "9.9.9"),
+            (&pinned, "1.2.0"),
+        ] {
+            state
+                .write()
+                .iter_mut()
+                .find(|e| e.project.id == p.id)
+                .unwrap()
+                .project
+                .seen_version = Some(v.into());
+        }
+
+        assert_eq!(
+            state.refresh_project(&vee.id).await.unwrap(),
+            Refresh::Reindexing
+        );
+        let vee = state.get(&vee.id).unwrap();
+        assert_eq!(vee.tracked_ref.as_deref(), Some("v1.2.0"));
+        assert_eq!(vee.status, ProjectStatus::Cloning);
+
+        assert_eq!(
+            state.refresh_project(&bare.id).await.unwrap(),
+            Refresh::Reindexing
+        );
+        assert_eq!(
+            state.get(&bare.id).unwrap().tracked_ref.as_deref(),
+            Some("2.0.0")
+        );
+
+        assert_eq!(
+            state.refresh_project(&missing.id).await.unwrap(),
+            Refresh::Unchanged,
+            "no tag for the version: keep following HEAD"
+        );
+        assert_eq!(state.get(&missing.id).unwrap().tracked_ref, None);
+
+        assert_eq!(
+            state.refresh_project(&pinned.id).await.unwrap(),
+            Refresh::Unchanged
+        );
+        assert_eq!(
+            state.get(&pinned.id).unwrap().tracked_ref,
+            None,
+            "a declared ref is never overridden"
+        );
+
+        let saved: Vec<Project> =
+            serde_json::from_slice(&std::fs::read(state.data_dir.join("projects.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved[0].seen_version.as_deref(), Some("1.2.0"));
+        assert_eq!(saved[0].tracked_ref.as_deref(), Some("v1.2.0"));
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn version_tag_candidates() {
+        assert_eq!(version_tags("1.2.0"), vec!["v1.2.0", "1.2.0"]);
+        assert_eq!(
+            version_tags("v0.29.0-beta.1"),
+            vec!["v0.29.0-beta.1", "0.29.0-beta.1"]
+        );
+        assert!(version_tags("--bad").is_empty());
     }
 
     #[test]

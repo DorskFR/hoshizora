@@ -167,6 +167,15 @@ pub struct Project {
     pub edges: usize,
     /// OTLP `service.name` values whose spans belong to this project.
     pub services: Vec<String>,
+    /// Tag the clone follows instead of the declared ref, resolved from `seen_version`.
+    #[serde(default)]
+    pub tracked_ref: Option<String>,
+    /// Ref the current graph was checked out at (`HEAD` of the remote when none is declared).
+    #[serde(default)]
+    pub indexed_ref: Option<String>,
+    /// Last `service.version` carried by spans routed to this project.
+    #[serde(default)]
+    pub seen_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

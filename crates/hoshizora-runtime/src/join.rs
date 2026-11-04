@@ -200,8 +200,7 @@ pub fn join(span: &mut RuntimeSpan, lookup: &dyn NodeLookup, cache: &JoinCache) 
         .then(|| by_http_route(span, cache))
         .flatten();
     let found = server_route
-        .or_else(|| by_code_location(span, lookup, cache))
-        .or_else(|| by_code_function(span, lookup))
+        .or_else(|| by_code(span, lookup, cache))
         .or_else(|| by_http_route(span, cache))
         .or_else(|| by_db_table(span, cache))
         .or_else(|| by_messaging(span, cache))
@@ -216,6 +215,35 @@ pub fn join(span: &mut RuntimeSpan, lookup: &dyn NodeLookup, cache: &JoinCache) 
 /// Whether the span's `code.filepath` + line lands on a function of this graph.
 pub fn locates(span: &RuntimeSpan, lookup: &dyn NodeLookup, cache: &JoinCache) -> bool {
     by_code_location(span, lookup, cache).is_some()
+}
+
+/// An explicit `code.function.name` wins over the line, which for `#[instrument]` is the
+/// attribute's line and can land on a neighbouring function. Same-file candidates beat a
+/// name match elsewhere; a location whose name contradicts the attribute is a miss.
+fn by_code(
+    span: &RuntimeSpan,
+    lookup: &dyn NodeLookup,
+    cache: &JoinCache,
+) -> Option<(NodeId, JoinMethod)> {
+    let file = attr(span, &["code.file.path", "code.filepath"]).and_then(|p| cache.resolve_file(p));
+    let name = attr(span, &["code.function.name", "code.function"]);
+    if let Some(name) = name
+        && let Some(id) = resolve_function_in_file(lookup, name, file)
+            .or_else(|| resolve_function(lookup, name, attr(span, &["code.namespace"])))
+    {
+        return Some((id, JoinMethod::CodeFunction));
+    }
+    let located = by_code_location(span, lookup, cache)?;
+    match name {
+        Some(name) => lookup
+            .node(&located.0)
+            .is_some_and(|n| name_matches(n, name))
+            .then_some(located),
+        None => Some(
+            resolve_function_in_file(lookup, span.name.trim(), file)
+                .map_or(located, |id| (id, JoinMethod::CodeLocation)),
+        ),
+    }
 }
 
 fn by_code_location(
@@ -233,10 +261,36 @@ fn by_code_location(
         .map(|n| (n.id.clone(), JoinMethod::CodeLocation))
 }
 
-fn by_code_function(span: &RuntimeSpan, lookup: &dyn NodeLookup) -> Option<(NodeId, JoinMethod)> {
-    let name = attr(span, &["code.function.name", "code.function"])?;
-    let namespace = attr(span, &["code.namespace"]);
-    resolve_function(lookup, name, namespace).map(|id| (id, JoinMethod::CodeFunction))
+fn name_matches(node: &Node, name: &str) -> bool {
+    let short = split_qualified(name).map_or(name, |(_, s)| s);
+    node.name == short || node.qualified_name == name
+}
+
+/// The one function in `file` whose qualified or short name equals `name`.
+fn resolve_function_in_file(
+    lookup: &dyn NodeLookup,
+    name: &str,
+    file: Option<&str>,
+) -> Option<NodeId> {
+    let file = file?;
+    if name.is_empty() || name.contains(' ') {
+        return None;
+    }
+    let short = split_qualified(name).map_or(name, |(_, s)| s);
+    let in_file = |candidate: &str| -> Vec<NodeId> {
+        lookup
+            .functions_named(candidate)
+            .into_iter()
+            .filter(|n| n.file.as_deref() == Some(file))
+            .map(|n| n.id.clone())
+            .collect()
+    };
+    for candidate in [name, short] {
+        if let [only] = in_file(candidate).as_slice() {
+            return Some(only.clone());
+        }
+    }
+    None
 }
 
 /// `name` may be short (`create`) or qualified (`sessions.Store.create`, `Store::create`);
@@ -715,6 +769,141 @@ pub(crate) mod tests {
         );
         let mut s = span("x", SpanKind::Internal, &[("code.function.name", "create")]);
         assert_eq!(joined(&mut s), (None, None));
+    }
+
+    fn adjacent_functions() -> FakeLookup {
+        FakeLookup {
+            nodes: vec![
+                node(
+                    "fn:src/repo.rs#CollectionRepository::get_quality_profile_id",
+                    NodeKind::Function,
+                    Some("src/repo.rs"),
+                    Some((10, 20)),
+                ),
+                node(
+                    "fn:src/repo.rs#CollectionRepository::linked_file_paths",
+                    NodeKind::Function,
+                    Some("src/repo.rs"),
+                    Some((22, 40)),
+                ),
+                node(
+                    "fn:src/other.rs#list_missing",
+                    NodeKind::Function,
+                    Some("src/other.rs"),
+                    Some((1, 5)),
+                ),
+            ],
+        }
+    }
+
+    fn joined_in(g: &FakeLookup, span: &mut RuntimeSpan) -> (Option<String>, Option<JoinMethod>) {
+        let cache = JoinCache::new(&g.nodes);
+        join(span, g, &cache);
+        (span.node.clone(), span.join)
+    }
+
+    const LINKED: &str = "fn:src/repo.rs#CollectionRepository::linked_file_paths";
+    const QUALITY: &str = "fn:src/repo.rs#CollectionRepository::get_quality_profile_id";
+
+    #[test]
+    fn code_function_name_beats_line_landing_in_the_neighbour() {
+        let g = adjacent_functions();
+        for name in [
+            "linked_file_paths",
+            "CollectionRepository::linked_file_paths",
+        ] {
+            let mut s = span(
+                "linked_file_paths",
+                SpanKind::Internal,
+                &[
+                    ("code.file.path", "/app/src/repo.rs"),
+                    ("code.line.number", "19"),
+                    ("code.function.name", name),
+                ],
+            );
+            assert_eq!(
+                joined_in(&g, &mut s),
+                (Some(LINKED.into()), Some(JoinMethod::CodeFunction))
+            );
+        }
+    }
+
+    #[test]
+    fn span_name_equal_to_neighbour_beats_containing_function_without_code_function_name() {
+        let g = adjacent_functions();
+        let mut s = span(
+            "linked_file_paths",
+            SpanKind::Internal,
+            &[
+                ("code.file.path", "src/repo.rs"),
+                ("code.line.number", "19"),
+            ],
+        );
+        assert_eq!(
+            joined_in(&g, &mut s),
+            (Some(LINKED.into()), Some(JoinMethod::CodeLocation))
+        );
+        let mut s = span(
+            "daemon.command",
+            SpanKind::Internal,
+            &[
+                ("code.file.path", "src/repo.rs"),
+                ("code.line.number", "19"),
+            ],
+        );
+        assert_eq!(
+            joined_in(&g, &mut s),
+            (Some(QUALITY.into()), Some(JoinMethod::CodeLocation))
+        );
+    }
+
+    #[test]
+    fn code_function_name_found_only_in_another_file_wins_over_contradicting_location() {
+        let g = adjacent_functions();
+        let mut s = span(
+            "list_missing",
+            SpanKind::Internal,
+            &[
+                ("code.file.path", "src/repo.rs"),
+                ("code.line.number", "12"),
+                ("code.function.name", "list_missing"),
+            ],
+        );
+        assert_eq!(
+            joined_in(&g, &mut s),
+            (
+                Some("fn:src/other.rs#list_missing".into()),
+                Some(JoinMethod::CodeFunction)
+            )
+        );
+    }
+
+    #[test]
+    fn location_contradicting_unresolvable_code_function_name_is_a_miss() {
+        let g = adjacent_functions();
+        let mut s = span(
+            "x",
+            SpanKind::Internal,
+            &[
+                ("code.file.path", "src/repo.rs"),
+                ("code.line.number", "12"),
+                ("code.function.name", "renamed_since_the_graph_was_built"),
+            ],
+        );
+        assert_eq!(joined_in(&g, &mut s), (None, None));
+        let mut s = span(
+            "x",
+            SpanKind::Internal,
+            &[
+                ("code.file.path", "src/repo.rs"),
+                ("code.line.number", "12"),
+                ("code.function.name", "get_quality_profile_id"),
+            ],
+        );
+        assert_eq!(
+            joined_in(&g, &mut s),
+            (Some(QUALITY.into()), Some(JoinMethod::CodeFunction))
+        );
     }
 
     #[test]
