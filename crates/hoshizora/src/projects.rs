@@ -20,7 +20,20 @@ use crate::git::{self, GitOptions};
 use crate::queries::GraphQueries;
 use crate::server::{AppError, ProjectState};
 
-pub type Indexer = Arc<dyn Fn(&Path) -> anyhow::Result<Graph> + Send + Sync>;
+/// Builds the graph of a source root, writes it to the output path and returns it.
+pub type Indexer = Arc<dyn Fn(&Path, &Path) -> anyhow::Result<Graph> + Send + Sync>;
+
+/// An [`Indexer`] that builds the graph in this process.
+#[cfg(test)]
+pub fn in_process(
+    build: impl Fn(&Path) -> anyhow::Result<Graph> + Send + Sync + 'static,
+) -> Indexer {
+    Arc::new(move |root: &Path, output: &Path| {
+        let graph = build(root)?;
+        hoshizora_core::save(&graph, output)?;
+        Ok(graph)
+    })
+}
 
 /// Resolves a ref on a remote to a commit; the production implementation shells out to
 /// `git ls-remote`, tests answer from a table.
@@ -723,11 +736,7 @@ impl<Q: GraphQueries> AppState<Q> {
         let index_root = root.clone();
         let config = self.config.clone();
         let state = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let graph = indexer(&index_root)?;
-            if let Some(parent) = graph_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            hoshizora_core::save(&graph, &graph_path)?;
+            let graph = indexer(&index_root, &graph_path)?;
             Ok(ProjectState::new(Q::from_graph(graph), index_root, config))
         })
         .await
@@ -1098,7 +1107,7 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "one"]);
 
-        let indexer: Indexer = Arc::new(|root: &Path| crate::build_graph(root, None));
+        let indexer = in_process(|root| crate::build_graph(root, None));
         let make_state = || {
             AppState::<crate::queries::GraphIndex>::new(
                 dir.join("data"),
@@ -1261,7 +1270,7 @@ mod tests {
         ));
         AppState::with_remote(
             dir,
-            Arc::new(|_: &Path| Ok(Graph::default())),
+            in_process(|_| Ok(Graph::default())),
             RuntimeConfig::default(),
             GitOptions {
                 allow_file_urls: true,

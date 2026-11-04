@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     fn fake_indexer() -> crate::projects::Indexer {
-        Arc::new(|_root: &Path| Ok(Fake::new().graph))
+        crate::projects::in_process(|_root| Ok(Fake::new().graph))
     }
 
     fn app_state() -> Arc<AppState<Fake>> {
@@ -1598,7 +1598,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "project not found");
 
-        let slow: crate::projects::Indexer = Arc::new(|_root: &Path| {
+        let slow = crate::projects::in_process(|_root| {
             std::thread::sleep(Duration::from_millis(300));
             Ok(Fake::new().graph)
         });
@@ -1937,8 +1937,7 @@ mod tests {
             ],
         );
 
-        let indexer: crate::projects::Indexer =
-            Arc::new(|root: &Path| crate::build_graph(root, None));
+        let indexer = crate::projects::in_process(|root| crate::build_graph(root, None));
         let app_state: Arc<AppState<crate::queries::GraphIndex>> = AppState::new(
             dir.join("data"),
             indexer,
@@ -2065,8 +2064,7 @@ mod tests {
         std::fs::create_dir_all(local.join("src")).unwrap();
         std::fs::write(local.join("src/lib.rs"), "pub fn gamma() {}\n").unwrap();
 
-        let indexer: crate::projects::Indexer =
-            Arc::new(|root: &Path| crate::build_graph(root, None));
+        let indexer = crate::projects::in_process(|root| crate::build_graph(root, None));
         let make_state = || {
             AppState::<crate::queries::GraphIndex>::new(
                 dir.join("data"),

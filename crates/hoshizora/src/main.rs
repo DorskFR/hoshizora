@@ -315,6 +315,35 @@ fn cmd_index(path: &Path, output: &Path, packs: Option<&Path>) -> anyhow::Result
     Ok(())
 }
 
+/// Indexes in a `hoshizora index` child process so the indexing peak is returned to the OS
+/// when it exits instead of staying in the server's heap.
+fn child_indexer(exe: PathBuf, packs: Option<PathBuf>) -> Indexer {
+    Arc::new(move |root: &Path, output: &Path| {
+        let mut partial = output.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("index").arg(root).arg("--output").arg(&partial);
+        if let Some(packs) = &packs {
+            cmd.arg("--packs").arg(packs);
+        }
+        let out = cmd
+            .stdin(std::process::Stdio::null())
+            .output()
+            .with_context(|| format!("running {}", exe.display()))?;
+        if !out.status.success() {
+            let _ = std::fs::remove_file(&partial);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = stderr.trim();
+            let tail = &stderr[stderr.floor_char_boundary(stderr.len().saturating_sub(2000))..];
+            anyhow::bail!("indexer {}: {tail}", out.status);
+        }
+        std::fs::rename(&partial, output)
+            .with_context(|| format!("moving the graph to {}", output.display()))?;
+        hoshizora_core::load(output)
+    })
+}
+
 struct ServeArgs {
     graph: Option<PathBuf>,
     root: Option<PathBuf>,
@@ -330,8 +359,8 @@ struct ServeArgs {
 }
 
 async fn cmd_serve(args: ServeArgs) -> anyhow::Result<()> {
-    let packs = args.packs.clone();
-    let indexer: Indexer = Arc::new(move |root: &Path| build_graph(root, packs.as_deref()));
+    let exe = std::env::current_exe().context("locating the hoshizora binary")?;
+    let indexer = child_indexer(exe, args.packs.clone());
     let state: Arc<AppState<GraphIndex>> = AppState::new(
         args.data_dir.clone(),
         indexer,
