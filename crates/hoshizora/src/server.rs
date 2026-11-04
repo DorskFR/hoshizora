@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use futures::Stream;
 use hoshizora_model::api::{
     AddProject, Insights, NodeDetail, Project, ProjectStatus, PurgeReport, Purged, Source,
-    StatesReport, Storage,
+    StatesReport, Storage, UpdateProject,
 };
 use hoshizora_model::{EdgeKind, Graph, Insight, LiveEvent, Node, NodeStats, RuntimeSpan};
 use hoshizora_runtime::route::{ProjectCandidate, project_for_span};
@@ -158,7 +158,9 @@ pub fn router<Q: GraphQueries + 'static>(state: Arc<AppState<Q>>) -> Router {
         )
         .route(
             "/api/projects/{project}",
-            get(get_project::<Q>).delete(delete_project::<Q>),
+            get(get_project::<Q>)
+                .patch(update_project::<Q>)
+                .delete(delete_project::<Q>),
         )
         .route(
             "/api/projects/{project}/reindex",
@@ -317,6 +319,15 @@ async fn get_project<Q: GraphQueries>(
 ) -> Result<Json<Project>, AppError> {
     let id = path_param(&params, "project")?;
     state.get(&id).map(Json).ok_or_else(|| not_found("project"))
+}
+
+async fn update_project<Q: GraphQueries>(
+    State(state): State<Arc<AppState<Q>>>,
+    params: RawPathParams,
+    Json(req): Json<UpdateProject>,
+) -> Result<Json<Project>, AppError> {
+    let id = path_param(&params, "project")?;
+    state.update(&id, req).map(Json)
 }
 
 async fn delete_project<Q: GraphQueries>(
@@ -1083,6 +1094,7 @@ mod tests {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            auto_refresh: false,
         }
     }
 
@@ -2038,6 +2050,85 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
+    }
+
+    async fn patch_json(app: &Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::patch(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn auto_refresh_is_opt_in_and_persisted() {
+        let app_state = app_state();
+        let root = temp_root();
+        app_state.insert_ready(
+            path_project("local", &root),
+            Fake::new(),
+            root.clone(),
+            None,
+        );
+        let mut git = path_project("remote", &root);
+        git.source = hoshizora_model::api::ProjectSource::Git {
+            url: "https://127.0.0.1:9/a/b".into(),
+            r#ref: None,
+        };
+        app_state.insert_ready(git, Fake::new(), root, None);
+        let app = router(Arc::clone(&app_state));
+
+        let (_, listed) = get_json(&app, "/api/projects").await;
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["auto_refresh"] == false),
+            "{listed}"
+        );
+
+        let (status, body) =
+            patch_json(&app, "/api/projects/local", r#"{"auto_refresh":true}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) =
+            patch_json(&app, "/api/projects/nope", r#"{"auto_refresh":true}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, body) =
+            patch_json(&app, "/api/projects/remote", r#"{"auto_refresh":true}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["auto_refresh"], true);
+        let (status, body) = patch_json(&app, "/api/projects/remote", "{}").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["auto_refresh"], true,
+            "absent field leaves it unchanged"
+        );
+
+        let saved: Vec<Project> = serde_json::from_str(
+            &std::fs::read_to_string(app_state.data_dir.join("projects.json")).unwrap(),
+        )
+        .unwrap();
+        let flags: Vec<(&str, bool)> = saved
+            .iter()
+            .map(|p| (p.id.as_str(), p.auto_refresh))
+            .collect();
+        assert_eq!(flags, vec![("local", false), ("remote", true)]);
+
+        let (status, body) =
+            patch_json(&app, "/api/projects/remote", r#"{"auto_refresh":false}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!app_state.get("remote").unwrap().auto_refresh);
     }
 
     #[tokio::test]

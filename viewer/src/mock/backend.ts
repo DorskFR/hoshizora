@@ -24,6 +24,7 @@ import type {
   SearchHit,
   Story,
   TraceSummary,
+  UpdateProject,
 } from "../types";
 
 const MS = 1_000_000;
@@ -328,6 +329,17 @@ export class MockProjects implements ProjectsApi {
       p.project.indexed_at = new Date().toISOString();
       if (p.project.source.kind === "git") p.cloneBytes ??= 48_000_000;
     }, STAGE_MS);
+    return { ...p.project };
+  }
+
+  async update(id: string, body: UpdateProject) {
+    const p = this.projects.get(id);
+    if (!p) throw new Error(`unknown project ${id}`);
+    if (body.auto_refresh !== undefined) {
+      if (body.auto_refresh && p.project.source.kind !== "git")
+        throw new Error("a path project has no remote to refresh from");
+      p.project.auto_refresh = body.auto_refresh;
+    }
     return { ...p.project };
   }
 

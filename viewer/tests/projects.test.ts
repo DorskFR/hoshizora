@@ -69,6 +69,19 @@ describe("HttpProjects", () => {
       ref: "main",
     });
   });
+
+  it("patches the auto-refresh opt-in", async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      calls.push({ url, init });
+      return respond({ id: "x", auto_refresh: true });
+    });
+    const p = await new HttpProjects().update("x", { auto_refresh: true });
+    expect(p.auto_refresh).toBe(true);
+    expect(calls[0]!.url).toBe("/api/projects/x");
+    expect(calls[0]!.init?.method).toBe("PATCH");
+    expect(JSON.parse(String(calls[0]!.init!.body))).toEqual({ auto_refresh: true });
+  });
 });
 
 describe("MockProjects", () => {

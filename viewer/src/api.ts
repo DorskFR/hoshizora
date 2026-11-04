@@ -16,6 +16,7 @@ import type {
   Story,
   Subgraph,
   TraceSummary,
+  UpdateProject,
 } from "./types";
 
 export interface Backend {
@@ -40,6 +41,7 @@ export interface ProjectsApi {
   get(id: string): Promise<Project>;
   add(body: AddProject): Promise<Project>;
   reindex(id: string): Promise<Project>;
+  update(id: string, body: UpdateProject): Promise<Project>;
   remove(id: string): Promise<void>;
   /** Deletes the clone, keeps the project and its graph; reindex clones again. */
   purge(id: string): Promise<Purged>;
@@ -161,6 +163,13 @@ export class HttpProjects implements ProjectsApi {
   }
   reindex(id: string) {
     return request<Project>(`/api/projects/${encodeURIComponent(id)}/reindex`, { method: "POST" });
+  }
+  update(id: string, body: UpdateProject) {
+    return request<Project>(`/api/projects/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
   }
   remove(id: string) {
     return request<void>(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" });
