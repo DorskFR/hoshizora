@@ -1,140 +1,166 @@
 # hoshizora 星空
 
-Map a codebase as a 3D sky of modules and functions, see what every action triggers, and watch
-real requests light it up through OpenTelemetry.
+Map a codebase as a 3D sky of modules and functions, and watch OpenTelemetry traces light it up.
 
-- **Static graph** for Rust, Python, TypeScript/JavaScript, Go, Svelte and Vue, parsed with
-  tree-sitter: packages → files → types → functions, with signatures, parameter types,
-  docstrings and source spans.
-- **Effects** on every function, direct and propagated through callers: network, database reads
-  and writes (with table names from the SQL), filesystem, processes, spawned work, joins, locks,
-  publish/subscribe, sleeps and blocking calls in async code.
-- **Cross-process flows**: frontend `fetch` → HTTP route → handler → SQL → call to another
-  service, linked into one path.
-- **Questions**: what does this action trigger, what does changing this affect, what is dead,
-  where is I/O inside a loop, which awaits could run concurrently, what is blocking async code.
-- **Runtime overlay**: an OTLP/HTTP receiver joins spans to graph nodes and streams them to the
-  viewer, with self time, time spent waiting on children, percentiles and rates per function.
-- **Agent first**: everything the viewer shows comes from an HTTP JSON API, and every query has
-  a CLI equivalent that prints JSON.
+[![CI](https://github.com/DorskFR/hoshizora/actions/workflows/ci.yml/badge.svg)](https://github.com/DorskFR/hoshizora/actions/workflows/ci.yml)
+
+![The hoshizora viewer on the polyglot demo: functions of a TypeScript frontend, a Rust API and a Python worker as stars, coloured by self time, with a ticker of incoming spans and the launch_observation handler selected, showing its effects and source](docs/assets/hero.png)
+
+^ The [demo](examples/demo) at function level with live spans streaming in. Stars are coloured
+by self time; the panel shows what `launch_observation` does directly (`spawn`) and through its
+callees (network, db read and write, sleep, blocking).
+
+hoshizora parses a repository with tree-sitter into packages, files, types and functions, works
+out what every function does (network, SQL by table, filesystem, spawns, locks, blocking calls in
+async code) and links a frontend `fetch` through the HTTP route, the handler, the SQL and the next
+service into one path. Point an OpenTelemetry SDK at it and the same graph shows real requests,
+with self time and percentiles per function. It is for reading an unfamiliar codebase or
+reviewing a change by asking what an action triggers, without instrumenting anything first.
+
+```sh
+hoshizora index path/to/repo          # parse it, write .hoshizora/graph.json
+hoshizora serve                       # API, OTLP receiver and the 3D viewer on :7317
+hoshizora query flow '<node id>'      # everything a function or route triggers, as JSON
+hoshizora query insights              # N+1 queries, sequential awaits, quadratic loops
+hoshizora diff ./base ./head          # what a change does to effects, tables and entrypoints
+```
+
+## FAQ
+
+- **Do I need to instrument my code?** No. Everything in the map, the stories and the queries
+  comes from the source. Spans only add the runtime overlay.
+- **Which languages?** Rust, Python, TypeScript/JavaScript, Go, Svelte and Vue.
+- **Does it upload my code?** No. It runs locally; the only network calls are `git` clones and
+  `ls-remote` for projects you add by URL.
+- **Is it as precise as a compiler?** No. Calls are resolved by name and imports, and every edge
+  carries a confidence. See [Limitations](#limitations).
+- **How big a repo?** Its own repository (137 files, 1432 functions) indexes in about 2 s.
+- **Can an agent use it?** Yes. Everything the viewer shows comes from an HTTP JSON API, and
+  every query has a CLI equivalent that prints JSON.
+
+## Install
+
+Linux (x86_64, aarch64) and macOS (Apple silicon) binaries, with the viewer embedded, are on the
+[releases page](https://github.com/DorskFR/hoshizora/releases):
+
+```sh
+gh release download -R DorskFR/hoshizora -p 'hoshizora-*-x86_64-unknown-linux-gnu.tar.gz'
+tar xzf hoshizora-*.tar.gz && ./hoshizora --version
+```
+
+A container image is published as `ghcr.io/dorskfr/hoshizora:<tag>`. To build from source you need
+Rust 1.90+ and Node 24; build the viewer first so the binary embeds it:
+
+```sh
+cd viewer && npm ci && npm run build && cd ..
+cargo install --path crates/hoshizora
+```
 
 ## Quick start
 
-```sh
-cargo install --git https://github.com/DorskFR/hoshizora hoshizora   # or a release binary
-hoshizora index path/to/repo -o .hoshizora/graph.json
-hoshizora serve --graph .hoshizora/graph.json --root path/to/repo    # http://127.0.0.1:7317
+Index the polyglot demo in this repository and list what it finds:
+
+```console
+$ hoshizora index examples/demo
+indexed /path/to/hoshizora/examples/demo in 60.59ms
+  files      19
+  nodes      150 (66 functions)
+  edges      341
+  dead       1
+  ...
+$ hoshizora query insights | jq -r '.insights[] | "\(.kind)\t\(.node)"'
+inefficient	fn:api/src/catalog.rs#find_duplicate_stars
+io_in_loop	fn:api/src/handlers.rs#list_stars
+parallelisable	fn:api/src/handlers.rs#launch_observation
+inefficient	fn:api/src/handlers.rs#launch_observation
+io_in_loop	fn:api/src/handlers.rs#recompute_catalog
+read_then_write	fn:api/src/handlers.rs#recompute_catalog
+$ hoshizora serve
+INFO graph loaded nodes=150 edges=341 root=/path/to/hoshizora/examples/demo
+INFO hoshizora listening on http://127.0.0.1:7317
+INFO OTLP/HTTP receiver also on http://127.0.0.1:4318/v1/traces
 ```
 
-One server can hold several projects. Give it a data dir and add repositories by URL; each is
-shallow-cloned and indexed in the background, and the list survives restarts:
+Open http://127.0.0.1:7317. The demo plants an N+1 query, sequential awaits, a blocking call in
+async code and a dead function; its [README](examples/demo/README.md) runs the whole stack with
+`docker compose up` so real traces flow in.
 
-```sh
-hoshizora serve --data-dir .hoshizora
-curl -X POST localhost:7317/api/projects -H 'content-type: application/json' \
-     -d '{"url":"https://github.com/tokio-rs/mini-redis","services":["mini-redis"]}'
-curl localhost:7317/api/projects                           # poll until status is "ready"
-curl localhost:7317/api/projects/tokio-rs-mini-redis/search?q=set
+## Usage
+
+### See what a click triggers
+
+```console
+$ hoshizora query flow 'fn:web/src/main.ts#onLaunch' | jq -r '.steps[] | "\(.depth)  \(.lane)\t\(.node)"' | head -12
+0  web	fn:web/src/main.ts#onLaunch
+1  web	fn:web/src/api.ts#launchObservation
+1  web	fn:web/src/otel.ts#tracedHandler
+2  web	fn:web/src/otel.ts#tracer
+2  routes	route:POST /observations
+2  web	fn:web/src/api.ts#request
+3  api	fn:api/src/handlers.rs#launch_observation
+4  api	fn:api/src/handlers.rs#record_observation_event
+4  api	fn:api/src/handlers.rs#internal
+4  api	fn:api/src/db.rs#insert_observation
+4  api	fn:api/src/catalog.rs#warm_lens
+4  api	fn:api/src/worker_client.rs#fetch_weather
 ```
 
-Projects can also be declared on the command line, so a server whose data dir is wiped (a
-container without a volume) re-creates them on every start without blocking startup:
+The full output goes on through the worker's `GET /weather/{}` route into the Python `weather`
+handler and the `stars`, `inventory`, `observations` and `events` tables.
 
-```sh
-hoshizora serve --project https://github.com/tokio-rs/mini-redis@master \
-                --project 'docs=./site'                    # [name=]<url>[@ref] or [name=]<path>
-hoshizora serve --projects-file projects.json             # [{"url":..,"ref":..,"name":..,"services":[..]}, {"path":..}]
-HOSHIZORA_PROJECTS=https://github.com/a/b,https://github.com/c/d hoshizora serve
+In the viewer the same flow is a story, one lane per service:
+
+![Story view of onLaunch: lanes for the web frontend, the Rust api, the Python worker and the database, with numbered steps from the click through POST /observations to the stars and inventory tables](docs/assets/story.png)
+
+### Find what a change affects
+
+```console
+$ hoshizora query impact 'fn:api/src/db.rs#insert_observation' | jq -r '.entrypoints[] | "\(.kind)\t\(.node)"'
+http_handler	fn:api/src/handlers.rs#launch_observation
+main	fn:api/src/main.rs#main
+ui_handler	fn:web/src/main.ts#onLaunch
+main	fn:web/src/main.ts#<module>
 ```
 
-A declared URL or path that is already registered keeps its clone and graph; its declared
-`name`, `services` and `ref` are merged in on every start (a changed `ref` queues a rebuild), so
-the flags are safe to keep when the data dir does persist.
+`hoshizora diff ./base ./head` does this for a whole change: functions added, removed, modified
+or moved, effects each entrypoint gains or loses, tables touched and new enum values left
+unhandled. The other queries (`effects`, `dead`, `states`, `search`, `node`) are in
+[docs/queries.md](docs/queries.md).
 
-Git projects can follow their remote. Auto-refresh is opt-in per project: tick it on the project
-card, or `PATCH /api/projects/{id}` with `{"auto_refresh": true}`; it is saved in `projects.json`.
-For opted-in projects, every `--refresh-interval` minutes (`HOSHIZORA_REFRESH_INTERVAL`, default 15,
-0 disables) a `git ls-remote` compares the tracked ref with the indexed commit and rebuilds when it
-moved; rebuilds run one project at a time. A project without a declared `ref`
-also follows the deployed code: when its spans carry a `service.version` and the remote has a
-tag `v<version>` or `<version>`, the project switches to that tag. `GET /api/projects` shows the
-declared `ref`, the `tracked_ref` adopted this way, the `indexed_ref`/`commit` the graph was built
-from and the last `seen_version`, so a stale graph is visible.
+### Light it up with traces
 
-Clones are only needed while indexing and for the source panel, so on a small volume they can be
-purged without losing anything: the project stays registered and its graph keeps being served,
-and the next reindex clones again. Path projects are never touched.
+hoshizora receives OTLP/HTTP on its port and on the standard port 4318, so a stock SDK exports to
+it with no configuration. Spans join to code through `code.function.name`,
+`code.file.path` + `code.line.number`, `http.route` and the `db.*` attributes. Turn on **Live**
+in the viewer to see them arrive, and **Heat** to colour functions by self time, call rate or p95.
+
+### Serve several repositories
 
 ```sh
-curl localhost:7317/api/storage                                    # clone/graph bytes per project, disk free
-curl -X POST localhost:7317/api/projects/tokio-rs-mini-redis/purge # {"id":..,"freed_bytes":..}
-curl -X POST localhost:7317/api/purge                              # every idle git project
+hoshizora serve --project https://github.com/tokio-rs/mini-redis --project ./my-service
 ```
 
-The viewer's home screen shows the same sizes with "Purge clone" and "Purge all clones" buttons.
+Each URL is shallow-cloned and indexed in the background, and the list persists in the data dir.
+Declared projects, following a remote, purging clones and span routing are in
+[docs/serving.md](docs/serving.md).
 
-Every `/api/...` route also exists under `/api/projects/{id}/...`; the unprefixed form is the
-first project. Set `HOSHIZORA_GIT_TOKEN` to clone private GitHub repositories. Spans are routed
-to the project owning their `service.name`, else by the `x-hoshizora-project` header or
-`?project=`, else by where their `code.filepath` resolves.
+## Configuration
 
-Point any OpenTelemetry SDK at it. hoshizora also listens on the standard OTLP/HTTP port 4318, so
-stock SDKs need no configuration:
+`hoshizora serve` options most setups touch (`hoshizora serve --help` lists all):
 
-```sh
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:7317
-OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-```
+| Option | Env | Default | Effect |
+|---|---|---|---|
+| `--port` | | `7317` | API, viewer and OTLP port |
+| `--otlp-port` | | `4318` | Extra standard OTLP/HTTP port, skipped when busy |
+| `--host` | | `127.0.0.1` | Bind address; `0.0.0.0` in a container |
+| `--data-dir` | | `.hoshizora` | Project list, clones and graphs |
+| `--project` | `HOSHIZORA_PROJECTS` | | `[name=]<url>[@ref]` or a path to register at start |
+| `--refresh-interval` | `HOSHIZORA_REFRESH_INTERVAL` | `15` | Minutes between remote checks for auto-refresh projects |
+| | `HOSHIZORA_GIT_TOKEN` | | Token used to clone private GitHub repositories |
 
-Spans join to code through `code.function.name`, `code.file.path` + `code.line.number`
-(Rust `#[tracing::instrument]` emits these through `tracing-opentelemetry`), `http.route`,
-`db.collection.name` / `db.query.text`, `messaging.destination.name` and server addresses.
-
-The polyglot demo in [`examples/demo`](examples/demo) runs a TypeScript frontend, a Rust API, a
-Python worker, Postgres and hoshizora with one `docker compose up`, with planted N+1 queries,
-sequential awaits, blocking calls and dead code to find.
-
-## Queries
-
-```sh
-hoshizora query flow    'fn:web/src/api.ts#launchObservation'   # everything it triggers
-hoshizora query impact  'fn:api/src/db.rs#insert_observation'   # everything that reaches it
-hoshizora query effects db_write --target observations
-hoshizora query insights
-hoshizora query states --domain Status                       # branches on a value domain and what they miss
-hoshizora query dead
-hoshizora query search  launch
-hoshizora diff ./base ./head                                   # what a change does
-hoshizora coverage --cases cases.json                          # score diffs against known review corrections
-```
-
-`diff` takes two source trees or graph files and prints which functions were added, removed,
-modified (by body text, never by line numbers) or moved (same body elsewhere, or same name when
-unambiguous; `modified: true` when the body changed too), the effects each entrypoint gains or
-loses (tests in their own section), the readers and writers of every table the changed code
-touches, insights that appeared or went away, and for each changed function the nearest
-user-facing entrypoints (routes, UI handlers, jobs, CLI, main) with one shortest path each,
-capped at 10 with an `omitted` count, and a `states` section: domains whose values were added
-or removed, with every site in the repo that does not handle a new value.
-
-`coverage` replays `diff` over labelled PRs and reports, per signal, how many of the review
-corrections outside the diff it would have pointed at and how large its set was; see
-[`docs/coverage.md`](docs/coverage.md).
-
-### States
-
-`states` collects declared value domains — Rust and Python enums, TypeScript `enum`s, string or
-number literal unions and `as const` lists or maps, Go typed const blocks — and every `switch`,
-`match` or `if`/`else if` chain that compares one subject against literals or members. A site is
-linked to a domain by its qualifier (`Status::Active` → `Status`, nearest declaration first) or,
-unqualified, when at least two handled values all belong to exactly one domain. Each site reports
-the values it misses and what its catch-all does: `throws`, `returns_empty` (empty body, bare
-`return`/`break`/`pass`, or an empty value) or `other`. A site with missing values and a silent
-catch-all is an `unhandled_values` insight.
-
-The HTTP API is documented in [`docs/api.md`](docs/api.md); the architecture in
-[`docs/architecture.md`](docs/architecture.md); prior art in
-[`docs/research/prior-art.md`](docs/research/prior-art.md).
+The HTTP API is in [docs/api.md](docs/api.md) and the design in
+[docs/architecture.md](docs/architecture.md), with prior art in
+[docs/research/prior-art.md](docs/research/prior-art.md).
 
 ## Extending
 
@@ -144,7 +170,7 @@ The HTTP API is documented in [`docs/api.md`](docs/api.md); the architecture in
 | A library (what is a DB call, a spawn, an HTTP client) | rules in `packs/*.toml`, or a directory passed with `--packs` |
 | A web framework's routes | a `[[route]]` rule in the same packs |
 
-## Limits
+## Limitations
 
 - Calls are resolved by name within the caller's language and the packages it imports. Edges
   carry a confidence (`exact`, `name`, `heuristic`, `observed`); edges with several candidate
@@ -153,6 +179,7 @@ The HTTP API is documented in [`docs/api.md`](docs/api.md); the architecture in
   propagate effects or complexity.
 - Complexity is a heuristic estimate with its reasons attached, not a proof.
 - Runtime stats come from spans: functions without spans are only visible statically.
+- The 3D viewer needs WebGL.
 
 ## Development
 
@@ -161,4 +188,13 @@ cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
 cd viewer && npm ci && npm run dev    # open http://localhost:5173/?mock for fixture data
 ```
 
-Build the viewer before the binary to embed it: `cd viewer && npm run build`.
+To regenerate the README images, serve the demo and run the Playwright script (needs `ffmpeg`):
+
+```sh
+hoshizora serve --data-dir /tmp/hz --project examples/demo --port 5450 --otlp-port 5451
+cd viewer && npm run readme:shots     # writes docs/assets/hero.png and story.png
+```
+
+## License
+
+[MIT](LICENSE)
