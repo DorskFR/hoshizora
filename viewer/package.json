@@ -10,7 +10,8 @@
     "check": "tsc --noEmit",
     "lint": "biome check src tests e2e playwright.config.ts",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "readme:shots": "node scripts/readme-screenshots.mjs"
   },
   "dependencies": {
     "3d-force-graph": "^1.80.1",
