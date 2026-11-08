@@ -6,7 +6,7 @@ Maps a codebase as a 3D graph of modules and functions and overlays OpenTelemetr
 
 ![The hoshizora viewer on the polyglot demo: functions of a TypeScript frontend, a Rust API and a Python worker as stars, coloured by self time, with a ticker of incoming spans and the launch_observation handler selected, showing its effects and source](docs/assets/hero.png)
 
-^ The [demo](examples/demo) with live spans. Colour is self time; the panel lists the direct and
+Colour is self time; the panel lists the direct and
 transitive effects of `launch_observation`.
 
 Parses a repository with tree-sitter into packages, files, types and functions, with each
@@ -167,13 +167,6 @@ Prior art: [docs/research/prior-art.md](docs/research/prior-art.md).
 ```sh
 cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
 cd viewer && npm ci && npm run dev    # open http://localhost:5173/?mock for fixture data
-```
-
-README images (Playwright, needs `ffmpeg`):
-
-```sh
-hoshizora serve --data-dir /tmp/hz --project examples/demo --port 5450 --otlp-port 5451
-cd viewer && npm run readme:shots     # writes docs/assets/hero.png and story.png
 ```
 
 ## License
