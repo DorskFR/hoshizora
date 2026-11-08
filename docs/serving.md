@@ -78,5 +78,8 @@ Spans join to code through `code.function.name`, `code.file.path` + `code.line.n
 (Rust `#[tracing::instrument]` emits these through `tracing-opentelemetry`), `http.route`,
 `db.collection.name` / `db.query.text`, `messaging.destination.name` and server addresses.
 
+In the viewer, **Live** shows spans as they arrive and **Heat** colours functions by self time,
+call rate or p95.
+
 With several projects, spans are routed to the project owning their `service.name`, else by the
 `x-hoshizora-project` header or `?project=`, else by where their `code.filepath` resolves.

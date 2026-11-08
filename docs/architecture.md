@@ -88,4 +88,9 @@ live stream). CLI and MCP are thin clients over it.
 
 - Dynamic dispatch (traits, interfaces, duck typing) makes name-based call edges fuzzy;
   SCIP and runtime traces correct them, and every edge carries its confidence.
+- Calls are resolved by name within the caller's language and the packages it imports. Edges
+  carry a confidence (`exact`, `name`, `heuristic`, `observed`). Edges with several candidate
+  targets, and name matches for a method called on an unnamed expression (`x.get(0).start()`) or
+  on a binding not named after the target's type, are kept for navigation but not used to
+  propagate effects or complexity.
 - Big-O is a heuristic estimate with a stated basis, never a proof.
