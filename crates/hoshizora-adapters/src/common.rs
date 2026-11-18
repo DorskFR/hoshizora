@@ -135,7 +135,7 @@ impl CallInfo {
     /// callee is just the method name.
     pub fn method(callee: &str, receiver: Option<String>, string_args: Vec<String>) -> Self {
         let callee = strip_ws(callee);
-        match receiver.map(|r| strip_ws(&r)) {
+        match receiver.map(|r| strip_ws(&r).replace("?.", ".")) {
             Some(r) if r.contains(['(', '[', '{', '?', '!']) => Self {
                 callee: last_segment(&callee),
                 receiver: Some(EXPR_RECEIVER.to_owned()),
@@ -359,18 +359,96 @@ pub fn analyze_nodes_with(
         last_stmt: nodes.last().map(|n| n.id()),
         is_ref,
         flows: HashMap::new(),
+        headers: HashMap::new(),
+        bound: Vec::new(),
     };
     for child in nodes {
         walk(*child, source, spec, State::default(), &mut out, &mut scope);
     }
     out.cyclomatic = 1 + out.branches + out.loops;
     out.calls.sort_by_key(|c| c.line);
+    for child in nodes {
+        collect_refs(*child, None, "", source, spec, &mut out.refs);
+    }
     out
 }
 
-/// Synthetic `<module>` symbol for top-level code, when it makes at least one call.
+/// Fields whose content is a callee, a declared name, a key or a pattern: never a reference.
+const NON_REF_FIELDS: &[&str] = &[
+    "field",
+    "property",
+    "attribute",
+    "name",
+    "function",
+    "constructor",
+    "macro",
+    "key",
+    "label",
+    "type",
+    "pattern",
+    "parameters",
+    "parameter",
+    "alias",
+];
+
+/// Identifiers and member paths read as values anywhere under `node`: everything except
+/// callees, receivers of a member access, declared names and assignment targets.
+fn collect_refs(
+    node: Node,
+    field: Option<&str>,
+    parent: &str,
+    source: &str,
+    spec: &BodySpec,
+    out: &mut Vec<String>,
+) {
+    let kind = node.kind();
+    if spec.stop.contains(&kind) {
+        return;
+    }
+    let leaf = spec.ref_kinds.contains(&kind)
+        || (kind.starts_with("shorthand") && spec.idents.contains(&kind));
+    let member = leaf && kind != "identifier" && !kind.starts_with("shorthand");
+    let path = leaf.then(|| strip_ws(text(node, source)).replace("?.", "."));
+    let clean = path
+        .as_deref()
+        .is_some_and(|t| !t.contains(['(', '[', '{', '<', '?', '!', '"', '\'', '`']));
+    let excluded = field.is_some_and(|f| NON_REF_FIELDS.contains(&f))
+        || (!member
+            && spec
+                .binders
+                .iter()
+                .any(|(k, f)| *k == parent && Some(*f) == field))
+        || (spec.ref_kinds.contains(&parent) && parent != "identifier");
+    if clean && !excluded {
+        let t = path.as_deref().unwrap_or_default();
+        let prefixes = t.match_indices('.').skip(1).map(|(i, _)| &t[..i]);
+        for p in prefixes.chain([t]) {
+            if !NOT_A_FUNCTION.contains(&p) && !out.iter().any(|o| o == p) {
+                out.push(p.to_owned());
+            }
+        }
+    }
+    if member && clean {
+        return;
+    }
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let child = cursor.node();
+        if child.is_named() {
+            collect_refs(child, cursor.field_name(), kind, source, spec, out);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// Synthetic `<module>` symbol for top-level code, when it calls or references anything.
 pub fn module_symbol(body: Body, lines: u32) -> Option<Symbol> {
-    (!body.calls.is_empty()).then(|| Symbol {
+    (!body.calls.is_empty() || !body.refs.is_empty()).then(|| Symbol {
         kind: SymbolKind::Function,
         name: "<module>".into(),
         local_name: "<module>".into(),
@@ -400,6 +478,11 @@ pub fn merge_module_symbol(symbols: &mut Vec<Symbol>, extra: Symbol) {
             };
             a.calls.extend(b.calls);
             a.calls.sort_by_key(|c| c.line);
+            for r in b.refs {
+                if !a.refs.contains(&r) {
+                    a.refs.push(r);
+                }
+            }
             a.branches += b.branches;
             a.loops += b.loops;
             a.max_loop_depth = a.max_loop_depth.max(b.max_loop_depth);
@@ -417,6 +500,10 @@ struct Scope<'a> {
     last_stmt: Option<usize>,
     is_ref: &'a dyn Fn(&str) -> bool,
     flows: HashMap<usize, DataFlow>,
+    /// Loop headers (iterated expressions), walked with the state outside their loop.
+    headers: HashMap<usize, State>,
+    /// Names bound by the enclosing loops' patterns.
+    bound: Vec<String>,
 }
 
 fn walk(
@@ -431,10 +518,38 @@ fn walk(
     if spec.stop.contains(&kind) {
         return;
     }
+    if let Some(outer) = scope.headers.remove(&node.id()) {
+        st = outer;
+    }
+    let bound_before = scope.bound.len();
     if spec.loops.contains(&kind) {
         out.loops += 1;
-        st.loop_depth += 1;
-        out.max_loop_depth = out.max_loop_depth.max(st.loop_depth);
+        let (pattern, iterable) = loop_parts(node);
+        if let Some(it) = iterable {
+            scope.headers.insert(it.id(), st);
+        }
+        if !bounded_loop(node, pattern, iterable, source, &scope.bound) {
+            st.loop_depth += 1;
+            out.max_loop_depth = out.max_loop_depth.max(st.loop_depth);
+        }
+        if let Some(p) = pattern {
+            pattern_names(p, source, spec.idents, &mut scope.bound);
+        }
+    }
+    if !scope.bound.is_empty()
+        && matches!(
+            kind,
+            "let_declaration" | "variable_declarator" | "assignment" | "short_var_declaration"
+        )
+        && let Some((_, field)) = spec.binders.iter().find(|(k, _)| *k == kind)
+        && let Some(target) = node.child_by_field_name(field)
+        && let Some(value) = node
+            .child_by_field_name("value")
+            .or_else(|| node.child_by_field_name("right"))
+        && root_ident(unwrap_iterable(value, source), source)
+            .is_some_and(|r| scope.bound.contains(&r))
+    {
+        pattern_names(target, source, spec.idents, &mut scope.bound);
     }
     if spec.closures.contains(&kind) {
         out.closures += 1;
@@ -513,6 +628,292 @@ fn walk(
         }
         walk(child, source, spec, cst, out, scope);
     }
+    if spec.loops.contains(&kind) {
+        scope.bound.truncate(bound_before);
+    }
+}
+
+/// The variable pattern and the iterated expression of a loop, when it has them:
+/// `for p in it`, `for (const p of it)`, `[.. for p in it]`, `while let p = it`, `for p := range it`.
+fn loop_parts(node: Node) -> (Option<Node>, Option<Node>) {
+    let clause = if node.kind().ends_with("comprehension") || node.kind() == "generator_expression"
+    {
+        child_of_kind(node, "for_in_clause")
+    } else if let Some(range) = child_of_kind(node, "range_clause") {
+        Some(range)
+    } else if let Some(cond) = node
+        .child_by_field_name("condition")
+        .filter(|c| c.kind() == "let_condition")
+    {
+        Some(cond)
+    } else {
+        Some(node)
+    };
+    let Some(clause) = clause else {
+        return (None, None);
+    };
+    let pattern = clause
+        .child_by_field_name("pattern")
+        .or_else(|| clause.child_by_field_name("left"));
+    let iterable = clause
+        .child_by_field_name("value")
+        .or_else(|| clause.child_by_field_name("right"));
+    (pattern, iterable)
+}
+
+/// Loops that do not scale with the input, so they add no loop depth: over a literal list, a
+/// constant table or a small literal range; retries; paced, polling and event loops that wait
+/// between iterations; and an inner loop over a part of an enclosing loop's item (a
+/// `group.items` walk visits each item once).
+fn bounded_loop(
+    node: Node,
+    pattern: Option<Node>,
+    iterable: Option<Node>,
+    source: &str,
+    bound: &[String],
+) -> bool {
+    let body = node
+        .child_by_field_name("body")
+        .map_or("", |b| text(b, source));
+    if [
+        "sleep(",
+        "sleep_until(",
+        ".tick()",
+        "select!",
+        "setTimeout(",
+    ]
+    .iter()
+    .any(|p| body.contains(p))
+    {
+        return true;
+    }
+    let pattern_text = pattern.map_or("", |p| text(p, source));
+    if retry_named(pattern_text) {
+        return true;
+    }
+    if let Some(cond) = node
+        .child_by_field_name("condition")
+        .or_else(|| {
+            child_of_kind(node, "for_clause").and_then(|c| c.child_by_field_name("condition"))
+        })
+        .filter(|c| c.kind() != "let_condition")
+    {
+        let cond = text(cond, source);
+        if retry_named(cond) || small_bound(cond) {
+            return true;
+        }
+    }
+    let Some(it) = iterable else {
+        return false;
+    };
+    let it_text = text(it, source);
+    if [".recv()", ".next().await", ".accept()", ".message().await"]
+        .iter()
+        .any(|p| it_text.contains(p))
+    {
+        return true;
+    }
+    let base = unwrap_iterable(it, source);
+    if constant_iterable(base, source)
+        || retry_named(last_segment(&strip_ws(text(base, source))).as_str())
+    {
+        return true;
+    }
+    !is_range(base, source)
+        && root_ident(base, source).is_some_and(|r| r != "self" && bound.contains(&r))
+}
+
+fn retry_named(t: &str) -> bool {
+    ident_words(t).iter().any(|w| {
+        matches!(
+            w.as_str(),
+            "attempt" | "attempts" | "retry" | "retries" | "tries" | "backoff"
+        )
+    })
+}
+
+/// `i < 3`, `n <= 10`: a C-style loop bounded by a small literal.
+fn small_bound(cond: &str) -> bool {
+    let cond = cond.trim().trim_end_matches(';');
+    cond.split_once('<')
+        .map(|(_, rhs)| rhs.trim_start_matches('=').trim().trim_end_matches(')'))
+        .and_then(|rhs| rhs.parse::<u64>().ok())
+        .is_some_and(|n| n <= SMALL_BOUND)
+}
+
+const SMALL_BOUND: u64 = 16;
+
+/// `&x`, `x.iter()`, `x.items()`, `enumerate(x)`, `Object.entries(x)` → `x`.
+fn unwrap_iterable<'t>(mut node: Node<'t>, source: &str) -> Node<'t> {
+    const ADAPTERS: &[&str] = &[
+        "iter",
+        "into_iter",
+        "iter_mut",
+        "items",
+        "keys",
+        "values",
+        "entries",
+        "enumerate",
+        "copied",
+        "cloned",
+        "sorted",
+        "reversed",
+        "list",
+        "tuple",
+    ];
+    loop {
+        match node.kind() {
+            "reference_expression"
+            | "parenthesized_expression"
+            | "unary_expression"
+            | "await_expression"
+            | "await" => {
+                let Some(inner) = named_children(node).pop() else {
+                    return node;
+                };
+                node = inner;
+            }
+            k if k.contains("call") => {
+                let Some(f) = node.child_by_field_name("function") else {
+                    return node;
+                };
+                let name = last_segment(&strip_ws(text(f, source)));
+                if !ADAPTERS.contains(&name.as_str()) {
+                    return node;
+                }
+                let receiver = f
+                    .child_by_field_name("value")
+                    .or_else(|| f.child_by_field_name("object"))
+                    .filter(|r| text(*r, source) != "Object");
+                let next = receiver.or_else(|| {
+                    node.child_by_field_name("arguments")
+                        .and_then(|a| a.named_child(0))
+                });
+                match next {
+                    Some(n) => node = n,
+                    None => return node,
+                }
+            }
+            _ => return node,
+        }
+    }
+}
+
+fn constant_iterable(node: Node, source: &str) -> bool {
+    match node.kind() {
+        "array_expression" | "tuple_expression" | "array" | "list" | "tuple" | "set" => true,
+        "identifier"
+        | "scoped_identifier"
+        | "field_expression"
+        | "attribute"
+        | "member_expression"
+        | "selector_expression" => {
+            let last = last_segment(&strip_ws(text(node, source)));
+            last.len() > 1
+                && last.chars().any(|c| c.is_ascii_uppercase())
+                && last
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        }
+        "range_expression" => {
+            let ends: Vec<Node> = named_children(node);
+            !ends.is_empty()
+                && ends.iter().all(|e| e.kind() == "integer_literal")
+                && ends
+                    .last()
+                    .and_then(|e| text(*e, source).parse::<u64>().ok())
+                    .is_some_and(|n| n <= SMALL_BOUND)
+        }
+        "call"
+            if node
+                .child_by_field_name("function")
+                .is_some_and(|f| text(f, source) == "range") =>
+        {
+            let args: Vec<Node> = node
+                .child_by_field_name("arguments")
+                .map(named_children)
+                .unwrap_or_default();
+            !args.is_empty()
+                && args.iter().all(|a| a.kind() == "integer")
+                && args
+                    .iter()
+                    .filter_map(|a| text(*a, source).parse::<u64>().ok())
+                    .max()
+                    .is_some_and(|n| n <= SMALL_BOUND)
+        }
+        _ => false,
+    }
+}
+
+fn is_range(node: Node, source: &str) -> bool {
+    node.kind() == "range_expression"
+        || (node.kind() == "call"
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|f| text(f, source) == "range"))
+}
+
+/// The variable an expression reads from: `m.tracks` → `m`, `row["cells"]` → `row`,
+/// `read_dir(&dir)` → `dir`, `line.split(';')` → `line`.
+fn root_ident(mut node: Node, source: &str) -> Option<String> {
+    for _ in 0..16 {
+        match node.kind() {
+            "identifier" => return Some(text(node, source).to_owned()),
+            k if k.contains("call") => {
+                let f = node.child_by_field_name("function")?;
+                node = match f
+                    .child_by_field_name("value")
+                    .or_else(|| f.child_by_field_name("object"))
+                    .or_else(|| f.child_by_field_name("operand"))
+                {
+                    Some(receiver) => receiver,
+                    None => node.child_by_field_name("arguments")?.named_child(0)?,
+                };
+            }
+            _ => {
+                node = node
+                    .child_by_field_name("value")
+                    .or_else(|| node.child_by_field_name("object"))
+                    .or_else(|| node.child_by_field_name("operand"))
+                    .or_else(|| node.named_child(0))?;
+            }
+        }
+    }
+    None
+}
+
+/// Identifiers bound by a loop pattern: `(k, group)` → `k`, `group`.
+fn pattern_names(node: Node, source: &str, idents: &[&str], out: &mut Vec<String>) {
+    if idents.contains(&node.kind()) {
+        out.push(text(node, source).to_owned());
+        return;
+    }
+    for c in named_children(node) {
+        pattern_names(c, source, idents, out);
+    }
+}
+
+/// Lowercase words of identifiers: `max_attempts` → `max`, `attempts`; `retryDelay` → `retry`,
+/// `delay`.
+fn ident_words(t: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![String::new()];
+    let mut prev_lower = false;
+    for c in t.chars() {
+        if !c.is_alphanumeric() {
+            out.push(String::new());
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            out.push(String::new());
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        if let Some(w) = out.last_mut() {
+            w.extend(c.to_lowercase());
+        }
+    }
+    out.retain(|w| !w.is_empty());
+    out
 }
 
 fn emit_refs(

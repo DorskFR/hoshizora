@@ -151,7 +151,11 @@ enum QueryCommand {
         target: Option<String>,
     },
     /// Static findings.
-    Insights,
+    Insights {
+        /// Also report findings on test code.
+        #[arg(long)]
+        include_tests: bool,
+    },
     /// Value domains (enums, literal unions, const lists) and the branches on them, with the
     /// values each branch misses.
     States {
@@ -528,6 +532,7 @@ fn serve_legacy_graph(
         tracked_ref: None,
         indexed_ref: None,
         seen_version: None,
+        recent_versions: Vec::new(),
         auto_refresh: false,
     };
     state.insert_ready(project, GraphIndex::new(graph), root, Some(0));
@@ -689,9 +694,11 @@ fn cmd_query(graph_path: &Path, query: QueryCommand) -> anyhow::Result<()> {
         QueryCommand::Effects { kind, target } => {
             serde_json::to_value(index.with_effect(parse_effect_kind(&kind)?, target.as_deref()))?
         }
-        QueryCommand::Insights => serde_json::to_value(hoshizora_model::api::Insights {
-            insights: index.static_insights(),
-        })?,
+        QueryCommand::Insights { include_tests } => {
+            serde_json::to_value(hoshizora_model::api::Insights {
+                insights: index.static_insights(include_tests),
+            })?
+        }
         QueryCommand::States { domain } => serde_json::to_value(index.states(domain.as_deref()))?,
         QueryCommand::Search { q, limit } => serde_json::to_value(index.search(&q, limit))?,
         QueryCommand::Node { id } => {

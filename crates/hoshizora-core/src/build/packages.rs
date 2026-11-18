@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use hoshizora_model::{Effects, FileFacts, Language, Node, NodeKind};
 
 use super::Ctx;
@@ -61,6 +63,124 @@ pub(crate) fn build(ctx: &mut Ctx) {
         });
         ctx.nodes[idx].lines += file.lines;
         ctx.package_of_file.push(idx);
+    }
+}
+
+/// Source files the manifest of a published JS package points at (`exports`, `main`, `module`,
+/// `svelte`), for packages not marked private. Build output paths are mapped back to sources:
+/// `dist/x.js` → `src/x`, `src/lib/x`.
+pub(crate) fn library_entries(ctx: &Ctx, root: &Path) -> Vec<usize> {
+    let mut dirs: Vec<String> = ctx
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.language, Language::TypeScript | Language::JavaScript))
+        .map(|(fi, _)| ctx.nodes[ctx.package_of_file[fi]].qualified_name.clone())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let base = if dir == "." {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let Ok(text) = std::fs::read_to_string(root.join(&base).join("package.json")) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if manifest.get("private").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        let mut targets = Vec::new();
+        for key in ["exports", "main", "module", "svelte"] {
+            if let Some(v) = manifest.get(key) {
+                string_leaves(v, &mut targets);
+            }
+        }
+        for target in targets {
+            let t = target.trim_start_matches("./");
+            if t.ends_with(".d.ts") || !t.ends_with(['s', 'x']) {
+                continue;
+            }
+            let stem = strip_ext(t);
+            let mut keys = vec![stem.clone()];
+            if let Some(rest) = stem.strip_prefix("dist/") {
+                keys.push(format!("src/{rest}"));
+                keys.push(format!("src/lib/{rest}"));
+            }
+            for key in keys {
+                if let Some(files) = ctx.module_files.get(&format!("{base}{key}")) {
+                    out.extend(files.iter().copied());
+                    break;
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Functions named by Python packaging entry points (`[project.scripts]`,
+/// `[tool.poetry.scripts]`, `[project.entry-points.*]`: `name = "pkg.cli:main"`).
+pub(crate) fn python_entry_points(ctx: &Ctx, root: &Path) -> Vec<usize> {
+    let mut dirs: Vec<&str> = Vec::new();
+    for file in ctx.files.iter().filter(|f| f.language == Language::Python) {
+        let mut dir = file.path.as_str();
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            dirs.push(parent);
+            dir = parent;
+        }
+        dirs.push("");
+    }
+    dirs.sort_unstable();
+    dirs.dedup();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(text) = std::fs::read_to_string(root.join(dir).join("pyproject.toml")) else {
+            continue;
+        };
+        let mut in_scripts = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_scripts = matches!(
+                    line,
+                    "[project.scripts]" | "[project.gui-scripts]" | "[tool.poetry.scripts]"
+                ) || line.starts_with("[project.entry-points");
+                continue;
+            }
+            let Some((module, func)) = line
+                .split_once('=')
+                .filter(|_| in_scripts)
+                .map(|(_, v)| v.trim().trim_matches(['"', '\'']))
+                .and_then(|v| v.split_once(':'))
+            else {
+                continue;
+            };
+            let func = func.split_whitespace().next().unwrap_or(func);
+            for &fi in ctx
+                .module_files
+                .get(&normalise(module))
+                .into_iter()
+                .flatten()
+            {
+                out.extend(ctx.fn_by_file_local[fi].get(func).copied());
+            }
+        }
+    }
+    out
+}
+
+fn string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Object(map) => map.values().for_each(|v| string_leaves(v, out)),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| string_leaves(v, out)),
+        _ => {}
     }
 }
 

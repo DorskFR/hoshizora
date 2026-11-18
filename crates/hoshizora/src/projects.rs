@@ -12,7 +12,7 @@ use anyhow::Context;
 use hoshizora_model::Graph;
 use hoshizora_model::api::{
     AddProject, DiskSpace, Project, ProjectSource, ProjectStatus, ProjectStorage, PurgeReport,
-    Purged, Storage, UpdateProject,
+    Purged, SeenVersion, Storage, UpdateProject,
 };
 use hoshizora_runtime::RuntimeConfig;
 
@@ -381,6 +381,7 @@ impl<Q: GraphQueries> AppState<Q> {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            recent_versions: Vec::new(),
             auto_refresh: false,
         };
         self.write().push(ProjectEntry {
@@ -438,6 +439,7 @@ impl<Q: GraphQueries> AppState<Q> {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            recent_versions: Vec::new(),
             auto_refresh: false,
         };
         self.write().push(ProjectEntry {
@@ -449,23 +451,21 @@ impl<Q: GraphQueries> AppState<Q> {
         Ok(project)
     }
 
-    /// Records the `service.version` spans routed to `id` carry; a new version queues a remote
-    /// check so a git project without a declared ref can move to the matching tag.
+    /// Records the `service.version` spans routed to `id` carry; a change of the newest recent
+    /// version queues a remote check so a git project without a declared ref can move to the
+    /// matching tag.
     pub fn note_version(self: &Arc<Self>, id: &str, version: &str) {
-        let changed = {
-            let mut projects = self.write();
-            match projects.iter_mut().find(|e| e.project.id == id) {
-                Some(e) if e.project.seen_version.as_deref() != Some(version) => {
-                    e.project.seen_version = Some(version.to_string());
-                    true
-                }
-                _ => false,
-            }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let Some(changed) = self.observe_version(id, version, now) else {
+            return;
         };
+        self.persist();
         if !changed {
             return;
         }
-        self.persist();
         let state = Arc::clone(self);
         let id = id.to_string();
         tokio::spawn(async move {
@@ -473,6 +473,49 @@ impl<Q: GraphQueries> AppState<Q> {
                 tracing::warn!(project = id, error = %e, "checking remote for new version");
             }
         });
+    }
+
+    /// Updates the recent versions of `id`: `None` when nothing needs saving, otherwise whether
+    /// the followed version changed.
+    fn observe_version(&self, id: &str, version: &str, now: u64) -> Option<bool> {
+        let mut projects = self.write();
+        let project = &mut projects.iter_mut().find(|e| e.project.id == id)?.project;
+        let recent = &mut project.recent_versions;
+        let mut dirty = false;
+        if recent.is_empty()
+            && let Some(seen) = &project.seen_version
+        {
+            recent.push(SeenVersion {
+                version: seen.clone(),
+                last_seen: now,
+            });
+            dirty = true;
+        }
+        match recent.iter_mut().find(|v| v.version == version) {
+            Some(v) if now.saturating_sub(v.last_seen) >= VERSION_TOUCH_SECS => {
+                v.last_seen = now;
+                dirty = true;
+            }
+            Some(_) => {}
+            None => {
+                recent.push(SeenVersion {
+                    version: version.to_string(),
+                    last_seen: now,
+                });
+                dirty = true;
+            }
+        }
+        let before = recent.len();
+        recent
+            .retain(|v| v.version == version || now.saturating_sub(v.last_seen) < VERSION_TTL_SECS);
+        dirty |= recent.len() != before;
+        let newest = recent
+            .iter()
+            .max_by(|a, b| compare_versions(&a.version, &b.version))
+            .map(|v| v.version.clone());
+        let changed = newest != project.seen_version;
+        project.seen_version = newest;
+        (dirty || changed).then_some(changed)
     }
 
     /// Checks the remote of a git project: adopts the tag matching `seen_version` when the
@@ -831,6 +874,64 @@ fn disk_space(path: &Path) -> Option<DiskSpace> {
 #[cfg(not(unix))]
 fn disk_space(_path: &Path) -> Option<DiskSpace> {
     None
+}
+
+/// A version not seen for this long no longer counts as deployed.
+const VERSION_TTL_SECS: u64 = 24 * 3600;
+/// `last_seen` is refreshed at most this often, which bounds `projects.json` writes.
+const VERSION_TOUCH_SECS: u64 = 60;
+
+/// Orders versions by semver precedence (a pre-release sorts below its release); versions that
+/// do not parse sort below the ones that do, then by text.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (parse_version(a), parse_version(b)) {
+        (Some(x), Some(y)) => x.0.cmp(&y.0).then_with(|| compare_pre(&x.1, &y.1)),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => a.cmp(b),
+    }
+}
+
+fn parse_version(v: &str) -> Option<([u64; 3], Vec<&str>)> {
+    let v = v.trim().trim_start_matches('v');
+    let v = v.split_once('+').map_or(v, |(v, _)| v);
+    let (core, pre) = v.split_once('-').map_or((v, ""), |(c, p)| (c, p));
+    let mut nums = [0u64; 3];
+    let mut parts = core.split('.');
+    for (i, part) in parts.by_ref().enumerate() {
+        if i >= 3 {
+            return None;
+        }
+        nums[i] = part.parse().ok()?;
+    }
+    let pre = if pre.is_empty() {
+        Vec::new()
+    } else {
+        pre.split('.').collect()
+    };
+    Some((nums, pre))
+}
+
+fn compare_pre(a: &[&str], b: &[&str]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        _ => {}
+    }
+    for (x, y) in a.iter().zip(b) {
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Tags a deployed `service.version` may be published under, most conventional first.
@@ -1329,6 +1430,7 @@ mod tests {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            recent_versions: Vec::new(),
             auto_refresh: false,
         };
         let root = state.repo_dir(&id);
@@ -1542,6 +1644,98 @@ mod tests {
         assert_eq!(saved[0].seen_version.as_deref(), Some("1.2.0"));
         assert_eq!(saved[0].tracked_ref.as_deref(), Some("v1.2.0"));
         let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn alternating_versions_settle_on_the_newest() {
+        let state = fake_state(FakeRemote::new(&[]));
+        let p = ready_git(&state, "file:///nowhere/v/alt", None, "abc");
+        assert_eq!(state.observe_version(&p.id, "0.31.0", 0), Some(true));
+        let mut refreshes = 0;
+        for i in 0..200u64 {
+            let version = if i % 2 == 0 {
+                "0.31.0"
+            } else {
+                "0.32.0-beta.2"
+            };
+            if state.observe_version(&p.id, version, 1_000 + i * 30) == Some(true) {
+                refreshes += 1;
+            }
+        }
+        assert_eq!(refreshes, 1);
+        let got = state.get(&p.id).unwrap();
+        assert_eq!(got.seen_version.as_deref(), Some("0.32.0-beta.2"));
+        assert_eq!(got.recent_versions.len(), 2);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn a_newer_version_that_stops_being_seen_ages_out() {
+        let state = fake_state(FakeRemote::new(&[]));
+        let p = ready_git(&state, "file:///nowhere/v/rollback", None, "abc");
+        assert_eq!(state.observe_version(&p.id, "1.1.0", 0), Some(true));
+        assert_eq!(state.observe_version(&p.id, "1.0.0", 10), Some(false));
+        assert_eq!(state.observe_version(&p.id, "1.0.0", 20), None);
+        assert_eq!(
+            state.observe_version(&p.id, "1.0.0", VERSION_TTL_SECS + 5),
+            Some(true),
+            "rollback followed once 1.1.0 aged out"
+        );
+        let got = state.get(&p.id).unwrap();
+        assert_eq!(got.seen_version.as_deref(), Some("1.0.0"));
+        assert_eq!(got.recent_versions.len(), 1);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn a_saved_seen_version_counts_as_recent() {
+        let state = fake_state(FakeRemote::new(&[]));
+        let p = ready_git(&state, "file:///nowhere/v/legacy", None, "abc");
+        state
+            .write()
+            .iter_mut()
+            .find(|e| e.project.id == p.id)
+            .unwrap()
+            .project
+            .seen_version = Some("0.32.0-beta.2".into());
+        assert_eq!(state.observe_version(&p.id, "0.31.0", 100), Some(false));
+        assert_eq!(
+            state.get(&p.id).unwrap().seen_version.as_deref(),
+            Some("0.32.0-beta.2")
+        );
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn projects_saved_without_recent_versions_still_load() {
+        let json = r#"[{"id":"a","name":"a","source":{"kind":"git","url":"https://x/a","ref":null},
+            "status":"ready","error":null,"commit":null,"indexed_at":null,"nodes":0,"edges":0,
+            "services":[],"seen_version":"1.0.0"}]"#;
+        let projects: Vec<Project> = serde_json::from_str(json).unwrap();
+        assert!(projects[0].recent_versions.is_empty());
+        assert!(
+            !serde_json::to_string(&projects[0])
+                .unwrap()
+                .contains("recent_versions")
+        );
+    }
+
+    #[test]
+    fn semver_precedence() {
+        use std::cmp::Ordering::*;
+        for (a, b, want) in [
+            ("0.32.0-beta.2", "0.31.0", Greater),
+            ("0.32.0-beta.2", "0.32.0", Less),
+            ("v1.2.0", "1.2.0", Equal),
+            ("1.10.0", "1.9.0", Greater),
+            ("1.0.0-alpha", "1.0.0-alpha.1", Less),
+            ("1.0.0-beta.2", "1.0.0-beta.11", Less),
+            ("1.0.0-alpha.beta", "1.0.0-alpha.1", Greater),
+            ("1.0.0+build.5", "1.0.0", Equal),
+            ("abc1234", "0.0.1", Less),
+        ] {
+            assert_eq!(compare_versions(a, b), want, "{a} vs {b}");
+        }
     }
 
     #[test]

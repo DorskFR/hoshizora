@@ -253,7 +253,10 @@ fn python_fastapi_route() {
     let get = call(fetch_one, "self.client.get");
     assert_eq!(get.receiver.as_deref(), Some("self.client"));
     assert_eq!(get.string_args, vec!["/users/{}"]);
-    assert!(get.awaited && get.loop_depth == 1);
+    assert!(
+        get.awaited && get.loop_depth == 0,
+        "a retry loop adds no depth"
+    );
     let body = fetch_one.body.as_ref().unwrap();
     assert_eq!(body.early_exits, 2);
     assert_eq!(body.cyclomatic, 4);
@@ -781,7 +784,17 @@ fn typescript_object_methods_fields_and_refs() {
     assert_eq!(session.parent.as_deref(), Some("keys"));
     assert_eq!(session.visibility, Visibility::Public);
     assert_eq!(sym(&facts, "keys.all").parent.as_deref(), Some("keys"));
-    assert!(!facts.symbols.iter().any(|s| s.name == "<module>"));
+    let module = sym(&facts, "<module>");
+    let mut initialisers: Vec<&str> = module
+        .body
+        .as_ref()
+        .unwrap()
+        .calls
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    initialisers.sort_unstable();
+    assert_eq!(initialisers, vec!["Client", "useSessionActions"]);
 
     let spawn = sym(&facts, "useSessionActions.spawn");
     assert_eq!(spawn.parent.as_deref(), Some("useSessionActions"));

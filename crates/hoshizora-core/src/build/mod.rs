@@ -48,6 +48,8 @@ pub(crate) struct FileScope {
     pub imports: Vec<ImportTarget>,
     /// Imports that bring every name of a module into scope (`use x::*`, `from x import *`).
     pub globs: Vec<usize>,
+    /// Local name → imported name for renamed imports (`import { a as b }`, `from x import a as b`).
+    pub renames: HashMap<String, String>,
 }
 
 pub(crate) struct Ctx<'a> {
@@ -197,7 +199,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
     analysis::entrypoints(&mut ctx);
     analysis::complexity(&mut ctx);
     analysis::transitive(&mut ctx);
-    analysis::dead(&mut ctx);
+    analysis::dead(&mut ctx, root);
     let states = states::build(&mut ctx);
 
     let mut languages: Vec<Language> = files.iter().map(|f| f.language).collect();

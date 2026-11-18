@@ -79,21 +79,39 @@ pub(crate) fn build_scopes(ctx: &mut Ctx) {
             if glob {
                 scope.globs.push(idx);
             }
+            let from_import = file.language == Language::Python && !imp.names.is_empty();
             if let Some(alias) = &imp.alias {
                 scope.bindings.insert(alias.clone(), idx);
-            } else if !glob && let Some(last) = last_segment(&path) {
+            } else if !glob
+                && !from_import
+                && let Some(last) = last_segment(&path)
+            {
                 scope.bindings.entry(last.to_owned()).or_insert(idx);
             }
             for name in &imp.names {
                 if name == "*" {
                     continue;
                 }
-                let bound = last_segment(name).unwrap_or(name).to_owned();
-                let sub = format!("{}/{}", normalise(&path), normalise(name));
-                let sub_files = if files.is_empty()
-                    || path.starts_with('.')
-                    || file.language == Language::Python
-                    || name.contains("::")
+                let (name, alias) = match name.split_once(" as ") {
+                    Some((orig, alias)) => (orig.trim(), Some(alias.trim())),
+                    None => (name.as_str(), None),
+                };
+                let orig = last_segment(name).unwrap_or(name).to_owned();
+                let bound = alias.map_or_else(|| orig.clone(), str::to_owned);
+                if bound != orig {
+                    scope.renames.insert(bound.clone(), orig);
+                }
+                let sub = if file.language == Language::Python && path.ends_with('.') {
+                    format!("{path}{name}")
+                } else {
+                    format!("{}/{}", normalise(&path), normalise(name))
+                };
+                let script = matches!(file.language, Language::TypeScript | Language::JavaScript);
+                let sub_files = if !script
+                    && (files.is_empty()
+                        || path.starts_with('.')
+                        || file.language == Language::Python
+                        || name.contains("::"))
                 {
                     resolve_import(ctx, fi, &sub)
                 } else {
@@ -239,7 +257,7 @@ fn probe(ctx: &Ctx, key: &str, restrict: Option<usize>, floor: usize) -> Vec<usi
 }
 
 /// Files an import path refers to, empty when it points outside the repo.
-fn resolve_import(ctx: &Ctx, fi: usize, path: &str) -> Vec<usize> {
+pub(crate) fn resolve_import(ctx: &Ctx, fi: usize, path: &str) -> Vec<usize> {
     let package_names = &ctx.package_names;
     let file = &ctx.files[fi];
     let own_pkg = ctx.package_of_file[fi];
@@ -336,10 +354,17 @@ fn resolve_import(ctx: &Ctx, fi: usize, path: &str) -> Vec<usize> {
         keys.push((normalise(path), None, 1));
     }
 
-    for (key, restrict, floor) in &keys {
-        let hits = probe(ctx, key, *restrict, *floor);
-        if !hits.is_empty() {
-            return hits;
+    for exact in [true, false] {
+        for (key, restrict, floor) in &keys {
+            let floor = if exact {
+                key.trim_matches('/').split('/').count()
+            } else {
+                *floor
+            };
+            let hits = probe(ctx, key, *restrict, floor);
+            if !hits.is_empty() {
+                return hits;
+            }
         }
     }
     if file.language == Language::Go
@@ -727,8 +752,37 @@ pub(crate) fn resolve_call_typed(
     call: &CallSite,
 ) -> (Vec<(usize, Confidence)>, Option<String>) {
     let mut receiver_type = None;
-    let targets = resolve_targets(ctx, f, call, &mut receiver_type);
+    let targets = resolve_targets(ctx, f, call, &mut receiver_type, false);
     (targets, receiver_type)
+}
+
+/// Functions a value reference (`handler`, `mod.run`, `self.on_tick`, `Type::parse`) names:
+/// through an import, the enclosing type, the file itself or a glob import, never by a bare
+/// name elsewhere in the package.
+pub(crate) fn resolve_ref(ctx: &mut Ctx, f: usize, path: &str) -> Vec<usize> {
+    let (receiver, name) = match path.rsplit_once('.') {
+        Some((r, n)) => (Some(r.to_owned()), n),
+        None => (None, path.rsplit("::").next().unwrap_or(path)),
+    };
+    let call = CallSite {
+        callee: path.to_owned(),
+        name: name.to_owned(),
+        receiver,
+        string_args: vec![],
+        line: 0,
+        loop_depth: 0,
+        awaited: false,
+        conditional: false,
+        in_closure: false,
+        binds: vec![],
+        uses: vec![],
+        mutates: vec![],
+    };
+    let mut receiver_type = None;
+    resolve_targets(ctx, f, &call, &mut receiver_type, true)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect()
 }
 
 fn resolve_targets(
@@ -736,6 +790,7 @@ fn resolve_targets(
     f: usize,
     call: &CallSite,
     receiver_type: &mut Option<String>,
+    strict: bool,
 ) -> Vec<(usize, Confidence)> {
     if call.callee.ends_with('!') || call.name.ends_with('!') {
         return Vec::new();
@@ -776,6 +831,15 @@ fn resolve_targets(
         && let Some(&imp) = ctx.scopes[fi].bindings.get(first)
         && let Some(tf) = ctx.scopes[fi].imports[imp].file
     {
+        let mut segments = segments.clone();
+        let mut name = name.clone();
+        if let Some(orig) = ctx.scopes[fi].renames.get(first) {
+            if segments.len() == 1 {
+                name = orig.clone();
+            }
+            segments[0] = orig.clone();
+        }
+        let first = &segments[0];
         let typed = segments.len() > 1 && is_type_name(first);
         let rest: Vec<String> = if segments.len() > 1 && !typed {
             segments[1..].to_vec()
@@ -900,6 +964,9 @@ fn resolve_targets(
             && !ctx.scopes[fi].bindings.contains_key(r)
             && !(language == Language::Go && ctx.package_names.contains_key(r))
     });
+    if strict && on_value {
+        return Vec::new();
+    }
     let bare = call.receiver.is_none() && segments.len() == 1;
     let from_test = is_test_file(&ctx.files[fi].path);
     let common = COMMON_METHODS.contains(&name.as_str());
@@ -947,6 +1014,7 @@ fn resolve_targets(
     if let Some(cands) = ctx
         .fn_by_package_name
         .get(&scope.pkg)
+        .filter(|_| !strict || language == Language::Go)
         .and_then(|m| m.get(&name))
         .cloned()
         .map(not_caller)
@@ -954,7 +1022,6 @@ fn resolve_targets(
     {
         return limited(ctx, &scope, cands, Confidence::Name, false);
     }
-
     let globs = ctx.scopes[fi].globs.clone();
     for imp in globs {
         if let Some(tf) = ctx.scopes[fi].imports[imp].file
@@ -963,6 +1030,9 @@ fn resolve_targets(
         {
             return limited(ctx, &scope, cands, Confidence::Name, false);
         }
+    }
+    if strict {
+        return Vec::new();
     }
 
     if let Some(cands) = ctx.fn_by_name.get(&name).cloned().map(not_caller) {

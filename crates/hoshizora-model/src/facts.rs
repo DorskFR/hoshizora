@@ -92,6 +92,9 @@ pub struct Import {
     /// Names pulled in by `from x import a, b` / `import { a, b } from "x"` / `use x::{a, b}`.
     pub names: Vec<String>,
     pub line: u32,
+    /// Re-exported rather than used: `export * from "x"`, `export { a } from "x"`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reexport: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -157,6 +160,10 @@ pub struct Body {
     pub closures: u32,
     #[serde(default)]
     pub discriminations: Vec<Discrimination>,
+    /// Functions named as values rather than called: callbacks, field initialisers, handlers
+    /// bound in markup, default arguments. As written (`handler`, `this.onTick`, `mod.run`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

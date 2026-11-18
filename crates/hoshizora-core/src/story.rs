@@ -215,6 +215,9 @@ impl Index {
             || n.qualified_name
                 .split("::")
                 .any(|seg| seg == "tests" || seg == "test")
+            || n.function
+                .as_ref()
+                .is_some_and(|f| f.attributes.iter().any(|a| is_test_attribute(a)))
     }
 
     /// A node becomes its own step when it is not a helper: synthetic nodes, route handlers,
@@ -434,15 +437,27 @@ fn link_label(kind: EdgeKind, named: Option<&Node>) -> Option<String> {
 
 pub(crate) fn is_test_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    name.starts_with("test_")
-        || name.ends_with("_test.py")
-        || name.ends_with("_test.go")
-        || name.ends_with(".test.ts")
-        || name.ends_with(".test.tsx")
-        || name.ends_with(".test.js")
-        || name.ends_with(".spec.ts")
-        || name.ends_with(".spec.js")
-        || path
-            .split('/')
-            .any(|seg| matches!(seg, "tests" | "test" | "__tests__" | "e2e" | "journeys"))
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    (name.starts_with("test_") && name.ends_with(".py"))
+        || name == "conftest.py"
+        || stem.ends_with("_test")
+        || stem.ends_with(".test")
+        || stem.ends_with(".spec")
+        || path.split('/').any(|seg| {
+            matches!(
+                seg,
+                "tests" | "test" | "__tests__" | "e2e" | "spec" | "journeys"
+            )
+        })
+}
+
+/// `#[test]`, `#[tokio::test]`, `#[rstest]`, functions inside `#[cfg(test)]` modules, pytest
+/// fixtures and marks.
+pub(crate) fn is_test_attribute(attr: &str) -> bool {
+    let a = attr.split('(').next().unwrap_or(attr);
+    attr == "cfg(test)"
+        || a == "test"
+        || a.ends_with("::test")
+        || matches!(a, "rstest" | "pytest.fixture" | "test_case")
+        || a.starts_with("pytest.mark")
 }

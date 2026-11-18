@@ -1,0 +1,5 @@
+[project]
+name = "app"
+
+[project.scripts]
+app-cli = "app.entry:run_cli"

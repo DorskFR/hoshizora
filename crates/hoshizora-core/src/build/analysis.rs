@@ -573,7 +573,7 @@ const HOOK_NAMES: &[&str] = &[
     "accept",
 ];
 
-pub(crate) fn dead(ctx: &mut Ctx) {
+pub(crate) fn dead(ctx: &mut Ctx, root_dir: &std::path::Path) {
     let n = ctx.nodes.len();
     let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (e, &(from, to)) in ctx.edges.iter().zip(&ctx.edge_ends) {
@@ -581,6 +581,156 @@ pub(crate) fn dead(ctx: &mut Ctx) {
             next[from].push(to);
         }
     }
+    let mut owned: HashMap<(usize, &str), Vec<usize>> = HashMap::new();
+    let mut by_file: HashMap<usize, Vec<usize>> = HashMap::new();
+    for f in 0..ctx.fns.len() {
+        if let Some(p) = &ctx.symbol(f).parent
+            && ctx.fns[f].parent_type.is_none()
+        {
+            owned
+                .entry((ctx.fns[f].file, p.as_str()))
+                .or_default()
+                .push(f);
+        }
+        by_file.entry(ctx.fns[f].file).or_default().push(f);
+    }
+    let mut member_refs: Vec<Vec<String>> = vec![Vec::new(); ctx.fns.len()];
+    for f in 0..ctx.fns.len() {
+        let from = ctx.fns[f].node;
+        let fi = ctx.fns[f].file;
+        let sym = ctx.symbol(f);
+        if let Some(p) = &sym.parent
+            && let Some(&pf) = ctx.fn_by_file_local[fi].get(p)
+        {
+            next[ctx.fns[pf].node].push(from);
+        }
+        let script =
+            super::resolve::family(ctx.files[fi].language) == super::resolve::Family::Script;
+        let bound = |name: &str| ctx.scopes[fi].bindings.contains_key(name);
+        let mut paths = value_refs(sym, script);
+        let mut heads: Vec<String> = Vec::new();
+        for receiver in sym
+            .body
+            .iter()
+            .flat_map(|b| &b.calls)
+            .filter_map(|c| c.receiver.as_deref())
+        {
+            let mut segs = receiver.split('.');
+            heads.extend(segs.next().map(str::to_owned));
+            member_refs[f].extend(segs.map(str::to_owned));
+        }
+        for path in &paths {
+            if let Some((head, name)) = path.rsplit_once('.') {
+                let first = head.split('.').next().unwrap_or(head);
+                if !bound(first) {
+                    member_refs[f].push(name.to_owned());
+                }
+                heads.push(first.to_owned());
+            }
+        }
+        heads.retain(|h| !is_local(sym, h) && !matches!(h.as_str(), "self" | "this" | "cls"));
+        heads.sort();
+        heads.dedup();
+        let mut objects: Vec<usize> = Vec::new();
+        for path in paths.iter().filter(|p| !p.contains(['.', ':'])) {
+            objects.extend(owned.get(&(fi, path.as_str())).into_iter().flatten());
+            if let Some(&imp) = ctx.scopes[fi].bindings.get(path)
+                && let Some(tf) = ctx.scopes[fi].imports[imp].file
+            {
+                let orig = ctx.scopes[fi].renames.get(path).unwrap_or(path);
+                objects.extend(owned.get(&(tf, orig.as_str())).into_iter().flatten());
+                let namespace = ctx.files[fi]
+                    .imports
+                    .iter()
+                    .any(|i| i.alias.as_deref() == Some(path) && i.names.is_empty());
+                if namespace {
+                    objects.extend(
+                        by_file
+                            .get(&tf)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|&t| ctx.symbol(t).visibility == Visibility::Public),
+                    );
+                }
+            }
+        }
+        for &t in &objects {
+            next[from].push(ctx.fns[t].node);
+        }
+        paths.extend(heads);
+        for path in paths {
+            for t in super::resolve::resolve_ref(ctx, f, &path) {
+                if t != f {
+                    next[from].push(ctx.fns[t].node);
+                }
+            }
+        }
+    }
+
+    let mut implementing_types: HashSet<usize> = HashSet::new();
+    for (e, &(from, _)) in ctx.edges.iter().zip(&ctx.edge_ends) {
+        if e.kind == EdgeKind::Implements {
+            implementing_types.insert(from);
+        }
+    }
+    for (fi, file) in ctx.files.iter().enumerate() {
+        for sym in &file.symbols {
+            if !sym.implements.is_empty()
+                && let Some(&t) = ctx.type_by_file_local[fi].get(&sym.local_name)
+            {
+                implementing_types.insert(t);
+            }
+        }
+    }
+    let attribute_text: Vec<String> = ctx
+        .files
+        .iter()
+        .map(|file| {
+            file.symbols
+                .iter()
+                .flat_map(|s| s.attributes.iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect();
+
+    let mut exempt = vec![false; ctx.fns.len()];
+    let mut root = vec![false; ctx.fns.len()];
+    for f in 0..ctx.fns.len() {
+        let sym = ctx.symbol(f);
+        let fi = ctx.fns[f].file;
+        let file = &ctx.files[fi];
+        let nested = sym
+            .parent
+            .as_ref()
+            .is_some_and(|p| ctx.fn_by_file_local[fi].contains_key(p));
+        let called_externally = referenced_in_attributes(&attribute_text[fi], &sym.name)
+            || !sym.implements.is_empty()
+            || ctx.fns[f]
+                .parent_type
+                .is_some_and(|t| implementing_types.contains(&t))
+            || HOOK_NAMES.contains(&sym.name.as_str())
+            || sym.name.starts_with("__")
+            || (file.language == Language::Go
+                && sym.visibility == Visibility::Public
+                && !file.path.starts_with("cmd/")
+                && file.module != "main")
+            || sym.attributes.iter().any(|a| {
+                a.contains("no_mangle") || a.contains("export") || a.contains("wasm_bindgen")
+            });
+        root[f] = called_externally || framework_root(file, sym);
+        exempt[f] = sym.body.is_none() || nested || called_externally;
+    }
+    for f in library_api(ctx, root_dir)
+        .into_iter()
+        .chain(files_named_by_path(ctx))
+        .chain(super::packages::python_entry_points(ctx, root_dir))
+    {
+        root[f] = true;
+    }
+
     let mut reachable = vec![false; n];
     let mut stack: Vec<usize> = ctx
         .nodes
@@ -588,6 +738,11 @@ pub(crate) fn dead(ctx: &mut Ctx) {
         .enumerate()
         .filter(|(_, nd)| nd.entrypoint.is_some())
         .map(|(i, _)| i)
+        .chain(
+            (0..ctx.fns.len())
+                .filter(|&f| root[f])
+                .map(|f| ctx.fns[f].node),
+        )
         .collect();
     for &s in &stack {
         reachable[s] = true;
@@ -603,7 +758,8 @@ pub(crate) fn dead(ctx: &mut Ctx) {
                 }
             }
         }
-        // Methods called on receivers of unknown type are kept alive by name, and become roots.
+        // Methods called or read on receivers of unknown type are kept alive by name, and
+        // become roots.
         for f in 0..ctx.fns.len() {
             if scanned[f] || !reachable[ctx.fns[f].node] {
                 continue;
@@ -614,6 +770,9 @@ pub(crate) fn dead(ctx: &mut Ctx) {
                 if call.receiver.is_some() {
                     live_method_names.insert((family, call.name.as_str()));
                 }
+            }
+            for name in &member_refs[f] {
+                live_method_names.insert((family, name.as_str()));
             }
         }
         for f in 0..ctx.fns.len() {
@@ -635,67 +794,258 @@ pub(crate) fn dead(ctx: &mut Ctx) {
         }
     }
 
-    let mut implementing_types: HashSet<usize> = HashSet::new();
-    for (e, &(from, _)) in ctx.edges.iter().zip(&ctx.edge_ends) {
-        if e.kind == EdgeKind::Implements {
-            implementing_types.insert(from);
-        }
-    }
-    for (fi, file) in ctx.files.iter().enumerate() {
-        for sym in &file.symbols {
-            if !sym.implements.is_empty()
-                && let Some(&t) = ctx.type_by_file_local[fi].get(&sym.local_name)
-            {
-                implementing_types.insert(t);
-            }
-        }
-    }
-
-    let attribute_text: Vec<String> = ctx
-        .files
-        .iter()
-        .map(|file| {
-            file.symbols
-                .iter()
-                .flat_map(|s| s.attributes.iter())
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .collect();
-
     for f in 0..ctx.fns.len() {
         let node = ctx.fns[f].node;
-        if reachable[node] {
-            continue;
-        }
-        let sym = ctx.symbol(f);
-        let fi = ctx.fns[f].file;
-        let file = &ctx.files[fi];
-        let nested = sym
-            .parent
-            .as_ref()
-            .is_some_and(|p| ctx.fn_by_file_local[fi].contains_key(p));
-        let exempt = sym.body.is_none()
-            || nested
-            || referenced_in_attributes(&attribute_text[fi], &sym.name)
-            || !sym.implements.is_empty()
-            || ctx.fns[f]
-                .parent_type
-                .is_some_and(|t| implementing_types.contains(&t))
-            || HOOK_NAMES.contains(&sym.name.as_str())
-            || sym.name.starts_with("__")
-            || (file.language == Language::Go
-                && sym.visibility == Visibility::Public
-                && !file.path.starts_with("cmd/")
-                && file.module != "main")
-            || sym.attributes.iter().any(|a| {
-                a.contains("no_mangle") || a.contains("export") || a.contains("wasm_bindgen")
-            });
-        if !exempt {
+        if !reachable[node] && !exempt[f] {
             ctx.nodes[node].dead = true;
         }
     }
+}
+
+/// Test doubles that replace a module named by path rather than run it.
+const MOCK_CALLS: &[&str] = &["mock", "doMock", "unmock", "importActual", "requireActual"];
+
+/// Top-level code and public functions of script files that code names by relative path
+/// (`new URL('./src/testing/paths.ts', import.meta.url)`, `new Worker('./worker.js')`).
+fn files_named_by_path(ctx: &Ctx) -> Vec<usize> {
+    let mut files: HashSet<usize> = HashSet::new();
+    for f in 0..ctx.fns.len() {
+        let fi = ctx.fns[f].file;
+        if super::resolve::family(ctx.files[fi].language) != super::resolve::Family::Script {
+            continue;
+        }
+        for arg in ctx
+            .symbol(f)
+            .body
+            .iter()
+            .flat_map(|b| &b.calls)
+            .filter(|c| !MOCK_CALLS.contains(&c.name.as_str()))
+            .flat_map(|c| &c.string_args)
+        {
+            let relative = arg.starts_with("./") || arg.starts_with("../");
+            let source = [
+                ".ts", ".js", ".mjs", ".cjs", ".mts", ".tsx", ".jsx", ".svelte",
+            ]
+            .iter()
+            .any(|ext| arg.ends_with(ext));
+            if relative && source {
+                let base = arg.rsplit('/').next().unwrap_or(arg);
+                files.extend(
+                    super::resolve::resolve_import(ctx, fi, arg)
+                        .into_iter()
+                        .filter(|&tf| ctx.files[tf].path.rsplit('/').next() == Some(base)),
+                );
+            }
+        }
+    }
+    (0..ctx.fns.len())
+        .filter(|&f| {
+            let sym = ctx.symbol(f);
+            files.contains(&ctx.fns[f].file)
+                && (sym.visibility == Visibility::Public || sym.name == "<module>")
+        })
+        .collect()
+}
+
+/// Public functions of a published package: those its manifest entry files define, and those
+/// they re-export (`export * from`, `export { a } from`), transitively.
+fn library_api(ctx: &Ctx, root: &std::path::Path) -> Vec<usize> {
+    let mut by_file: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (f, rec) in ctx.fns.iter().enumerate() {
+        by_file.entry(rec.file).or_default().push(f);
+    }
+    let mut seen: HashSet<(usize, String)> = HashSet::new();
+    let mut pending: Vec<(usize, String)> = super::packages::library_entries(ctx, root)
+        .into_iter()
+        .map(|fi| (fi, "*".to_owned()))
+        .collect();
+    let mut out = Vec::new();
+    while let Some((fi, name)) = pending.pop() {
+        if !seen.insert((fi, name.clone())) {
+            continue;
+        }
+        let public: Vec<usize> = by_file
+            .get(&fi)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&f| ctx.symbol(f).visibility == Visibility::Public)
+            .collect();
+        let owned = |f: usize| {
+            let sym = ctx.symbol(f);
+            name == "*" || sym.parent.as_deref().unwrap_or(&sym.name) == name
+        };
+        if public.iter().any(|&f| owned(f)) {
+            out.extend(public.iter().copied().filter(|&f| owned(f)));
+        } else {
+            // A re-exported value that is not a function (`theme = new Theme()`) exposes the
+            // methods of the file's types.
+            out.extend(
+                public
+                    .iter()
+                    .copied()
+                    .filter(|&f| ctx.symbol(f).kind == SymbolKind::Method),
+            );
+        }
+        for imp in ctx.files[fi].imports.iter().filter(|i| i.reexport) {
+            let names: Vec<String> = imp
+                .names
+                .iter()
+                .map(|n| n.split(" as ").next().unwrap_or(n).trim().to_owned())
+                .filter(|n| name == "*" || *n == name || n == "*")
+                .collect();
+            for tf in super::resolve::resolve_import(ctx, fi, &imp.path) {
+                pending.extend(names.iter().map(|n| (tf, n.clone())));
+            }
+        }
+    }
+    out
+}
+
+/// A bare name the function binds itself: a parameter or a local assignment.
+fn is_local(sym: &hoshizora_model::Symbol, name: &str) -> bool {
+    !name.contains(['.', ':'])
+        && sym.name != "<module>"
+        && (sym.params.iter().any(|p| p.name == name)
+            || sym
+                .body
+                .iter()
+                .flat_map(|b| &b.calls)
+                .any(|c| c.binds.iter().any(|b| b == name)))
+}
+
+/// Identifier paths in `text`: `defaultStorage()` → `defaultStorage`, `a.b(c)` → `a.b`, `c`.
+fn paths_in(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '.')))
+        .map(|w| w.trim_matches('.'))
+        .filter(|w| !w.is_empty() && !w.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// References a body makes to functions as values, plus those in parameter defaults
+/// (`run = run_command`, `storage = defaultStorage()`, `{ sleep = defaultSleep } = {}`);
+/// names the function binds itself are left out. In scripts, `$store` reads `store`.
+fn value_refs(sym: &hoshizora_model::Symbol, script: bool) -> Vec<String> {
+    let Some(body) = &sym.body else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for p in &sym.params {
+        out.extend(
+            p.default
+                .as_deref()
+                .into_iter()
+                .flat_map(paths_in)
+                .map(str::to_owned),
+        );
+        for part in p.name.split([',', '{', '}', '[', ']']) {
+            if let Some((_, value)) = part.split_once('=') {
+                out.extend(paths_in(value).map(str::to_owned));
+            }
+        }
+    }
+    for r in &body.refs {
+        let r = match r.strip_prefix('$') {
+            Some(store) if script && !store.is_empty() => store,
+            _ => r.as_str(),
+        };
+        if !is_local(sym, r) {
+            out.push(r.to_owned());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+const SVELTEKIT_ROUTE_EXPORTS: &[&str] = &["load", "entries"];
+const SVELTEKIT_ENDPOINTS: &[&str] = &[
+    "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "fallback",
+];
+const SVELTEKIT_HOOKS: &[&str] = &[
+    "handle",
+    "handleFetch",
+    "handleError",
+    "handleValidationError",
+    "reroute",
+    "init",
+    "transport",
+];
+/// Decorator namespaces that wrap a function rather than register it somewhere.
+const WRAPPING_DECORATORS: &[&str] = &[
+    "functools",
+    "contextlib",
+    "abc",
+    "typing",
+    "typing_extensions",
+    "dataclasses",
+    "pytest",
+    "unittest",
+    "mock",
+    "enum",
+    "warnings",
+    "backoff",
+    "tenacity",
+    "torch",
+    "numba",
+    "jax",
+    "np",
+    "numpy",
+];
+const PROPERTY_DECORATORS: &[&str] = &["property", "cached_property", "functools.cached_property"];
+/// Rust attributes that export a function to a host runtime.
+const FFI_ATTRIBUTES: &[&str] = &[
+    "pyfunction",
+    "pymethods",
+    "pymodule",
+    "pyo3::pymodule",
+    "pyo3::pyfunction",
+    "pyo3::pymethods",
+    "napi",
+    "tauri::command",
+    "uniffi::export",
+    "export_name",
+];
+
+/// Functions a framework or runtime calls by convention: SvelteKit route modules, endpoints
+/// and hooks, functions registered through a decorator on an object (`@app.command()`,
+/// `@router.get("/")`), properties, methods of a default-exported object, FFI exports.
+fn framework_root(file: &hoshizora_model::FileFacts, sym: &hoshizora_model::Symbol) -> bool {
+    let base = file.path.rsplit('/').next().unwrap_or(&file.path);
+    let stem = base.split('.').next().unwrap_or(base);
+    let script = matches!(file.language, Language::TypeScript | Language::JavaScript)
+        && !base.ends_with(".svelte");
+    if script {
+        let top = sym.parent.is_none();
+        let route = matches!(stem, "+page" | "+layout");
+        if route
+            && ((top && SVELTEKIT_ROUTE_EXPORTS.contains(&sym.name.as_str()))
+                || sym.parent.as_deref() == Some("actions"))
+        {
+            return true;
+        }
+        if stem == "+server" && top && SVELTEKIT_ENDPOINTS.contains(&sym.name.as_str()) {
+            return true;
+        }
+        if stem == "hooks" && top && SVELTEKIT_HOOKS.contains(&sym.name.as_str()) {
+            return true;
+        }
+        if sym.parent.as_deref() == Some("default") {
+            return true;
+        }
+    }
+    sym.attributes.iter().any(|a| {
+        let head = a.split('(').next().unwrap_or(a).trim();
+        match file.language {
+            Language::Python => {
+                PROPERTY_DECORATORS.contains(&head)
+                    || head
+                        .split_once('.')
+                        .is_some_and(|(ns, _)| !WRAPPING_DECORATORS.contains(&ns))
+            }
+            Language::Rust => FFI_ATTRIBUTES.contains(&head),
+            _ => false,
+        }
+    })
 }
 
 /// `#[serde(default = "default_site")]`, `@traced`, `@app.on_event(startup_hook)`.

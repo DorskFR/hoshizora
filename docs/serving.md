@@ -46,9 +46,11 @@ rebuilds run one project at a time.
 
 A project without a declared `ref` also follows the deployed code: when its spans carry a
 `service.version` and the remote has a tag `v<version>` or `<version>`, the project switches to
-that tag. `GET /api/projects` shows the declared `ref`, the `tracked_ref` adopted this way, the
-`indexed_ref`/`commit` the graph was built from and the last `seen_version`, so a stale graph is
-visible.
+that tag. When several deployments report different versions, the newest by semver among those
+seen in the last 24 hours is followed (a pre-release sorts below its release), so a rollback is
+followed once the newer version stops reporting. `GET /api/projects` shows the declared `ref`,
+the `tracked_ref` adopted this way, the `indexed_ref`/`commit` the graph was built from, the
+followed `seen_version` and the `recent_versions` it was picked from, so a stale graph is visible.
 
 ## Reclaim disk
 

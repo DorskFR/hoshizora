@@ -414,6 +414,7 @@ impl Ctx<'_> {
                         alias: field_text(s, "name", src),
                         names: vec![],
                         line: common::line(s),
+                        reexport: false,
                     });
                 }
             }

@@ -441,11 +441,19 @@ impl Index {
     /// Findings that need no runtime data: I/O in loops, blocking calls in async code,
     /// sequential independent awaits, high-complexity hot candidates, a table read then
     /// written across an await without a transaction, branches on a domain whose catch-all
-    /// silently swallows values they do not handle.
+    /// silently swallows values they do not handle. Test code is skipped.
     pub fn static_insights(&self) -> Vec<Insight> {
+        self.static_insights_with(false)
+    }
+
+    /// [`Self::static_insights`], optionally including findings on test code.
+    pub fn static_insights_with(&self, include_tests: bool) -> Vec<Insight> {
         let mut out = Vec::new();
         for (i, n) in self.graph.nodes.iter().enumerate() {
             let Some(info) = &n.function else { continue };
+            if !include_tests && self.is_test(i) {
+                continue;
+            }
             self.io_in_loop(i, &mut out);
             self.parallelisable(i, &mut out);
             self.blocking(i, info, &mut out);
@@ -456,17 +464,22 @@ impl Index {
         out
     }
 
-    /// A site that handles fewer values than it misses is a projection (`_ => None` on one
-    /// variant of twenty), not a mapping that forgot some; a non-empty default with exactly
-    /// one value missing is that value's branch; tests are skipped.
+    /// A default that returns nothing for values no branch handles. A site that handles fewer
+    /// values than it misses is a projection (`_ => None` on one variant of twenty); a default
+    /// computing a value (`_ => Category::System`) is a deliberate mapping; a single missing
+    /// value named like a neutral case (`all`, `none`, `ok`) is meant to map to nothing; tests
+    /// are skipped.
     pub(crate) fn silent_site(&self, s: &hoshizora_model::StateSite) -> bool {
-        let silent = match s.default {
-            DefaultKind::ReturnsEmpty => true,
-            DefaultKind::Other => s.missing.len() > 1,
-            DefaultKind::None | DefaultKind::Throws => false,
+        let neutral = |v: &str| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "all" | "any" | "none" | "ok" | "unknown" | "default" | "other" | "empty" | "null"
+            )
         };
-        silent
+        s.default == DefaultKind::ReturnsEmpty
+            && !s.missing.is_empty()
             && s.handled.len() >= s.missing.len()
+            && !(s.missing.len() == 1 && neutral(&s.missing[0]))
             && !self.idx(&s.function).is_some_and(|i| self.is_test(i))
     }
 
@@ -512,6 +525,10 @@ impl Index {
                 conditional: false,
                 root: effect_root(&e.via),
                 is_method: e.via.contains('.') && !e.via.contains("::"),
+                mutation: matches!(
+                    e.kind,
+                    EffectKind::DbWrite | EffectKind::DbDelete | EffectKind::FsWrite
+                ) || (e.kind == EffectKind::Network && mutating_name(&e.via)),
             })
             .collect();
         for &ei in &self.outgoing[i] {
@@ -541,6 +558,7 @@ impl Index {
                     None => module_of(&target.qualified_name),
                 },
                 is_method: e.attrs.contains_key("receiver"),
+                mutation: mutating_name(&target.name),
             });
         }
         items.sort_by_key(|it| (it.line, it.label.clone()));
@@ -683,10 +701,9 @@ impl Index {
             let consumed_between = run
                 .last()
                 .is_some_and(|prev| boundaries.iter().any(|&l| prev.line < l && l < it.line));
-            let independent = run
-                .iter()
-                .all(|prev| prev.loop_depth == it.loop_depth && prev.root != it.root)
-                && (run.is_empty() || !it.local_receiver(&params))
+            let independent = run.iter().all(|prev| {
+                prev.loop_depth == it.loop_depth && prev.root != it.root && !prev.mutation
+            }) && (run.is_empty() || !it.local_receiver(&params))
                 && !consumed_between
                 && !run.first().is_some_and(|first| ordered(first.line, it));
             if independent {
@@ -720,6 +737,7 @@ impl Index {
                     line,
                     write: e.kind == EdgeKind::Writes,
                     delete: deletes_at(n, Some(line)),
+                    guarded: e.attrs.contains_key("guard"),
                 }),
                 EdgeKind::Calls => {
                     let Some(t) = self.idx(&e.to) else { continue };
@@ -742,6 +760,7 @@ impl Index {
                             line,
                             write: c.kind == EdgeKind::Writes,
                             delete: deletes_at(callee, c.line),
+                            guarded: c.attrs.contains_key("guard"),
                         });
                     }
                 }
@@ -797,7 +816,7 @@ impl Index {
             }
             let Some(w) = accesses
                 .iter()
-                .find(|a| a.write && a.table == r.table && a.line > r.line)
+                .find(|a| a.write && !a.guarded && a.table == r.table && a.line > r.line)
             else {
                 continue;
             };
@@ -835,9 +854,35 @@ impl Index {
             Some(hoshizora_model::Language::TypeScript | hoshizora_model::Language::JavaScript)
         );
         if info.is_async && !js {
+            let offloads: Vec<u32> = self.outgoing[i]
+                .iter()
+                .map(|&ei| &self.graph.edges[ei])
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .filter(|e| self.idx(&e.to).is_some_and(|t| self.offloads(t)))
+                .filter_map(|e| e.line)
+                .collect();
+            let awaited_lines: Vec<u32> = self.outgoing[i]
+                .iter()
+                .map(|&ei| &self.graph.edges[ei])
+                .filter(|e| e.awaited)
+                .filter_map(|e| e.line)
+                .chain(
+                    n.effects
+                        .direct
+                        .iter()
+                        .filter(|e| e.awaited)
+                        .map(|e| e.line),
+                )
+                .collect();
+            let offloaded = |line: u32| {
+                offloads
+                    .iter()
+                    .any(|&w| w <= line && !awaited_lines.iter().any(|&a| w < a && a <= line))
+            };
             for &ei in &self.outgoing[i] {
                 let e = &self.graph.edges[ei];
-                if e.kind != EdgeKind::Calls || !plausible_call(e) {
+                if e.kind != EdgeKind::Calls || !plausible_call(e) || e.line.is_some_and(offloaded)
+                {
                     continue;
                 }
                 let Some(t) = self.idx(&e.to) else { continue };
@@ -865,6 +910,25 @@ impl Index {
                 reasons,
             });
         }
+    }
+
+    /// An async function that hands its work to a blocking thread pool (`spawn_blocking`,
+    /// `block_in_place`, `asyncio.to_thread`), so the closure its callers pass runs off the
+    /// async threads.
+    fn offloads(&self, t: usize) -> bool {
+        let n = &self.graph.nodes[t];
+        n.function.as_ref().is_some_and(|f| f.is_async)
+            && n.effects.direct.iter().any(|e| {
+                e.kind == EffectKind::Spawn
+                    && [
+                        "spawn_blocking",
+                        "block_in_place",
+                        "to_thread",
+                        "run_in_executor",
+                    ]
+                    .iter()
+                    .any(|p| e.via.ends_with(p))
+            })
     }
 
     fn complexity_candidate(
@@ -911,6 +975,23 @@ const LOOP_IO_KINDS: &[EffectKind] = &[
     EffectKind::DbDelete,
 ];
 
+/// `api.post`, `createUser`, `save_draft`, `mkdir`: a call named like it changes state.
+fn mutating_name(via: &str) -> bool {
+    let last = via
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(via)
+        .to_ascii_lowercase();
+    [
+        "post", "put", "patch", "delete", "create", "update", "insert", "upsert", "save", "set",
+        "remove", "write", "mkdir", "makedirs", "store", "send", "submit", "sync", "retry",
+        "upload", "trigger", "enqueue", "cancel", "archive", "rename", "move", "approve", "reject",
+        "revoke", "grant", "reset", "register",
+    ]
+    .iter()
+    .any(|p| last.starts_with(p))
+}
+
 fn kind_name(kind: EffectKind) -> &'static str {
     match kind {
         EffectKind::Network => "network",
@@ -944,6 +1025,8 @@ struct TableAccess {
     line: u32,
     write: bool,
     delete: bool,
+    /// `ON CONFLICT`, `WHERE NOT EXISTS`: safe against a concurrent writer.
+    guarded: bool,
 }
 
 struct IoItem {
@@ -956,6 +1039,8 @@ struct IoItem {
     /// `db::inventory`, the function name for a bare call.
     root: String,
     is_method: bool,
+    /// Writes something (a row, a file, a directory, a POST): what follows probably depends on it.
+    mutation: bool,
 }
 
 impl IoItem {

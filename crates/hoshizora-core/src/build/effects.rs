@@ -135,16 +135,80 @@ pub(crate) fn build_rule_sets(ctx: &mut Ctx) {
     }
 }
 
-/// Wildcard client patterns (`*.get`) only fire when the call looks like an HTTP call, so a
-/// `map.get(key)` in a file that imports reqwest stays silent.
+/// Wildcard client patterns (`*.get`) only fire when the call looks like an HTTP call: a URL
+/// literal argument, or a receiver named like a client (`client`, `http`, `api`, `session`).
+/// Receivers named like maps of settings or request data (`os.environ`, `req.headers`,
+/// `sessionStorage`) never do, so `map.get(key)` in a file that imports reqwest stays silent.
 fn client_shaped(call: &CallSite) -> bool {
-    if call.string_args.iter().any(|a| parse_url(a).is_some()) {
+    let receiver = call.receiver.as_deref().unwrap_or("");
+    let last = receiver
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(receiver)
+        .trim_start_matches('_');
+    let words = words(last);
+    let has = |w: &str| words.iter().any(|x| x == w);
+    if NOT_CLIENT.iter().any(|w| has(w)) || (has("query") && has("client")) {
+        return false;
+    }
+    if call.string_args.iter().any(|a| url_literal(a)) {
         return true;
     }
-    let receiver = call.receiver.as_deref().unwrap_or("").to_ascii_lowercase();
-    ["client", "http", "api", "session", "req", "fetch", "agent"]
+    words
         .iter()
-        .any(|k| receiver.contains(k))
+        .any(|w| w.contains("http") || w.ends_with("client") || CLIENT.contains(&w.as_str()))
+}
+
+const CLIENT: &[&str] = &[
+    "api", "session", "requests", "request", "fetch", "fetcher", "agent", "axios", "ky",
+];
+
+const NOT_CLIENT: &[&str] = &[
+    "environ", "env", "headers", "header", "metadata", "params", "args", "cookies", "storage",
+    "config", "settings", "options", "cache", "labels",
+];
+
+/// Lowercase words of an identifier split on `_` and camel case: `sessionStorage` →
+/// `session`, `storage`.
+fn words(ident: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut prev_lower = false;
+    for c in ident.chars() {
+        if !c.is_alphanumeric() {
+            out.push(String::new());
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower || out.is_empty() {
+            out.push(String::new());
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        if let Some(w) = out.last_mut() {
+            w.extend(c.to_lowercase());
+        }
+    }
+    out.retain(|w| !w.is_empty());
+    out
+}
+
+/// An absolute http(s)/ws URL, or a path (`/users/1`, `{base}/users`) without whitespace.
+fn url_literal(arg: &str) -> bool {
+    let a = arg.trim();
+    if let Some((scheme, _)) = a.split_once("://") {
+        return matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "ws" | "wss"
+        ) && parse_url(a).is_some();
+    }
+    if a.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let path = if a.starts_with('{') || a.starts_with("${") {
+        a.find('}').map_or("", |i| &a[i + 1..])
+    } else {
+        a
+    };
+    path.starts_with('/') && path.len() > 1
 }
 
 pub(crate) fn is_spawn_call(ctx: &Ctx, f: usize, call: &CallSite) -> bool {
@@ -500,6 +564,26 @@ fn ambiguous_routes(routes: &[RouteRef], hits: &[usize]) -> bool {
     paths.len() > 1
 }
 
+/// A write that cannot duplicate or clobber a row a concurrent caller wrote first:
+/// `ON CONFLICT`, `ON DUPLICATE KEY`, `INSERT OR IGNORE`, `WHERE NOT EXISTS`, `MERGE`.
+fn conflict_guarded(statement: &str) -> bool {
+    let sql = statement
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    [
+        "ON CONFLICT",
+        "ON DUPLICATE KEY",
+        "INSERT OR IGNORE",
+        "INSERT IGNORE",
+        "WHERE NOT EXISTS",
+    ]
+    .iter()
+    .any(|p| sql.contains(p))
+        || sql.starts_with("MERGE ")
+}
+
 fn effect_edge(
     ctx: &mut Ctx,
     from: usize,
@@ -507,7 +591,7 @@ fn effect_edge(
     kind: EdgeKind,
     call: &CallSite,
     confidence: Confidence,
-) {
+) -> bool {
     let mut edge = Edge::new(
         ctx.nodes[from].id.clone(),
         ctx.nodes[to].id.clone(),
@@ -518,7 +602,7 @@ fn effect_edge(
     edge.loop_depth = call.loop_depth;
     edge.conditional = call.conditional;
     edge.awaited = call.awaited;
-    ctx.add_edge(from, to, edge);
+    ctx.add_edge(from, to, edge)
 }
 
 /// Enum variants of types defined in the repo that are both handed to a method call
@@ -604,7 +688,11 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                         }
                     }
                     Target::Sql => {
-                        if let Some(facts) = call.string_args.iter().find_map(|a| sql::analyse(a)) {
+                        if let Some((statement, facts)) = call
+                            .string_args
+                            .iter()
+                            .find_map(|a| sql::analyse(a).map(|f| (a, f)))
+                        {
                             if facts.transaction {
                                 kind = EffectKind::Lock;
                             } else if rule.kind == RuleKind::Db {
@@ -649,10 +737,11 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                                     Confidence::Heuristic,
                                 );
                             }
+                            let guarded = conflict_guarded(statement);
                             for t in facts.changed() {
                                 let table =
                                     ctx.synthetic(NodeKind::Table, format!("table:{t}"), t.clone());
-                                effect_edge(
+                                let added = effect_edge(
                                     ctx,
                                     from,
                                     table,
@@ -660,6 +749,12 @@ pub(crate) fn effects(ctx: &mut Ctx) {
                                     call,
                                     Confidence::Heuristic,
                                 );
+                                if guarded
+                                    && added
+                                    && let Some(edge) = ctx.edges.last_mut()
+                                {
+                                    edge.attrs.insert("guard".into(), "conflict".into());
+                                }
                             }
                         }
                     }
@@ -907,6 +1002,77 @@ fn wrapper_requests(ctx: &mut Ctx, routes: &[RouteRef], mut wrappers: HashMap<us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(callee: &str, args: &[&str]) -> CallSite {
+        let (receiver, name) = match callee.rsplit_once('.') {
+            Some((r, n)) => (Some(r.to_owned()), n.to_owned()),
+            None => (None, callee.to_owned()),
+        };
+        CallSite {
+            callee: callee.into(),
+            name,
+            receiver,
+            string_args: args.iter().map(|a| a.to_string()).collect(),
+            line: 1,
+            loop_depth: 0,
+            awaited: false,
+            conditional: false,
+            in_closure: false,
+            binds: vec![],
+            uses: vec![],
+            mutates: vec![],
+        }
+    }
+
+    #[test]
+    fn http_calls_look_like_http_calls() {
+        for (callee, args) in [
+            ("client.get", &[][..]),
+            ("self._client.post", &[]),
+            ("conn.client.get", &[]),
+            ("web_client.get", &[]),
+            ("eqclient.get", &[]),
+            ("self.http.post", &[]),
+            ("httpx.get", &[]),
+            ("house.api.get", &[]),
+            ("page.request.get", &[]),
+            ("requests.get", &[]),
+            ("post", &["/ingest/trace"]),
+            ("get", &["/collections/${id}/groups"]),
+            ("self.get", &["{base}/system/status"]),
+            ("fetch", &["https://api.example.com/users"]),
+        ] {
+            assert!(client_shaped(&call(callee, args)), "{callee} {args:?}");
+        }
+    }
+
+    #[test]
+    fn maps_and_settings_are_not_http_clients() {
+        for (callee, args) in [
+            (
+                "os.environ.get",
+                &["DATABASE_URL", "postgres://u@localhost/db"][..],
+            ),
+            ("os.environ.get", &["BASE", "https://example.com"]),
+            ("req.headers.get", &["x-request-id"]),
+            ("request.metadata.get", &["category"]),
+            ("request.node.get_closest_marker", &["slow"]),
+            ("req.get_method", &[]),
+            ("sessionStorage.getItem", &["draft"]),
+            ("queryClient.getQueryData", &[]),
+            ("fetched.get", &[]),
+            ("freq.get", &[]),
+            ("FAIL_PREFIX.get", &["_"]),
+            ("abilities.get", &["/doability {name}"]),
+            ("files.get", &["{short}.wld"]),
+            ("self.failures.get", &["{x},{y}"]),
+            ("program.getSourceFile", &["${file}.ts"]),
+            ("config.top", &[]),
+            ("others.size", &[]),
+        ] {
+            assert!(!client_shaped(&call(callee, args)), "{callee} {args:?}");
+        }
+    }
 
     fn routes() -> Vec<RouteRef> {
         [
