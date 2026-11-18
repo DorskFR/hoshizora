@@ -25,6 +25,11 @@ fn call(callee: &str, line: u32) -> CallSite {
         binds: vec![],
         uses: vec![],
         mutates: vec![],
+        reference: false,
+        per_item: false,
+        concurrent: false,
+        on_part: false,
+        guards: vec![],
     }
 }
 

@@ -101,7 +101,10 @@ impl<'r> RuleSet<'r> {
         }
         hits.sort_unstable();
         hits.dedup();
-        hits.retain(|&i| !self.rules[i].async_only || is_async);
+        hits.retain(|&i| {
+            let rule = self.rules[i];
+            (!rule.async_only || is_async) && !(call.awaited && rule.kind == RuleKind::Blocking)
+        });
         hits
     }
 }
@@ -565,7 +568,7 @@ fn ambiguous_routes(routes: &[RouteRef], hits: &[usize]) -> bool {
 }
 
 /// A write that cannot duplicate or clobber a row a concurrent caller wrote first:
-/// `ON CONFLICT`, `ON DUPLICATE KEY`, `INSERT OR IGNORE`, `WHERE NOT EXISTS`, `MERGE`.
+/// `ON CONFLICT`, `ON DUPLICATE KEY`, `INSERT OR IGNORE`, `NOT EXISTS`, `MERGE`.
 fn conflict_guarded(statement: &str) -> bool {
     let sql = statement
         .split_whitespace()
@@ -577,7 +580,7 @@ fn conflict_guarded(statement: &str) -> bool {
         "ON DUPLICATE KEY",
         "INSERT OR IGNORE",
         "INSERT IGNORE",
-        "WHERE NOT EXISTS",
+        "NOT EXISTS",
     ]
     .iter()
     .any(|p| sql.contains(p))
@@ -1021,6 +1024,11 @@ mod tests {
             binds: vec![],
             uses: vec![],
             mutates: vec![],
+            reference: false,
+            per_item: false,
+            concurrent: false,
+            on_part: false,
+            guards: vec![],
         }
     }
 

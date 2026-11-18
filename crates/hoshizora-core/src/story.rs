@@ -446,7 +446,14 @@ pub(crate) fn is_test_file(path: &str) -> bool {
         || path.split('/').any(|seg| {
             matches!(
                 seg,
-                "tests" | "test" | "__tests__" | "e2e" | "spec" | "journeys"
+                "tests"
+                    | "test"
+                    | "__tests__"
+                    | "e2e"
+                    | "spec"
+                    | "journeys"
+                    | "fixtures"
+                    | "testing"
             )
         })
 }

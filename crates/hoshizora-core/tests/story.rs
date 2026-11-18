@@ -52,6 +52,7 @@ fn func(id: &str, parent: &str, language: Language, is_async: bool) -> Node {
         branches: 0,
         loops: 0,
         max_loop_depth: 0,
+        pairwise: false,
         recursive: false,
         complexity: hoshizora_model::Complexity {
             time: "O(1)".into(),

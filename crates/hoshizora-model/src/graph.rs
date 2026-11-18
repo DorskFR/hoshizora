@@ -157,6 +157,9 @@ pub struct FunctionInfo {
     pub branches: u32,
     pub loops: u32,
     pub max_loop_depth: u32,
+    /// A loop nested in a loop over the same collection (`for a in xs { for b in xs }`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pairwise: bool,
     pub recursive: bool,
     pub complexity: Complexity,
     pub fan_in: u32,
@@ -183,6 +186,12 @@ pub struct Flow {
     /// A call whose position relative to other I/O is the point: transaction and lock
     /// boundaries, channel sends, flushes.
     pub barrier: bool,
+    /// Already concurrent with its siblings: an argument of `try_join!` and the like.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub concurrent: bool,
+    /// Identifiers the conditions of the enclosing branches read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<String>,
 }
 
 /// Heuristic asymptotic estimate. `basis` says why, so nobody mistakes it for a proof.

@@ -156,6 +156,8 @@ struct CallInfo {
     target: usize,
     loop_depth: u32,
     trusted: bool,
+    /// Works on the current loop item only: its callee's `n` is that item, not the input.
+    per_item: bool,
 }
 
 const SORT_NAMES: &[&str] = &[
@@ -230,6 +232,7 @@ pub(crate) fn complexity(ctx: &mut Ctx) {
             target: tf,
             loop_depth: e.loop_depth,
             trusted: trusted_call(e),
+            per_item: e.attrs.contains_key("per_item"),
         });
         fan_out[ff].insert(tf);
         fan_in[tf].insert(ff);
@@ -256,8 +259,9 @@ pub(crate) fn complexity(ctx: &mut Ctx) {
 }
 
 /// Polynomial exponent of a function's running time, with an `exponential` flag for branching
-/// recursion. Only calls inside a loop, through a trusted edge, add their callee's exponent;
-/// cycles other than direct self-calls contribute nothing (treated as unknown).
+/// recursion. Only calls inside a loop, through a trusted edge, on more than the current loop
+/// item, add their callee's exponent; cycles other than direct self-calls contribute nothing
+/// (treated as unknown).
 fn exponent(
     ctx: &Ctx,
     f: usize,
@@ -283,7 +287,9 @@ fn exponent(
         }
         let (k, e) = exponent(ctx, call.target, out, memo, on_stack);
         exponential |= e;
-        exp = exp.max(k + call.loop_depth);
+        if !call.per_item {
+            exp = exp.max(k + call.loop_depth);
+        }
     }
     match ctx.self_calls[f].len() {
         0 => {}
@@ -341,7 +347,7 @@ fn describe(
         if call.target == f {
             continue;
         }
-        if call.loop_depth > 0 && call.trusted && noted.insert(call.target) {
+        if call.loop_depth > 0 && call.trusted && !call.per_item && noted.insert(call.target) {
             let (k, _) = memo[call.target].unwrap_or((0, false));
             if k > 0 {
                 basis.push(format!(
@@ -468,7 +474,7 @@ pub(crate) fn transitive(ctx: &mut Ctx) {
         | effect_bit(EffectKind::Lock)
         | effect_bit(EffectKind::Spawn)
         | effect_bit(EffectKind::Join);
-    let mut callers: Vec<Vec<(usize, EdgeKind)>> = vec![Vec::new(); n];
+    let mut callers: Vec<Vec<(usize, EdgeKind, bool)>> = vec![Vec::new(); n];
     for (e, &(from, to)) in ctx.edges.iter().zip(&ctx.edge_ends) {
         let trusted = if matches!(e.kind, EdgeKind::Calls | EdgeKind::Spawns) {
             plausible_call(e)
@@ -476,7 +482,8 @@ pub(crate) fn transitive(ctx: &mut Ctx) {
             !e.attrs.contains_key("candidates")
         };
         if FLOW_KINDS.contains(&e.kind) && trusted {
-            callers[to].push((from, e.kind));
+            let detached = e.kind == EdgeKind::Spawns || e.attrs.contains_key("ref");
+            callers[to].push((from, e.kind, detached));
         }
     }
     let mut queue: VecDeque<usize> = (0..n).filter(|&i| mask[i] != 0).collect();
@@ -486,14 +493,17 @@ pub(crate) fn transitive(ctx: &mut Ctx) {
     }
     while let Some(i) = queue.pop_front() {
         queued[i] = false;
-        for &(c, kind) in &callers[i] {
+        for &(c, kind, detached) in &callers[i] {
             let inherited = if kind == EdgeKind::Requests {
                 mask[i] & !local_only
+            } else if detached {
+                mask[i] & !blocking_sources
             } else {
                 mask[i]
             };
             let mut merged = mask[c] | inherited;
             if kind == EdgeKind::Calls
+                && !detached
                 && !is_async[i]
                 && is_async[c]
                 && can_block[i]
@@ -1057,11 +1067,14 @@ fn referenced_in_attributes(attributes: &str, name: &str) -> bool {
 
 /// Two self-calls on one path (`f(n - 1) + f(n - 2)`, or two unconditional calls) branch;
 /// one call per match arm or per child does not.
-fn branching(self_calls: &[(u32, bool)]) -> bool {
-    let unconditional = self_calls.iter().filter(|(_, c)| !c).count();
-    let same_line = self_calls
+/// Two or more unconditional self-calls, or two on one line, that do not each descend into a
+/// part of the input (a tree walk visits every node once).
+fn branching(self_calls: &[super::SelfCall]) -> bool {
+    let repeats: Vec<&super::SelfCall> = self_calls.iter().filter(|c| !c.on_part).collect();
+    let unconditional = repeats.iter().filter(|c| !c.conditional).count();
+    let same_line = repeats
         .iter()
         .enumerate()
-        .any(|(i, (l, _))| self_calls[i + 1..].iter().any(|(m, _)| m == l));
+        .any(|(i, c)| repeats[i + 1..].iter().any(|d| d.line == c.line));
     unconditional >= 2 || same_line
 }

@@ -52,8 +52,8 @@ revisions, or two prebuilt graph files:
 ## Signals
 
 Every location is mapped to the innermost head function whose span contains the line
-(`function: null` when it is outside any function, e.g. a type or a constant; such locations
-count as misses). For that function:
+(`function: null` when it is outside any function, e.g. a type, a constant, an import or other
+top-level code; such locations count as misses). For that function:
 
 | signal | true when the function... | set |
 | --- | --- | --- |

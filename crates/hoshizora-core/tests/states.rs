@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use hoshizora_core::{Index, Packs, build_graph};
+use hoshizora_core::{Index, InsightOptions, Packs, build_graph};
 use hoshizora_model::{DefaultKind, Graph, Insight, StateSite};
 
 fn graph() -> Graph {
@@ -8,6 +8,11 @@ fn graph() -> Graph {
     let files = hoshizora_adapters::index_tree(&root).unwrap();
     build_graph(&root, files, &Packs::builtin())
 }
+
+const UNHANDLED: InsightOptions = InsightOptions {
+    include_tests: false,
+    unhandled_values: true,
+};
 
 fn site<'a>(g: &'a Graph, function: &str) -> &'a StateSite {
     let sites: Vec<&StateSite> = g
@@ -120,7 +125,7 @@ fn states_query_groups_sites_per_domain_and_filters_by_name() {
 fn silent_defaults_with_missing_values_are_insights() {
     let index = Index::new(graph());
     let mut found: Vec<(String, String, Vec<String>, DefaultKind)> = index
-        .static_insights()
+        .static_insights_with(UNHANDLED)
         .into_iter()
         .filter_map(|i| match i {
             Insight::UnhandledValues {
@@ -160,6 +165,17 @@ fn silent_defaults_with_missing_values_are_insights() {
 }
 
 #[test]
+fn unhandled_values_are_only_reported_on_request() {
+    let index = Index::new(graph());
+    assert!(
+        !index
+            .static_insights()
+            .iter()
+            .any(|i| matches!(i, Insight::UnhandledValues { .. }))
+    );
+}
+
+#[test]
 fn projections_and_tests_are_sites_but_not_insights() {
     let g = graph();
     let s = site(&g, "fn:api/src/lib.rs#only_active");
@@ -168,12 +184,17 @@ fn projections_and_tests_are_sites_but_not_insights() {
     let t = site(&g, "fn:api/src/lib.rs#label_in_test");
     assert_eq!(t.missing, vec!["Done"]);
     let index = Index::new(g);
-    assert!(index.static_insights().iter().all(|i| !matches!(
-        i,
-        Insight::UnhandledValues { node, .. }
-            if node == "fn:api/src/lib.rs#only_active"
-                || node == "fn:api/src/lib.rs#label_in_test"
-    )));
+    assert!(
+        index
+            .static_insights_with(UNHANDLED)
+            .iter()
+            .all(|i| !matches!(
+                i,
+                Insight::UnhandledValues { node, .. }
+                    if node == "fn:api/src/lib.rs#only_active"
+                        || node == "fn:api/src/lib.rs#label_in_test"
+            ))
+    );
 }
 
 #[test]
