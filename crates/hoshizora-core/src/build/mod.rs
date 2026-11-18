@@ -31,6 +31,14 @@ pub(crate) struct FnRec {
     pub parent_type: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SelfCall {
+    pub line: u32,
+    pub conditional: bool,
+    /// On a part of its input (`walk(node.left)`): a structural descent.
+    pub on_part: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ImportTarget {
     /// Imported path as written.
@@ -62,9 +70,8 @@ pub(crate) struct Ctx<'a> {
     pub edge_ends: Vec<(usize, usize)>,
     pub edge_set: HashSet<(usize, usize, EdgeKind, Option<u32>)>,
     pub fns: Vec<FnRec>,
-    /// Number of call sites per function that resolve to the function itself.
-    /// Line and conditional flag of each call a function makes to itself.
-    pub self_calls: Vec<Vec<(u32, bool)>>,
+    /// Calls a function makes to itself.
+    pub self_calls: Vec<Vec<SelfCall>>,
     pub file_nodes: Vec<usize>,
     pub package_of_file: Vec<usize>,
     pub scopes: Vec<FileScope>,
@@ -89,6 +96,8 @@ pub(crate) struct Ctx<'a> {
     pub package_names: HashMap<String, usize>,
     /// Normalised module key (`a/b/c`) → files.
     pub module_files: HashMap<String, Vec<usize>>,
+    /// Last segment of every module key (`c` for `a/b/c`).
+    pub module_names: HashSet<String>,
     pub counters: BTreeMap<&'static str, u32>,
     pub warnings: Vec<String>,
     pub sql_sites: Vec<SqlSite>,
@@ -184,6 +193,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
         type_fields: HashMap::new(),
         package_names: HashMap::new(),
         module_files: HashMap::new(),
+        module_names: HashSet::new(),
         counters: BTreeMap::new(),
         warnings: Vec::new(),
         sql_sites: Vec::new(),
@@ -266,6 +276,9 @@ fn build_files_and_symbols(ctx: &mut Ctx) {
         ctx.simple_edge(pkg, file_node, EdgeKind::Contains, Confidence::Exact);
 
         for key in packages::module_keys(file) {
+            if let Some(last) = key.rsplit('/').next() {
+                ctx.module_names.insert(last.to_owned());
+            }
             ctx.module_files.entry(key).or_default().push(fi);
         }
 
@@ -339,6 +352,7 @@ fn build_files_and_symbols(ctx: &mut Ctx) {
                     branches: body.branches,
                     loops: body.loops,
                     max_loop_depth: body.max_loop_depth,
+                    pairwise: body.pairwise,
                     recursive: false,
                     complexity: hoshizora_model::Complexity {
                         time: "unknown".into(),
@@ -453,10 +467,12 @@ pub(crate) fn flows(calls: &[CallSite]) -> Vec<Flow> {
         };
         flow.conditional |= c.conditional;
         flow.barrier |= barrier;
+        flow.concurrent |= c.concurrent;
         for (into, from) in [
             (&mut flow.binds, &c.binds),
             (&mut flow.uses, &c.uses),
             (&mut flow.mutates, &c.mutates),
+            (&mut flow.guards, &c.guards),
         ] {
             for name in from {
                 if !into.contains(name) {

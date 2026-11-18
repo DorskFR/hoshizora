@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use hoshizora_core::{Index, Packs, build_graph};
+use hoshizora_core::{Index, InsightOptions, Packs, build_graph};
 use hoshizora_model::Insight;
 
 fn index() -> Index {
@@ -31,10 +31,14 @@ fn test_code_is_left_out_of_insights_unless_asked() {
             "fn:loops.py#crawl",
             "fn:src/loops.rs#fetch_each",
             "fn:src/repo.rs#load_all",
+            "fn:src/upsert.rs#decay",
             "fn:web/users.ts#fetchAll"
         ]
     );
-    let with_tests = idx.static_insights_with(true);
+    let with_tests = idx.static_insights_with(InsightOptions {
+        include_tests: true,
+        ..InsightOptions::default()
+    });
     let all = io_nodes(&with_tests);
     for node in [
         "fn:src/repo.rs#seed",
@@ -42,6 +46,7 @@ fn test_code_is_left_out_of_insights_unless_asked() {
         "fn:tests/it.rs#reload",
         "fn:web/users.test.ts#fetchAll",
         "fn:conftest.py#warm",
+        "fn:src/fixtures/mod.rs#seed_counters",
     ] {
         assert!(all.contains(&node), "{node} missing from {all:?}");
     }
@@ -87,8 +92,100 @@ fn loops_over_parts_or_constants_do_not_multiply() {
         ("fn:loops.py#all_tips", "O(n)"),
         ("fn:web/loops.ts#publicDrops", "O(n)"),
         ("fn:web/loops.ts#interleave", "O(n^2)"),
+        ("fn:src/loops.rs#per_group", "O(n)"),
+        ("fn:src/loops.rs#against_all", "O(n^3)"),
+        ("fn:loops.py#cutoff", "O(n)"),
+        ("fn:loops.py#around", "O(1)"),
+        ("fn:loops.py#capped", "O(n^2)"),
+        ("fn:loops.py#lines_of", "O(n)"),
+        ("fn:web/tree.ts#height", "O(n)"),
+        ("fn:web/tree.ts#fib", "O(2^n)"),
+        ("fn:web/tree.ts#condition", "O(1)"),
     ] {
         assert_eq!(time(&idx, node), want, "{node}");
+    }
+}
+
+fn inefficient_nodes(insights: &[Insight]) -> Vec<&str> {
+    insights
+        .iter()
+        .filter_map(|i| match i {
+            Insight::Inefficient { node, .. } => Some(node.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn deep_or_pairwise_nesting_is_inefficient() {
+    let idx = index();
+    let insights = idx.static_insights();
+    let nodes = inefficient_nodes(&insights);
+    for node in [
+        "fn:src/loops.rs#triples",
+        "fn:src/loops.rs#pairs",
+        "fn:web/loops.ts#interleave",
+        "fn:loops.py#overlaps",
+    ] {
+        assert!(nodes.contains(&node), "{node} missing: {nodes:?}");
+    }
+    for node in [
+        "fn:src/loops.rs#cross",
+        "fn:src/loops.rs#against_all",
+        "fn:src/loops.rs#walk",
+        "fn:web/loops.ts#publicDrops",
+        "fn:loops.py#nearest_free",
+        "fn:loops.py#seasons",
+    ] {
+        assert!(!nodes.contains(&node), "{node} reported: {nodes:?}");
+    }
+}
+
+#[test]
+fn arguments_and_module_aliases_carry_no_effects() {
+    let idx = index();
+    let insights = idx.static_insights();
+    let io = io_nodes(&insights);
+    for node in ["fn:web/review.ts#review", "fn:geom.py#normals"] {
+        assert!(!io.contains(&node), "{node} reported: {io:?}");
+    }
+    let rate = idx.outgoing("fn:web/review.ts#rate");
+    assert!(
+        rate.iter()
+            .any(|e| e.to == "fn:web/modes.ts#mode" && e.attrs.contains_key("ref")),
+        "{rate:?}"
+    );
+    assert!(
+        !idx.outgoing("fn:geom.py#normals")
+            .iter()
+            .any(|e| e.to.ends_with("Runner.cross")),
+    );
+}
+
+#[test]
+fn spawned_workers_are_not_io_in_loop() {
+    let idx = index();
+    let insights = idx.static_insights();
+    let io = io_nodes(&insights);
+    assert!(!io.contains(&"fn:src/workers.rs#start"), "{io:?}");
+}
+
+#[test]
+fn awaited_and_spawned_calls_are_not_blocking() {
+    let idx = index();
+    let insights = idx.static_insights();
+    for node in ["fn:src/workers.rs#reap", "fn:src/workers.rs#reap_later"] {
+        assert_eq!(
+            blocking_reasons(&insights, node),
+            Vec::<String>::new(),
+            "{node}"
+        );
+    }
+    for node in [
+        "fn:src/workers.rs#reap_sync",
+        "fn:src/workers.rs#wait_inline",
+    ] {
+        assert_eq!(blocking_reasons(&insights, node).len(), 1, "{node}");
     }
 }
 
@@ -131,17 +228,25 @@ fn calls_after_a_write_are_not_parallelisable() {
             _ => None,
         })
         .collect();
-    for node in ["store", "reload", "resync"] {
+    for node in ["store", "reload", "resync", "localOnly", "withLocal"] {
         let node = format!("fn:web/order.ts#{node}");
         assert!(!par.contains(&node), "{node}: {par:?}");
     }
     assert!(par.iter().any(|n| n == "fn:web/order.ts#both"), "{par:?}");
+    assert!(
+        par.iter().any(|n| n == "fn:src/workers.rs#sequential"),
+        "{par:?}"
+    );
+    for node in ["joined", "mark_then_count", "two_writes"] {
+        let node = format!("fn:src/workers.rs#{node}");
+        assert!(!par.contains(&node), "{node}: {par:?}");
+    }
 }
 
 #[test]
-fn conflict_guarded_writes_are_not_read_then_write() {
+fn read_then_write_needs_the_read_in_the_write() {
     let idx = index();
-    let races: Vec<String> = idx
+    let mut races: Vec<String> = idx
         .static_insights()
         .into_iter()
         .filter_map(|i| match i {
@@ -149,14 +254,25 @@ fn conflict_guarded_writes_are_not_read_then_write() {
             _ => None,
         })
         .collect();
-    assert_eq!(races, ["fn:src/upsert.rs#rename"]);
+    races.sort();
+    assert_eq!(
+        races,
+        [
+            "fn:src/upsert.rs#bump",
+            "fn:src/upsert.rs#decay",
+            "fn:src/upsert.rs#rename"
+        ]
+    );
 }
 
 #[test]
 fn deliberate_catch_alls_are_not_unhandled_values() {
     let idx = index();
     let sites: Vec<String> = idx
-        .static_insights()
+        .static_insights_with(InsightOptions {
+            unhandled_values: true,
+            ..InsightOptions::default()
+        })
         .into_iter()
         .filter_map(|i| match i {
             Insight::UnhandledValues { node, .. } => Some(node),

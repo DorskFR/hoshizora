@@ -121,6 +121,7 @@ fn expand_macro(node: Node, source: &str) -> Vec<CallSite> {
     ) {
         for c in &mut calls {
             c.awaited = true;
+            c.concurrent = true;
         }
     }
     calls
@@ -231,6 +232,11 @@ fn message_sites(body: Node, source: &str) -> Vec<CallSite> {
         binds: vec![],
         uses: vec![],
         mutates: vec![],
+        reference: false,
+        per_item: false,
+        concurrent: false,
+        on_part: false,
+        guards: vec![],
     };
     while let Some(node) = pending.pop() {
         match node.kind() {

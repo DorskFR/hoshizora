@@ -53,16 +53,10 @@ fn read_then_write_across_an_await_is_flagged() {
 }
 
 #[test]
-fn read_in_one_callee_and_delete_in_another_counts_at_the_call_lines() {
+fn deletes_after_a_read_are_not_flagged() {
     let found = findings(&index());
     assert!(
-        found.contains(&(
-            "fn:api/src/lib.rs#purge".into(),
-            "jobs".into(),
-            47,
-            49,
-            "deletes".into()
-        )),
+        !found.iter().any(|f| f.0 == "fn:api/src/lib.rs#purge"),
         "{found:?}"
     );
 }
@@ -83,7 +77,7 @@ fn transactions_locks_other_tables_sync_code_and_tests_are_not_flagged() {
     ] {
         assert!(!flagged.contains(&quiet), "{quiet} flagged: {flagged:?}");
     }
-    assert_eq!(flagged.len(), 3, "{flagged:?}");
+    assert_eq!(flagged.len(), 2, "{flagged:?}");
 }
 
 #[test]

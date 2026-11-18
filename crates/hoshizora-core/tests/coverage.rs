@@ -177,3 +177,47 @@ fn signals_per_location_and_aggregates() {
     assert!(text.contains("impact_full"), "{text}");
     serde_json::to_string(&report).unwrap();
 }
+
+#[test]
+fn top_level_code_is_outside_any_function() {
+    let base = Tree::new("module-base");
+    base.write(
+        "app.py",
+        "import os\nLIMIT = 3\nos.getenv(\"A\")\n\n\ndef run():\n    return LIMIT\n",
+    );
+    let head = Tree::new("module-head");
+    head.write(
+        "app.py",
+        "import os\nLIMIT = 3\nos.getenv(\"B\")\n\n\ndef run():\n    return LIMIT\n",
+    );
+    let head_index = head.index();
+    let report = diff(&base.index(), &head_index);
+    assert_eq!(report.functions.modified, vec!["fn:app.py#<module>"]);
+    assert_eq!(
+        head_index.function_at("app.py", 2).map(|n| n.id.as_str()),
+        Some("fn:app.py#<module>")
+    );
+
+    let case = coverage::evaluate(
+        "module",
+        &head_index,
+        &report,
+        &[
+            Location {
+                file: "app.py".into(),
+                line: 2,
+                in_diff: false,
+            },
+            Location {
+                file: "app.py".into(),
+                line: 7,
+                in_diff: false,
+            },
+        ],
+    );
+    let constant = &case.locations[0];
+    assert!(constant.function.is_none(), "{constant:?}");
+    assert!(!constant.changed, "{constant:?}");
+    assert_eq!(case.locations[1].function.as_deref(), Some("fn:app.py#run"));
+    assert_eq!(coverage::summarize(&[case]).unmapped_locations, 1);
+}

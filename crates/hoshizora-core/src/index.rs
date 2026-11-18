@@ -25,6 +25,17 @@ pub const DEFAULT_FLOW_KINDS: &[EdgeKind] = &[
 
 pub const FLOW_NODE_LIMIT: usize = 2000;
 
+/// Findings [`Index::static_insights_with`] reports beyond the defaults.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InsightOptions {
+    /// Findings on test code.
+    pub include_tests: bool,
+    /// Branches on a domain whose catch-all silently swallows values they do not handle.
+    /// Across a whole repository most such catch-alls are deliberate; `diff` reports them
+    /// for changed code regardless.
+    pub unhandled_values: bool,
+}
+
 pub struct Index {
     pub(crate) graph: Graph,
     by_id: HashMap<String, usize>,
@@ -118,12 +129,24 @@ impl Index {
             .unwrap_or_default()
     }
 
-    /// Innermost function node whose span contains `line` in `file`.
+    /// Innermost function node whose span contains `line` in `file`; top-level code maps to
+    /// the file's `<module>` node.
     pub fn function_at(&self, file: &str, line: u32) -> Option<&Node> {
+        self.innermost(file, line, true)
+    }
+
+    /// Innermost function written in the source whose span contains `line` in `file`, never
+    /// the synthetic `<module>` node that spans the whole file.
+    pub fn code_function_at(&self, file: &str, line: u32) -> Option<&Node> {
+        self.innermost(file, line, false)
+    }
+
+    fn innermost(&self, file: &str, line: u32, module: bool) -> Option<&Node> {
         self.by_file
             .get(file)?
             .iter()
             .map(|&i| &self.graph.nodes[i])
+            .filter(|n| module || n.name != "<module>")
             .filter(|n| {
                 n.span
                     .is_some_and(|s| s.start_line <= line && line <= s.end_line)
@@ -440,18 +463,17 @@ impl Index {
 
     /// Findings that need no runtime data: I/O in loops, blocking calls in async code,
     /// sequential independent awaits, high-complexity hot candidates, a table read then
-    /// written across an await without a transaction, branches on a domain whose catch-all
-    /// silently swallows values they do not handle. Test code is skipped.
+    /// written across an await without a transaction. Test code is skipped.
     pub fn static_insights(&self) -> Vec<Insight> {
-        self.static_insights_with(false)
+        self.static_insights_with(InsightOptions::default())
     }
 
-    /// [`Self::static_insights`], optionally including findings on test code.
-    pub fn static_insights_with(&self, include_tests: bool) -> Vec<Insight> {
+    /// [`Self::static_insights`] with the findings `opts` turns on.
+    pub fn static_insights_with(&self, opts: InsightOptions) -> Vec<Insight> {
         let mut out = Vec::new();
         for (i, n) in self.graph.nodes.iter().enumerate() {
             let Some(info) = &n.function else { continue };
-            if !include_tests && self.is_test(i) {
+            if !opts.include_tests && self.is_test(i) {
                 continue;
             }
             self.io_in_loop(i, &mut out);
@@ -460,7 +482,9 @@ impl Index {
             self.complexity_candidate(n, info, &mut out);
             self.read_then_write(i, &mut out);
         }
-        out.extend(self.unhandled_values());
+        if opts.unhandled_values {
+            out.extend(self.unhandled_values());
+        }
         out
     }
 
@@ -529,6 +553,26 @@ impl Index {
                     e.kind,
                     EffectKind::DbWrite | EffectKind::DbDelete | EffectKind::FsWrite
                 ) || (e.kind == EffectKind::Network && mutating_name(&e.via)),
+                remote: LOOP_IO_KINDS.contains(&e.kind),
+                writes: matches!(
+                    e.kind,
+                    EffectKind::DbWrite | EffectKind::DbDelete | EffectKind::FsWrite
+                ),
+                tables: e
+                    .target
+                    .iter()
+                    .flat_map(|t| t.split(','))
+                    .map(str::to_owned)
+                    .collect(),
+                written: if matches!(e.kind, EffectKind::DbWrite | EffectKind::DbDelete) {
+                    e.target
+                        .iter()
+                        .flat_map(|t| t.split(','))
+                        .map(str::to_owned)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         for &ei in &self.outgoing[i] {
@@ -547,6 +591,13 @@ impl Index {
             if !reaches_io {
                 continue;
             }
+            let deep = self.deep_tables(t);
+            let remote = target.kind == NodeKind::Route
+                || target
+                    .effects
+                    .transitive
+                    .iter()
+                    .any(|k| LOOP_IO_KINDS.contains(k));
             items.push(IoItem {
                 label: target.name.clone(),
                 line: e.line.unwrap_or(0),
@@ -559,6 +610,15 @@ impl Index {
                 },
                 is_method: e.attrs.contains_key("receiver"),
                 mutation: mutating_name(&target.name),
+                remote,
+                writes: target.effects.transitive.iter().any(|k| {
+                    matches!(
+                        k,
+                        EffectKind::DbWrite | EffectKind::DbDelete | EffectKind::FsWrite
+                    )
+                }),
+                tables: deep.0,
+                written: deep.1,
             });
         }
         items.sort_by_key(|it| (it.line, it.label.clone()));
@@ -593,7 +653,7 @@ impl Index {
             let e = &self.graph.edges[ei];
             if registration_code
                 || e.loop_depth == 0
-                || !matches!(e.kind, EdgeKind::Calls | EdgeKind::Spawns)
+                || e.kind != EdgeKind::Calls
                 || !plausible_call(e)
             {
                 continue;
@@ -627,7 +687,9 @@ impl Index {
         }
     }
 
-    /// Two or more consecutive awaited I/O items at the same loop depth, none conditional,
+    /// Two or more consecutive awaited I/O items at the same loop depth, all over the network
+    /// or to a database (local file reads in between are skipped, local writes end a run), none conditional or already joined (`try_join!` arguments), not two
+    /// writes and none reading or writing a table an earlier one writes (through callees too),
     /// each on a distinct receiver root, no later item on a local receiver (probably derived
     /// from an earlier result, like `cur = await conn.execute(); cur.fetchall()`), no plain
     /// call on a line in between (which probably consumes the earlier result), no later item
@@ -694,7 +756,11 @@ impl Index {
         };
         for it in &items {
             let conditional = it.conditional || flow_at(it.line).is_some_and(|f| f.conditional);
-            if !it.awaited || conditional {
+            let joined = flow_at(it.line).is_some_and(|f| f.concurrent);
+            if !it.remote && !it.mutation && !it.writes {
+                continue;
+            }
+            if !it.awaited || conditional || joined || !it.remote {
                 flush(&mut run);
                 continue;
             }
@@ -702,7 +768,11 @@ impl Index {
                 .last()
                 .is_some_and(|prev| boundaries.iter().any(|&l| prev.line < l && l < it.line));
             let independent = run.iter().all(|prev| {
-                prev.loop_depth == it.loop_depth && prev.root != it.root && !prev.mutation
+                prev.loop_depth == it.loop_depth
+                    && prev.root != it.root
+                    && !prev.mutation
+                    && !(prev.writes && it.writes)
+                    && !prev.written.iter().any(|t| it.tables.contains(t))
             }) && (run.is_empty() || !it.local_receiver(&params))
                 && !consumed_between
                 && !run.first().is_some_and(|first| ordered(first.line, it));
@@ -714,6 +784,43 @@ impl Index {
             }
         }
         flush(&mut run);
+    }
+
+    /// Tables a function reads and writes, itself or through the functions it calls, a few
+    /// levels down.
+    fn deep_tables(&self, start: usize) -> (Vec<String>, Vec<String>) {
+        let (mut tables, mut written) = (Vec::new(), Vec::new());
+        let mut seen: HashSet<usize> = HashSet::from([start]);
+        let mut frontier = vec![start];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for &f in &frontier {
+                for &ei in &self.outgoing[f] {
+                    let e = &self.graph.edges[ei];
+                    match e.kind {
+                        EdgeKind::Reads | EdgeKind::Writes => {
+                            let t = e.to.trim_start_matches("table:").to_owned();
+                            if e.kind == EdgeKind::Writes && !written.contains(&t) {
+                                written.push(t.clone());
+                            }
+                            if !tables.contains(&t) {
+                                tables.push(t);
+                            }
+                        }
+                        EdgeKind::Calls if plausible_call(e) => {
+                            if let Some(t) = self.idx(&e.to)
+                                && seen.insert(t)
+                            {
+                                next.push(t);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            frontier = next;
+        }
+        (tables, written)
     }
 
     /// Table accesses of a function: its own `reads`/`writes` edges plus those of the
@@ -738,6 +845,8 @@ impl Index {
                     write: e.kind == EdgeKind::Writes,
                     delete: deletes_at(n, Some(line)),
                     guarded: e.attrs.contains_key("guard"),
+                    conditional: e.conditional,
+                    loop_depth: e.loop_depth,
                 }),
                 EdgeKind::Calls => {
                     let Some(t) = self.idx(&e.to) else { continue };
@@ -761,6 +870,8 @@ impl Index {
                             write: c.kind == EdgeKind::Writes,
                             delete: deletes_at(callee, c.line),
                             guarded: c.attrs.contains_key("guard"),
+                            conditional: e.conditional || c.conditional,
+                            loop_depth: e.loop_depth,
                         });
                     }
                 }
@@ -771,10 +882,16 @@ impl Index {
         out
     }
 
-    /// A read of a table followed by a write to it, with an awaited call or effect from the
-    /// read line up to the write line, and no lock or transaction taken before the write.
-    /// Functions handed a transaction by their caller (`tx: &mut Transaction<'_, _>`) run
-    /// inside it and are skipped.
+    /// A read of a table followed by a write to it that depends on the read: it passes on a
+    /// value bound since the read (the row read, something a call computed from it, or, in a
+    /// loop entered after the read, a local that is not an input bound before it; a variable
+    /// that existed before the read and is updated after it is not read data), or it sits in a
+    /// branch, after the unconditional read, whose condition tests such a value (check, then
+    /// act). There must be an awaited
+    /// call or effect from the read line up to the write line, and no lock or transaction
+    /// taken before the write. Deletes are idempotent and skipped, as are unconditional writes
+    /// of values the read did not produce. Functions handed a transaction by their caller
+    /// (`tx: &mut Transaction<'_, _>`) run inside it and are skipped.
     fn read_then_write(&self, i: usize, out: &mut Vec<Insight>) {
         let n = &self.graph.nodes[i];
         if self.is_test(i)
@@ -809,15 +926,56 @@ impl Index {
                 .filter(|e| e.awaited)
                 .filter_map(|e| e.line),
         );
+        let flows: &[Flow] = n.function.as_ref().map_or(&[], |f| f.flows.as_slice());
+        let params: HashSet<&str> = n
+            .function
+            .iter()
+            .flat_map(|f| &f.params)
+            .flat_map(|p| p.name.split(|c: char| !c.is_alphanumeric() && c != '_'))
+            .collect();
+        let input = |name: &str| {
+            params.contains(name)
+                || NOT_A_LOCAL.contains(&name)
+                || name.starts_with(|c: char| c.is_uppercase())
+                || self.by_name.contains_key(name)
+        };
+        let carries_read = |r: &TableAccess, w: &TableAccess| {
+            let before: HashSet<&String> = flows
+                .iter()
+                .filter(|f| f.line < r.line)
+                .flat_map(|f| &f.binds)
+                .collect();
+            let since: HashSet<&String> = flows
+                .iter()
+                .filter(|f| r.line <= f.line && f.line < w.line)
+                .flat_map(|f| &f.binds)
+                .filter(|b| !before.contains(b))
+                .collect();
+            let at_write = || flows.iter().filter(|f| f.line == w.line);
+            let in_later_loop = w.loop_depth > r.loop_depth;
+            let carried = at_write()
+                .flat_map(|f| f.uses.iter().chain(&f.mutates))
+                .any(|u| since.contains(u) || (in_later_loop && !(before.contains(u) || input(u))));
+            let checked = w.conditional
+                && !r.conditional
+                && at_write()
+                    .flat_map(|f| &f.guards)
+                    .any(|g| since.contains(g));
+            carried || checked
+        };
         let mut reported: HashSet<&str> = HashSet::new();
         for r in accesses.iter().filter(|a| !a.write) {
             if reported.contains(r.table.as_str()) {
                 continue;
             }
-            let Some(w) = accesses
-                .iter()
-                .find(|a| a.write && !a.guarded && a.table == r.table && a.line > r.line)
-            else {
+            let Some(w) = accesses.iter().find(|a| {
+                a.write
+                    && !a.delete
+                    && !a.guarded
+                    && a.table == r.table
+                    && a.line > r.line
+                    && carries_read(r, a)
+            }) else {
                 continue;
             };
             let yields = awaits.iter().any(|&l| l >= r.line && l < w.line);
@@ -881,7 +1039,10 @@ impl Index {
             };
             for &ei in &self.outgoing[i] {
                 let e = &self.graph.edges[ei];
-                if e.kind != EdgeKind::Calls || !plausible_call(e) || e.line.is_some_and(offloaded)
+                if e.kind != EdgeKind::Calls
+                    || e.attrs.contains_key("ref")
+                    || !plausible_call(e)
+                    || e.line.is_some_and(offloaded)
                 {
                     continue;
                 }
@@ -931,23 +1092,29 @@ impl Index {
             })
     }
 
+    /// Loops nested three deep in the function itself, a loop over a collection nested in a
+    /// loop over the same collection (all pairs), or branching recursion. Other doubly nested
+    /// loops are mostly walks over an item's parts, strided windows or merges, and a callee's
+    /// estimate counted inside a loop is often over the current item, not the input.
     fn complexity_candidate(
         &self,
         n: &Node,
         info: &hoshizora_model::FunctionInfo,
         out: &mut Vec<Insight>,
     ) {
-        let mut reasons = Vec::new();
-        if info.max_loop_depth >= 2 {
-            reasons.push(format!("nested loops (depth {})", info.max_loop_depth));
-        }
-        if info.cyclomatic >= 15 {
-            reasons.push(format!("cyclomatic complexity {}", info.cyclomatic));
-        }
-        if info.complexity.time == "O(2^n)" || info.complexity.time.starts_with("O(n^") {
+        let exponential = info.complexity.time == "O(2^n)";
+        if info.max_loop_depth >= 3 || info.pairwise || exponential {
+            let mut reasons = Vec::new();
+            if info.max_loop_depth >= 2 {
+                reasons.push(format!("nested loops (depth {})", info.max_loop_depth));
+            }
+            if info.pairwise {
+                reasons.push("nested loops over the same collection".to_owned());
+            }
+            if info.cyclomatic >= 15 {
+                reasons.push(format!("cyclomatic complexity {}", info.cyclomatic));
+            }
             reasons.push(format!("estimated {}", info.complexity.time));
-        }
-        if reasons.len() >= 2 || (reasons.len() == 1 && info.complexity.time == "O(2^n)") {
             reasons.extend(info.complexity.basis.iter().cloned());
             out.push(Insight::Inefficient {
                 node: n.id.clone(),
@@ -966,6 +1133,19 @@ const IO_KINDS: &[EffectKind] = &[
     EffectKind::DbDelete,
     EffectKind::FsRead,
     EffectKind::FsWrite,
+];
+
+/// Identifiers that name no local value.
+const NOT_A_LOCAL: &[&str] = &[
+    "self",
+    "this",
+    "cls",
+    "None",
+    "null",
+    "undefined",
+    "nil",
+    "true",
+    "false",
 ];
 
 const LOOP_IO_KINDS: &[EffectKind] = &[
@@ -1025,8 +1205,10 @@ struct TableAccess {
     line: u32,
     write: bool,
     delete: bool,
-    /// `ON CONFLICT`, `WHERE NOT EXISTS`: safe against a concurrent writer.
+    /// `ON CONFLICT`, `NOT EXISTS`: safe against a concurrent writer.
     guarded: bool,
+    conditional: bool,
+    loop_depth: u32,
 }
 
 struct IoItem {
@@ -1041,6 +1223,13 @@ struct IoItem {
     is_method: bool,
     /// Writes something (a row, a file, a directory, a POST): what follows probably depends on it.
     mutation: bool,
+    /// Goes over the network or to a database, rather than to the local filesystem.
+    remote: bool,
+    /// Writes a row or a file, itself or through its callees.
+    writes: bool,
+    /// Tables it reads or writes, itself or through its callees.
+    tables: Vec<String>,
+    written: Vec<String>,
 }
 
 impl IoItem {

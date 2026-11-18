@@ -361,6 +361,8 @@ pub fn analyze_nodes_with(
         flows: HashMap::new(),
         headers: HashMap::new(),
         bound: Vec::new(),
+        iterated: Vec::new(),
+        guards: Vec::new(),
     };
     for child in nodes {
         walk(*child, source, spec, State::default(), &mut out, &mut scope);
@@ -486,6 +488,7 @@ pub fn merge_module_symbol(symbols: &mut Vec<Symbol>, extra: Symbol) {
             a.branches += b.branches;
             a.loops += b.loops;
             a.max_loop_depth = a.max_loop_depth.max(b.max_loop_depth);
+            a.pairwise |= b.pairwise;
             a.early_exits += b.early_exits;
             a.closures += b.closures;
             a.cyclomatic = 1 + a.branches + a.loops;
@@ -504,6 +507,10 @@ struct Scope<'a> {
     headers: HashMap<usize, State>,
     /// Names bound by the enclosing loops' patterns.
     bound: Vec<String>,
+    /// Collections the enclosing loops that count towards the depth iterate over, as written.
+    iterated: Vec<String>,
+    /// Identifiers read by the conditions of the enclosing branches.
+    guards: Vec<String>,
 }
 
 fn walk(
@@ -522,15 +529,24 @@ fn walk(
         st = outer;
     }
     let bound_before = scope.bound.len();
+    let iterated_before = scope.iterated.len();
     if spec.loops.contains(&kind) {
         out.loops += 1;
         let (pattern, iterable) = loop_parts(node);
         if let Some(it) = iterable {
             scope.headers.insert(it.id(), st);
         }
-        if !bounded_loop(node, pattern, iterable, source, &scope.bound) {
+        if !bounded_loop(node, pattern, iterable, source, spec, &scope.bound) {
             st.loop_depth += 1;
             out.max_loop_depth = out.max_loop_depth.max(st.loop_depth);
+            if let Some(base) = iterable
+                .map(|it| unwrap_iterable(it, source))
+                .filter(|b| !is_range(*b, source))
+            {
+                let over = strip_ws(text(base, source));
+                out.pairwise |= scope.iterated.contains(&over);
+                scope.iterated.push(over);
+            }
         }
         if let Some(p) = pattern {
             pattern_names(p, source, spec.idents, &mut scope.bound);
@@ -546,6 +562,16 @@ fn walk(
         && let Some(value) = node
             .child_by_field_name("value")
             .or_else(|| node.child_by_field_name("right"))
+        && (root_ident(unwrap_iterable(value, source), source)
+            .is_some_and(|r| scope.bound.contains(&r))
+            || keyed_by(value, source, spec, &scope.bound))
+    {
+        pattern_names(target, source, spec.idents, &mut scope.bound);
+    }
+    if kind == "as_pattern"
+        && !scope.bound.is_empty()
+        && let (Some(value), Some(target)) =
+            (node.named_child(0), node.child_by_field_name("alias"))
         && root_ident(unwrap_iterable(value, source), source)
             .is_some_and(|r| scope.bound.contains(&r))
     {
@@ -591,10 +617,18 @@ fn walk(
             .flows
             .entry(top.id())
             .or_insert_with(|| data_flow(top, source, spec));
+        let per_item = st.loop_depth > 0
+            && per_item(node, info.receiver.as_deref(), source, spec, &scope.bound);
         let mut call = site(callee, info.receiver, info.string_args, at, awaited, st);
         call.binds = flow.binds.clone();
         call.uses = flow.uses.clone();
         call.mutates = flow.mutates.clone();
+        call.per_item = per_item;
+        call.guards = scope.guards.clone();
+        call.on_part = node
+            .child_by_field_name("arguments")
+            .and_then(|a| a.named_child(0))
+            .is_some_and(|a| PART_KINDS.contains(&a.kind()));
         out.calls.push(call);
         if let Some(expand) = spec.expand {
             for mut c in expand(node, source) {
@@ -621,16 +655,70 @@ fn walk(
     }
     let is_cond = spec.conditionals.contains(&kind);
     let guard = node.child_by_field_name("condition").map(|n| n.id());
+    let tested = (is_cond || spec.switches.contains(&kind))
+        .then(|| {
+            node.child_by_field_name("condition")
+                .or_else(|| node.child_by_field_name("value"))
+        })
+        .flatten();
+    let guards_before = scope.guards.len();
     for child in named_children(node) {
         let mut cst = st;
         if is_cond && guard != Some(child.id()) {
             cst.conditional = true;
         }
+        let in_branch = tested.is_some_and(|t| t.id() != child.id());
+        if in_branch && scope.guards.len() == guards_before {
+            let mut names = Vec::new();
+            if let Some(t) = tested {
+                idents(t, source, spec, &mut names);
+            }
+            scope.guards.extend(names);
+        }
+        if !in_branch {
+            scope.guards.truncate(guards_before);
+        }
         walk(child, source, spec, cst, out, scope);
     }
+    scope.guards.truncate(guards_before);
     if spec.loops.contains(&kind) {
         scope.bound.truncate(bound_before);
+        scope.iterated.truncate(iterated_before);
     }
+}
+
+/// Expressions that take a part of a value: a field, a member, an index or a slice.
+const PART_KINDS: &[&str] = &[
+    "field_expression",
+    "member_expression",
+    "attribute",
+    "subscript",
+    "subscript_expression",
+    "index_expression",
+    "selector_expression",
+    "slice_expression",
+];
+
+/// A call whose arguments and receiver read only names bound by the enclosing loops.
+fn per_item(
+    node: Node,
+    receiver: Option<&str>,
+    source: &str,
+    spec: &BodySpec,
+    bound: &[String],
+) -> bool {
+    let mut names = Vec::new();
+    if let Some(args) = node.child_by_field_name("arguments") {
+        idents(args, source, spec, &mut names);
+    }
+    if let Some(root) = receiver
+        .filter(|r| *r != EXPR_RECEIVER)
+        .and_then(|r| r.split(['.', ':']).find(|p| !p.is_empty()))
+    {
+        names.push(root.to_owned());
+    }
+    names.retain(|n| !NOT_A_FUNCTION.contains(&n.as_str()));
+    !names.is_empty() && names.iter().all(|n| bound.contains(n))
 }
 
 /// The variable pattern and the iterated expression of a loop, when it has them:
@@ -663,18 +751,27 @@ fn loop_parts(node: Node) -> (Option<Node>, Option<Node>) {
 
 /// Loops that do not scale with the input, so they add no loop depth: over a literal list, a
 /// constant table or a small literal range; retries; paced, polling and event loops that wait
-/// between iterations; and an inner loop over a part of an enclosing loop's item (a
-/// `group.items` walk visits each item once).
+/// between iterations; loops that stop at a constant cap (`take(K)`, `[:K]`, `if n >= CAP:
+/// break`); a window around a point (`range(x - r, x + r + 1)`); and an inner loop over a part
+/// of an enclosing loop's item (a `group.items` walk, or a lookup keyed by it like
+/// `groups_of(c.id)`, visits each item once).
 fn bounded_loop(
     node: Node,
     pattern: Option<Node>,
     iterable: Option<Node>,
     source: &str,
+    spec: &BodySpec,
     bound: &[String],
 ) -> bool {
     let body = node
         .child_by_field_name("body")
         .map_or("", |b| text(b, source));
+    if node
+        .child_by_field_name("body")
+        .is_some_and(|b| cap_break(b, source, spec))
+    {
+        return true;
+    }
     if [
         "sleep(",
         "sleep_until(",
@@ -710,17 +807,113 @@ fn bounded_loop(
     if [".recv()", ".next().await", ".accept()", ".message().await"]
         .iter()
         .any(|p| it_text.contains(p))
+        || CAPPED.is_match(&strip_ws(it_text))
     {
         return true;
     }
     let base = unwrap_iterable(it, source);
     if constant_iterable(base, source)
         || retry_named(last_segment(&strip_ws(text(base, source))).as_str())
+        || window(base, source)
+        || (!is_range(base, source) && keyed_by(base, source, spec, bound))
+        || part_indices(base, source, spec, bound)
     {
         return true;
     }
     !is_range(base, source)
         && root_ident(base, source).is_some_and(|r| r != "self" && bound.contains(&r))
+}
+
+/// An `if` of the loop's own body (not of a nested loop or closure) that breaks at a
+/// constant cap.
+fn cap_break(node: Node, source: &str, spec: &BodySpec) -> bool {
+    named_children(node).into_iter().any(|c| {
+        if spec.loops.contains(&c.kind()) || spec.closures.contains(&c.kind()) {
+            return false;
+        }
+        (c.kind().starts_with("if") && CAP_BREAK.is_match(text(c, source)))
+            || cap_break(c, source, spec)
+    })
+}
+
+/// `if len(found) >= CAP: break`, `if n > 10 { break; }`.
+static CAP_BREAK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"if\s[^\n:{]*(>=|>|==)\s*([A-Z][A-Z0-9_]*|\d+)\s*[:{]\s*(\{\s*)?break\b")
+        .expect("valid regex")
+});
+
+/// `.take(10)`, `.take(MAX)`, `[:5]`, `[..LIMIT]`, `.slice(0, 20)`.
+static CAPPED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\.take\(([A-Z][A-Z0-9_]*|\d+)\)|\[(0?:|\.\.=?)([A-Z][A-Z0-9_]*|\d+)\]|\.slice\(0,([A-Z][A-Z0-9_]*|\d+)\)")
+        .expect("valid regex")
+});
+
+/// `range(x - r, x + r + 1)`, `range(-r, r + 1)`, `x - r..=x + r`: a window of fixed reach
+/// around a point.
+fn window(node: Node, source: &str) -> bool {
+    if !is_range(node, source) {
+        return false;
+    }
+    let ends: Vec<String> = match node.child_by_field_name("arguments") {
+        Some(args) => named_children(args),
+        None => named_children(node),
+    }
+    .into_iter()
+    .map(|e| strip_ws(text(e, source)))
+    .collect();
+    let [start, end] = ends.as_slice() else {
+        return false;
+    };
+    let Some((at, reach)) = start.rsplit_once('-') else {
+        return false;
+    };
+    let at = if at.is_empty() {
+        at.to_owned()
+    } else {
+        format!("{at}+")
+    };
+    !reach.is_empty() && (end == &format!("{at}{reach}") || end == &format!("{at}{reach}+1"))
+}
+
+/// `range(len(row))`, `range(min(len(a), len(b)))`, `0..item.len()`: the indices of a part of
+/// an enclosing loop's item.
+fn part_indices(node: Node, source: &str, spec: &BodySpec, bound: &[String]) -> bool {
+    if !is_range(node, source) {
+        return false;
+    }
+    let t = strip_ws(text(node, source));
+    let mut names = Vec::new();
+    idents(node, source, spec, &mut names);
+    names.retain(|n| n != "range" && n != "len" && n != "min");
+    !names.is_empty()
+        && names.iter().all(|n| {
+            bound.contains(n)
+                && (t.contains(&format!("len({n})")) || t.contains(&format!("{n}.len()")))
+        })
+}
+
+/// A call outside any closure whose arguments read only names the enclosing loops bound:
+/// `ctx.groups_of(c.id)`, `repo.copies(*id, hash).await?`.
+fn keyed_by(node: Node, source: &str, spec: &BodySpec, bound: &[String]) -> bool {
+    if spec.closures.contains(&node.kind()) {
+        return false;
+    }
+    if node.kind().contains("call")
+        && let Some(args) = node.child_by_field_name("arguments")
+        && !named_children(args)
+            .iter()
+            .any(|a| spec.closures.contains(&a.kind()))
+    {
+        let mut names = Vec::new();
+        idents(args, source, spec, &mut names);
+        names.retain(|n| !NOT_A_FUNCTION.contains(&n.as_str()));
+        if !names.is_empty() && names.iter().all(|n| bound.contains(n)) {
+            return true;
+        }
+    }
+    named_children(node)
+        .into_iter()
+        .any(|c| keyed_by(c, source, spec, bound))
 }
 
 fn retry_named(t: &str) -> bool {
@@ -786,8 +979,13 @@ fn unwrap_iterable<'t>(mut node: Node<'t>, source: &str) -> Node<'t> {
                     .or_else(|| f.child_by_field_name("object"))
                     .filter(|r| text(*r, source) != "Object");
                 let next = receiver.or_else(|| {
-                    node.child_by_field_name("arguments")
-                        .and_then(|a| a.named_child(0))
+                    node.child_by_field_name("arguments").and_then(|a| {
+                        if a.kind() == "generator_expression" {
+                            Some(a)
+                        } else {
+                            a.named_child(0)
+                        }
+                    })
                 });
                 match next {
                     Some(n) => node = n,
@@ -927,7 +1125,10 @@ fn emit_refs(
     for n in nodes {
         let t = strip_ws(text(*n, source));
         if spec.ref_kinds.contains(&n.kind()) && names_function(&t) && is_ref(&t) {
-            out.calls.push(site(t, None, vec![], *n, false, st));
+            out.calls.push(CallSite {
+                reference: true,
+                ..site(t, None, vec![], *n, false, st)
+            });
         }
     }
 }
@@ -953,6 +1154,11 @@ fn site(
         binds: vec![],
         uses: vec![],
         mutates: vec![],
+        reference: false,
+        per_item: false,
+        concurrent: false,
+        on_part: false,
+        guards: vec![],
     }
 }
 

@@ -407,6 +407,7 @@ mod tests {
             branches: 0,
             loops: depth,
             max_loop_depth: depth,
+            pairwise: false,
             recursive: false,
             complexity: Complexity {
                 time: time.into(),

@@ -103,3 +103,31 @@ pub fn cross(items: &[u32], other: &[u32]) -> usize {
     }
     n
 }
+
+pub fn triples(items: &[u32]) -> usize {
+    let mut n = 0;
+    for a in items {
+        for b in items {
+            for c in items {
+                n += (a + b + c) as usize;
+            }
+        }
+    }
+    n
+}
+
+pub fn per_group(groups: &[Vec<u32>]) -> usize {
+    let mut n = 0;
+    for g in groups {
+        n += pairs(g);
+    }
+    n
+}
+
+pub fn against_all(groups: &[Vec<u32>], items: &[u32]) -> usize {
+    let mut n = 0;
+    for g in groups {
+        n += pairs(items) + g.len();
+    }
+    n
+}

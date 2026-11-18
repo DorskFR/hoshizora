@@ -20,7 +20,7 @@ pub const INDEXER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use build::analysis::{ALL_EFFECTS, FLOW_KINDS};
 pub use diff::{DiffReport, diff};
-pub use index::{DEFAULT_FLOW_KINDS, FLOW_NODE_LIMIT, Index};
+pub use index::{DEFAULT_FLOW_KINDS, FLOW_NODE_LIMIT, Index, InsightOptions};
 pub use packs::Packs;
 pub use store::save_with;
 

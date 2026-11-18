@@ -47,4 +47,6 @@ the values it misses and what its catch-all does: `throws`, `returns_empty` (emp
 `return`/`break`/`pass`, or an empty value) or `other`. A site whose `returns_empty` catch-all
 swallows missing values is an `unhandled_values` insight, unless it handles fewer values than it
 misses (a projection) or the only missing value is a neutral one (`all`, `none`, `ok`, `unknown`).
-A catch-all that computes a value (`other`) is a deliberate mapping and is not reported.
+A catch-all that computes a value (`other`) is a deliberate mapping and is not reported. Most
+silent catch-alls across a whole repository are deliberate, so `query insights` lists them only
+with `--unhandled-values`; `diff` always reports the ones in changed code.

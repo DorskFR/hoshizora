@@ -111,7 +111,9 @@ pub fn evaluate(
     let locations = locations
         .iter()
         .map(|loc| {
-            let function = head.function_at(&loc.file, loc.line).map(|n| n.id.clone());
+            let function = head
+                .code_function_at(&loc.file, loc.line)
+                .map(|n| n.id.clone());
             let near_state = sets.state_lines.iter().any(|(file, line)| {
                 *file == loc.file && line.abs_diff(loc.line) <= STATE_NEAR_LINES
             });

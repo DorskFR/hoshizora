@@ -9,7 +9,7 @@ use hoshizora_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::index::{DEFAULT_FLOW_KINDS, Index};
+use crate::index::{DEFAULT_FLOW_KINDS, Index, InsightOptions};
 
 pub const IMPACT_CAP: usize = 10;
 
@@ -832,15 +832,20 @@ fn insight_key(i: &Insight, rename: &HashMap<&str, &str>) -> String {
     }
 }
 
+const CHANGE_INSIGHTS: InsightOptions = InsightOptions {
+    include_tests: false,
+    unhandled_values: true,
+};
+
 fn insight_delta(base: &Index, head: &Index, moved_from_to: &HashMap<&str, &str>) -> InsightDelta {
     let none = HashMap::new();
     let base_keys: HashMap<String, Insight> = base
-        .static_insights()
+        .static_insights_with(CHANGE_INSIGHTS)
         .into_iter()
         .map(|i| (insight_key(&i, moved_from_to), i))
         .collect();
     let head_keys: HashMap<String, Insight> = head
-        .static_insights()
+        .static_insights_with(CHANGE_INSIGHTS)
         .into_iter()
         .map(|i| (insight_key(&i, &none), i))
         .collect();

@@ -152,6 +152,9 @@ pub struct Body {
     pub branches: u32,
     pub loops: u32,
     pub max_loop_depth: u32,
+    /// A loop nested in a loop over the same collection (`for a in xs { for b in xs }`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pairwise: bool,
     /// McCabe: 1 + decision points.
     pub cyclomatic: u32,
     /// Places that end the function early (`return`, `?`, `raise`, `throw`).
@@ -197,4 +200,22 @@ pub struct CallSite {
     /// Subset of `uses` passed as a mutable borrow (`&mut tx`).
     #[serde(default)]
     pub mutates: Vec<String>,
+    /// A function named as an argument value (`map(load)`, `spawn(worker)`), not called here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reference: bool,
+    /// Inside a loop, every variable the call reads (arguments, receiver) is bound by an
+    /// enclosing loop: it works on the current item, not on the whole input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_item: bool,
+    /// An argument of a join (`try_join!`, `join!`, `select!`): runs concurrently with its
+    /// siblings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub concurrent: bool,
+    /// The first argument is a part of a value (`node.left`, `xs[:mid]`): a recursive call
+    /// like this descends into a structure rather than repeating the problem.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_part: bool,
+    /// Identifiers the conditions of the enclosing branches read (`if job.is_ok()` → `job`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<String>,
 }

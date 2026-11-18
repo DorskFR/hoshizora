@@ -33,6 +33,7 @@ use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use crate::assets;
 pub use crate::projects::AppState;
 use crate::queries::{GraphQueries, parse_edge_kinds, parse_effect_kind};
+use hoshizora_core::InsightOptions;
 
 /// One ready project: its graph, runtime and live event stream.
 pub struct ProjectState<Q: GraphQueries> {
@@ -619,6 +620,8 @@ async fn effects<Q: GraphQueries>(
 struct InsightsParams {
     #[serde(default)]
     include_tests: bool,
+    #[serde(default)]
+    unhandled_values: bool,
 }
 
 async fn insights<Q: GraphQueries>(
@@ -626,7 +629,13 @@ async fn insights<Q: GraphQueries>(
     Query(p): Query<InsightsParams>,
 ) -> Json<Insights> {
     Json(Insights {
-        insights: all_insights(&state, p.include_tests),
+        insights: all_insights(
+            &state,
+            InsightOptions {
+                include_tests: p.include_tests,
+                unhandled_values: p.unhandled_values,
+            },
+        ),
     })
 }
 
@@ -642,8 +651,11 @@ async fn states<Q: GraphQueries>(
     Json(state.queries.states(p.domain.as_deref()))
 }
 
-pub fn all_insights<Q: GraphQueries>(state: &ProjectState<Q>, include_tests: bool) -> Vec<Insight> {
-    let statics = state.queries.static_insights(include_tests);
+pub fn all_insights<Q: GraphQueries>(
+    state: &ProjectState<Q>,
+    opts: InsightOptions,
+) -> Vec<Insight> {
+    let statics = state.queries.static_insights(opts);
     state
         .runtime()
         .insights(hoshizora_runtime::now_unix_nanos(), &statics)
@@ -881,6 +893,7 @@ mod tests {
                 branches: 1,
                 loops: 1,
                 max_loop_depth: 1,
+                pairwise: false,
                 recursive: false,
                 complexity: hoshizora_model::Complexity {
                     time: "O(n)".into(),
@@ -1014,7 +1027,7 @@ mod tests {
         fn search(&self, _query: &str, _limit: usize) -> Vec<SearchHit> {
             vec![]
         }
-        fn static_insights(&self, _include_tests: bool) -> Vec<Insight> {
+        fn static_insights(&self, _opts: InsightOptions) -> Vec<Insight> {
             vec![Insight::IoInLoop {
                 node: FN_ID.into(),
                 effect: "db_read".into(),

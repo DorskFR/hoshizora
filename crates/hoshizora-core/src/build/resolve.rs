@@ -412,10 +412,20 @@ pub(crate) fn calls(ctx: &mut Ctx) {
     for f in 0..ctx.fns.len() {
         let sym = ctx.symbol(f);
         let Some(body) = &sym.body else { continue };
-        let spawned = spawned_calls(ctx, f, &body.calls);
+        let resolved: Vec<_> = body
+            .calls
+            .iter()
+            .map(|call| resolve_call_typed(ctx, f, call))
+            .collect();
+        let wrappers: Vec<bool> = resolved
+            .iter()
+            .map(|(targets, _)| {
+                !targets.is_empty() && targets.iter().all(|&(t, _)| spawns_a_parameter(ctx, t))
+            })
+            .collect();
+        let spawned = spawned_calls(ctx, f, &body.calls, &wrappers);
         let from = ctx.fns[f].node;
-        for (ci, call) in body.calls.iter().enumerate() {
-            let (targets, receiver_type) = resolve_call_typed(ctx, f, call);
+        for (ci, (call, (targets, receiver_type))) in body.calls.iter().zip(resolved).enumerate() {
             let kind = if spawned[ci] {
                 EdgeKind::Spawns
             } else {
@@ -423,8 +433,12 @@ pub(crate) fn calls(ctx: &mut Ctx) {
             };
             let candidates = targets.len();
             for (t, confidence) in targets {
-                if t == f {
-                    ctx.self_calls[f].push((call.line, call.conditional));
+                if t == f && !call.reference {
+                    ctx.self_calls[f].push(super::SelfCall {
+                        line: call.line,
+                        conditional: call.conditional,
+                        on_part: call.on_part,
+                    });
                 }
                 let to = ctx.fns[t].node;
                 let mut edge = Edge::new(
@@ -447,19 +461,41 @@ pub(crate) fn calls(ctx: &mut Ctx) {
                     edge.attrs
                         .insert("candidates".into(), candidates.to_string());
                 }
+                if call.reference {
+                    edge.attrs.insert("ref".into(), "argument".into());
+                }
+                if call.per_item {
+                    edge.attrs.insert("per_item".into(), "true".into());
+                }
                 ctx.add_edge(from, to, edge);
             }
         }
     }
 }
 
-/// Calls handed to a spawn primitive: those on the spawn call's own line (`spawn(work())`)
-/// and those inside a closure from that line up to the next call outside any closure.
-fn spawned_calls(ctx: &Ctx, f: usize, calls: &[CallSite]) -> Vec<bool> {
+/// A function that hands one of its parameters to a spawn primitive (`spawn_root(name, fut)`
+/// calling `tokio::spawn(fut)`): what its callers pass it runs concurrently.
+fn spawns_a_parameter(ctx: &Ctx, t: usize) -> bool {
+    let sym = ctx.symbol(t);
+    sym.body.as_ref().is_some_and(|b| {
+        b.calls.iter().any(|c| {
+            effects::is_spawn_call(ctx, t, c)
+                && c.uses
+                    .iter()
+                    .any(|u| sym.params.iter().any(|p| &p.name == u))
+        })
+    })
+}
+
+/// Calls handed to a spawn primitive or to a function that spawns its argument: those on the
+/// spawn call's own line (`spawn(work())`) and those inside a closure from that line up to the
+/// next call outside any closure.
+fn spawned_calls(ctx: &Ctx, f: usize, calls: &[CallSite], wrappers: &[bool]) -> Vec<bool> {
     let mut spawned = vec![false; calls.len()];
     let is_spawn: Vec<bool> = calls
         .iter()
-        .map(|c| effects::is_spawn_call(ctx, f, c))
+        .zip(wrappers)
+        .map(|(c, &w)| w || effects::is_spawn_call(ctx, f, c))
         .collect();
     for (i, call) in calls.iter().enumerate() {
         if !is_spawn[i] {
@@ -689,9 +725,11 @@ const COMMON_METHODS: &[&str] = &[
 
 /// Whether a call edge carries evidence for its target beyond a bare name: an exact
 /// resolution, or a method call whose receiver type is known (`self`, a parameter, a field
-/// chain), and no competing candidates.
+/// chain), and no competing candidates. A function passed as an argument only counts when
+/// it resolved exactly or to the caller's own file: a name like `mode` or `regions` passed
+/// as a value is usually a variable.
 pub(crate) fn trusted_call(edge: &Edge) -> bool {
-    if edge.attrs.contains_key("candidates") {
+    if edge.attrs.contains_key("candidates") || weak_reference(edge) {
         return false;
     }
     match edge.confidence {
@@ -712,7 +750,10 @@ pub(crate) fn plausible_call(edge: &Edge) -> bool {
     if trusted_call(edge) {
         return true;
     }
-    if edge.confidence != Confidence::Name || edge.attrs.contains_key("candidates") {
+    if edge.confidence != Confidence::Name
+        || edge.attrs.contains_key("candidates")
+        || weak_reference(edge)
+    {
         return false;
     }
     match edge.attrs.get("receiver") {
@@ -720,6 +761,12 @@ pub(crate) fn plausible_call(edge: &Edge) -> bool {
         Some(r) if r == EXPR_RECEIVER => false,
         Some(r) => r.contains('.') || receiver_names_type(r, &edge.to),
     }
+}
+
+fn weak_reference(edge: &Edge) -> bool {
+    edge.attrs.contains_key("ref")
+        && edge.confidence != Confidence::Exact
+        && edge.from.split('#').next() != edge.to.split('#').next()
 }
 
 /// `scheduler` ↔ `Scheduler::start`, `repository` ↔ `MatchingRepository::find`,
@@ -777,6 +824,11 @@ pub(crate) fn resolve_ref(ctx: &mut Ctx, f: usize, path: &str) -> Vec<usize> {
         binds: vec![],
         uses: vec![],
         mutates: vec![],
+        reference: false,
+        per_item: false,
+        concurrent: false,
+        on_part: false,
+        guards: vec![],
     };
     let mut receiver_type = None;
     resolve_targets(ctx, f, &call, &mut receiver_type, true)
@@ -952,9 +1004,11 @@ fn resolve_targets(
     }
 
     if let Some(r) = &call.receiver
-        && ctx.scopes[fi].bindings.contains_key(r)
+        && let Some(&imp) = ctx.scopes[fi].bindings.get(r)
+        && external(ctx, &ctx.scopes[fi].imports[imp])
+        && !(language == Language::Go && ctx.package_names.contains_key(r))
     {
-        *receiver_type = Some(r.clone());
+        return Vec::new();
     }
 
     let elsewhere = call.receiver.as_deref().is_some_and(|r| !is_self(r))
@@ -1051,6 +1105,18 @@ fn resolve_targets(
         }
     }
     Vec::new()
+}
+
+/// An import that resolved to no project file and that no project module is named after
+/// (`numpy`, `math`), as opposed to a sibling module the import resolution missed.
+fn external(ctx: &Ctx, imp: &super::ImportTarget) -> bool {
+    imp.file.is_none()
+        && !ctx.module_names.contains(
+            imp.path
+                .rsplit(['/', '.', ':'])
+                .find(|s| !s.is_empty())
+                .unwrap_or(&imp.path),
+        )
 }
 
 /// Functions named `name` in the module spelled by `segments[..n-1]`, resolved like a `use`.

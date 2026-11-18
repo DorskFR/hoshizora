@@ -155,6 +155,9 @@ enum QueryCommand {
         /// Also report findings on test code.
         #[arg(long)]
         include_tests: bool,
+        /// Also report catch-alls that silently swallow domain values (`unhandled_values`).
+        #[arg(long)]
+        unhandled_values: bool,
     },
     /// Value domains (enums, literal unions, const lists) and the branches on them, with the
     /// values each branch misses.
@@ -694,11 +697,15 @@ fn cmd_query(graph_path: &Path, query: QueryCommand) -> anyhow::Result<()> {
         QueryCommand::Effects { kind, target } => {
             serde_json::to_value(index.with_effect(parse_effect_kind(&kind)?, target.as_deref()))?
         }
-        QueryCommand::Insights { include_tests } => {
-            serde_json::to_value(hoshizora_model::api::Insights {
-                insights: index.static_insights(include_tests),
-            })?
-        }
+        QueryCommand::Insights {
+            include_tests,
+            unhandled_values,
+        } => serde_json::to_value(hoshizora_model::api::Insights {
+            insights: index.static_insights(hoshizora_core::InsightOptions {
+                include_tests,
+                unhandled_values,
+            }),
+        })?,
         QueryCommand::States { domain } => serde_json::to_value(index.states(domain.as_deref()))?,
         QueryCommand::Search { q, limit } => serde_json::to_value(index.search(&q, limit))?,
         QueryCommand::Node { id } => {
