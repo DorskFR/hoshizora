@@ -44,5 +44,7 @@ number literal unions and `as const` lists or maps, Go typed const blocks) and e
 linked to a domain by its qualifier (`Status::Active` → `Status`, nearest declaration first) or,
 unqualified, when at least two handled values all belong to exactly one domain. Each site reports
 the values it misses and what its catch-all does: `throws`, `returns_empty` (empty body, bare
-`return`/`break`/`pass`, or an empty value) or `other`. A site with missing values and a silent
-catch-all is an `unhandled_values` insight.
+`return`/`break`/`pass`, or an empty value) or `other`. A site whose `returns_empty` catch-all
+swallows missing values is an `unhandled_values` insight, unless it handles fewer values than it
+misses (a projection) or the only missing value is a neutral one (`all`, `none`, `ok`, `unknown`).
+A catch-all that computes a value (`other`) is a deliberate mapping and is not reported.

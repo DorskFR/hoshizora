@@ -557,18 +557,40 @@ fn is_async(node: Node, source: &str) -> bool {
     child_of_kind(node, "function_modifiers").is_some_and(|m| text(m, source).contains("async"))
 }
 
+/// Impl-block attributes that export every method in the block to a host runtime.
+const EXPORTING_IMPL_ATTRIBUTES: &[&str] =
+    &["pymethods", "pyo3::pymethods", "napi", "wasm_bindgen"];
+
+/// Initialisers of `static` and `const` items outside functions (`LazyLock::new(|| ..)`).
+fn item_initializers<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    for c in named_children(node) {
+        match c.kind() {
+            "const_item" | "static_item" => out.extend(c.child_by_field_name("value")),
+            "mod_item" | "impl_item" | "declaration_list" => item_initializers(c, out),
+            _ => {}
+        }
+    }
+}
+
 struct Ctx<'a> {
     source: &'a str,
     symbols: Vec<Symbol>,
     imports: Vec<Import>,
     domains: Vec<Domain>,
     trait_impls: Vec<(String, String)>,
+    in_test_mod: bool,
+    /// Enclosing inline `mod` names outside test modules, qualifying the functions they hold.
+    modules: Vec<String>,
 }
 
 impl Ctx<'_> {
     fn function(&mut self, node: Node, parent: Option<&str>, public: bool) {
         let name = field_text(node, "name", self.source).unwrap_or_default();
-        let local_name = parent.map_or_else(|| name.clone(), |p| format!("{p}::{name}"));
+        let local_name = match parent {
+            Some(p) => format!("{p}::{name}"),
+            None if self.modules.is_empty() => name.clone(),
+            None => format!("{}::{name}", self.modules.join("::")),
+        };
         self.symbols.push(Symbol {
             kind: if parent.is_some() {
                 SymbolKind::Method
@@ -588,7 +610,13 @@ impl Ctx<'_> {
             } else {
                 Visibility::Private
             },
-            attributes: attributes(node, self.source),
+            attributes: {
+                let mut attrs = attributes(node, self.source);
+                if self.in_test_mod {
+                    attrs.push("cfg(test)".into());
+                }
+                attrs
+            },
             implements: vec![],
             body: node.child_by_field_name("body").map(|b| {
                 let mut body = common::analyze_body(b, self.source, &SPEC);
@@ -608,13 +636,16 @@ impl Ctx<'_> {
         }
         let mut attrs = attributes(node, self.source);
         if let Some(body) = node.child_by_field_name("body") {
-            attrs.extend(
-                named_children(body)
-                    .into_iter()
-                    .filter(|c| c.kind() == "attribute_item")
-                    .filter_map(|a| child_of_kind(a, "attribute"))
-                    .map(|a| collapse_ws(text(a, self.source))),
-            );
+            let mut pending = vec![body];
+            while let Some(n) = pending.pop() {
+                if n.kind() == "attribute_item" {
+                    attrs.extend(
+                        child_of_kind(n, "attribute").map(|a| collapse_ws(text(a, self.source))),
+                    );
+                } else {
+                    pending.extend(named_children(n).into_iter().rev());
+                }
+            }
         }
         let fields = if node.kind() == "struct_item" {
             struct_fields(node, self.source)
@@ -673,19 +704,38 @@ impl Ctx<'_> {
                 if let Some(t) = &trait_ {
                     self.trait_impls.push((ty.clone(), t.clone()));
                 }
+                let exported: Vec<String> = attributes(node, self.source)
+                    .into_iter()
+                    .filter(|a| EXPORTING_IMPL_ATTRIBUTES.contains(&a.as_str()))
+                    .collect();
                 if let Some(body) = node.child_by_field_name("body") {
                     for m in named_children(body) {
                         if m.kind() == "function_item" {
                             self.function(m, Some(&ty), trait_.is_some());
+                            if let Some(method) = self.symbols.last_mut() {
+                                method.attributes.extend(exported.iter().cloned());
+                            }
                         }
                     }
                 }
             }
             "mod_item" => {
                 if let Some(body) = node.child_by_field_name("body") {
+                    let outer = self.in_test_mod;
+                    self.in_test_mod |= attributes(node, self.source)
+                        .iter()
+                        .any(|a| a == "cfg(test)");
+                    let module = (!self.in_test_mod)
+                        .then(|| field_text(node, "name", self.source))
+                        .flatten();
+                    self.modules.extend(module.clone());
                     for c in named_children(body) {
                         self.item(c);
                     }
+                    if module.is_some() {
+                        self.modules.pop();
+                    }
+                    self.in_test_mod = outer;
                 }
             }
             "use_declaration" => self.import(node),
@@ -705,6 +755,7 @@ impl Ctx<'_> {
                 alias: field_text(arg, "alias", src),
                 names: vec![],
                 line,
+                reexport: false,
             }),
             "scoped_use_list" => {
                 let names = arg
@@ -721,6 +772,7 @@ impl Ctx<'_> {
                     alias: None,
                     names,
                     line,
+                    reexport: false,
                 });
             }
             "use_list" => self.imports.push(Import {
@@ -731,12 +783,14 @@ impl Ctx<'_> {
                     .map(|n| collapse_ws(text(*n, src)))
                     .collect(),
                 line,
+                reexport: false,
             }),
             _ => self.imports.push(Import {
                 path: strip_ws(text(arg, src)),
                 alias: None,
                 names: vec![],
                 line,
+                reexport: false,
             }),
         }
     }
@@ -759,9 +813,19 @@ impl Adapter for RustAdapter {
             imports: vec![],
             domains: vec![],
             trait_impls: vec![],
+            in_test_mod: false,
+            modules: vec![],
         };
         for item in all_children(tree.root_node()) {
             ctx.item(item);
+        }
+        let mut initializers = Vec::new();
+        item_initializers(tree.root_node(), &mut initializers);
+        if let Some(m) = common::module_symbol(
+            common::analyze_nodes(&initializers, source, &SPEC),
+            common::line_count(source),
+        ) {
+            ctx.symbols.push(m);
         }
         for (ty, tr) in ctx.trait_impls {
             if let Some(s) = ctx

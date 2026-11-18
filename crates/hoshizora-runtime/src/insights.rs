@@ -1,12 +1,12 @@
 //! Runtime insights, merged with the static ones from `Index::static_insights`.
 //!
 //! Runtime data confirms and measures static candidates (Parallelisable, IoInLoop, Inefficient)
-//! and adds what only traces can show (HotPath, Waiting, NeverObserved). Output order: entries
-//! with runtime evidence, then static-only ones, then NeverObserved.
+//! and adds what only traces can show (HotPath, Waiting, NeverObserved on routes and jobs).
+//! Output order: entries with runtime evidence, then static-only ones, then NeverObserved.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use hoshizora_model::{EffectKind, Insight, NodeId, NodeKind, RuntimeSpan};
+use hoshizora_model::{EffectKind, EntrypointKind, Insight, NodeId, NodeKind, RuntimeSpan};
 
 use crate::NodeLookup;
 use crate::config::RuntimeConfig;
@@ -190,7 +190,14 @@ pub fn runtime_insights(
     if old_enough {
         let observed: HashSet<&NodeId> = stats.observed_nodes().collect();
         for node in lookup.nodes() {
-            if node.kind == NodeKind::Function && !node.dead && !observed.contains(&node.id) {
+            if node.kind == NodeKind::Function
+                && matches!(
+                    node.entrypoint,
+                    Some(EntrypointKind::HttpHandler | EntrypointKind::Job)
+                )
+                && !node.dead
+                && !observed.contains(&node.id)
+            {
                 out.push(Insight::NeverObserved {
                     node: node.id.clone(),
                 });
@@ -436,6 +443,20 @@ mod tests {
             rule: "rust.sqlx.query".into(),
         });
         db_call.effects.transitive.push(EffectKind::DbRead);
+        let mut never = node(
+            "fn:a.rs#never",
+            NodeKind::Function,
+            Some("a.rs"),
+            Some((80, 90)),
+        );
+        never.entrypoint = Some(EntrypointKind::HttpHandler);
+        let mut test = node(
+            "fn:a.rs#test_never",
+            NodeKind::Function,
+            Some("a.rs"),
+            Some((96, 99)),
+        );
+        test.entrypoint = Some(EntrypointKind::Test);
         FakeLookup {
             nodes: vec![
                 heavy,
@@ -445,12 +466,8 @@ mod tests {
                     Some("a.rs"),
                     Some((60, 70)),
                 ),
-                node(
-                    "fn:a.rs#never",
-                    NodeKind::Function,
-                    Some("a.rs"),
-                    Some((80, 90)),
-                ),
+                never,
+                test,
                 node(
                     "fn:a.rs#pure",
                     NodeKind::Function,
@@ -789,7 +806,10 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, Insight::NeverObserved { .. }))
             .collect();
-        assert_eq!(never.len(), 3);
+        assert!(
+            matches!(never.as_slice(), [Insight::NeverObserved { node }] if node == "fn:a.rs#never"),
+            "only unobserved routes and jobs: {never:?}"
+        );
         assert!(matches!(
             insights.last(),
             Some(Insight::NeverObserved { .. })

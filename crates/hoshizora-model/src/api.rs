@@ -173,12 +173,23 @@ pub struct Project {
     /// Ref the current graph was checked out at (`HEAD` of the remote when none is declared).
     #[serde(default)]
     pub indexed_ref: Option<String>,
-    /// Last `service.version` carried by spans routed to this project.
+    /// Newest `service.version` among `recent_versions`; the version the project follows.
     #[serde(default)]
     pub seen_version: Option<String>,
+    /// `service.version` values carried by spans routed to this project, with when each was
+    /// last seen; entries age out so a rollback is followed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_versions: Vec<SeenVersion>,
     /// Opt-in: the periodic remote check reindexes this git project when its ref moves.
     #[serde(default)]
     pub auto_refresh: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeenVersion {
+    pub version: String,
+    /// Unix seconds.
+    pub last_seen: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

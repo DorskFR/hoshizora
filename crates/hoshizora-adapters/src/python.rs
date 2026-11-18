@@ -374,6 +374,28 @@ fn visibility(name: &str) -> Visibility {
     }
 }
 
+/// Statements of a body, with those inside `if`/`for`/`while`/`with`/`try` blocks, so
+/// definitions nested in control flow are found; nested definitions are not entered.
+fn nested_statements(body: Node) -> Vec<Node> {
+    let mut out = Vec::new();
+    let mut pending: Vec<Node> = named_children(body).into_iter().rev().collect();
+    while let Some(node) = pending.pop() {
+        out.push(node);
+        if !matches!(
+            node.kind(),
+            "function_definition" | "class_definition" | "decorated_definition"
+        ) {
+            pending.extend(
+                named_children(node)
+                    .into_iter()
+                    .filter(|c| !c.kind().ends_with("expression") && c.kind() != "call")
+                    .rev(),
+            );
+        }
+    }
+    out
+}
+
 struct Ctx<'a> {
     source: &'a str,
     symbols: Vec<Symbol>,
@@ -401,7 +423,6 @@ impl<'a> Ctx<'a> {
             "function_definition" | "class_definition" => {
                 self.definition(node, parent, in_class, vec![]);
             }
-            "import_statement" | "import_from_statement" => self.import(node),
             "expression_statement" if parent.is_none() => {
                 let Some(a) = named_children(node)
                     .into_iter()
@@ -504,7 +525,7 @@ impl<'a> Ctx<'a> {
             self.domains.extend(enum_domain(node, self.source));
         }
         if let Some(body) = body {
-            for child in named_children(body) {
+            for child in nested_statements(body) {
                 self.statement(child, Some(&local_name), is_class);
             }
         }
@@ -529,6 +550,7 @@ impl<'a> Ctx<'a> {
                 alias: None,
                 names,
                 line,
+                reexport: false,
             });
             return;
         }
@@ -539,6 +561,7 @@ impl<'a> Ctx<'a> {
                     alias: field_text(n, "alias", src),
                     names: vec![],
                     line,
+                    reexport: false,
                 });
             } else {
                 self.imports.push(Import {
@@ -546,6 +569,7 @@ impl<'a> Ctx<'a> {
                     alias: None,
                     names: vec![],
                     line,
+                    reexport: false,
                 });
             }
         }
@@ -619,6 +643,14 @@ impl Adapter for PythonAdapter {
         };
         for stmt in all_children(tree.root_node()) {
             ctx.statement(stmt, None, false);
+        }
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "import_statement" | "import_from_statement") {
+                ctx.import(node);
+                continue;
+            }
+            pending.extend(named_children(node).into_iter().rev());
         }
         ctx.callable_bindings();
         let top: Vec<Node> = named_children(tree.root_node())

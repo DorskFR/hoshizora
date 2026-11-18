@@ -39,6 +39,7 @@ fn import(path: &str, names: &[&str]) -> Import {
         alias: None,
         names: names.iter().map(|s| (*s).to_owned()).collect(),
         line: 1,
+        reexport: false,
     }
 }
 
@@ -780,4 +781,37 @@ fn untyped_receivers_bind_only_distinctive_unique_methods() {
         typed.attrs.get("receiver_type").map(String::as_str),
         Some("Watchdog")
     );
+}
+
+#[test]
+fn esm_specifiers_with_an_extension_resolve_to_the_file_not_the_index() {
+    let idx = build(vec![
+        file(
+            "src/index.ts",
+            Language::TypeScript,
+            "src/index",
+            vec![import("./cli/run.js", &["run"])],
+            vec![func("start", 1, vec![call("run", 2)])],
+        ),
+        file(
+            "src/cli/run.ts",
+            Language::TypeScript,
+            "src/cli/run",
+            vec![import("./util.ts", &["helper"])],
+            vec![func("run", 1, vec![call("helper", 2)])],
+        ),
+        file(
+            "src/cli/util.ts",
+            Language::TypeScript,
+            "src/cli/util",
+            vec![],
+            vec![func("helper", 1, vec![])],
+        ),
+    ]);
+    let exact = |from: &str, to: &str| {
+        edge(&idx, from, to).is_some_and(|e| e.confidence == Confidence::Exact)
+    };
+    assert!(exact("fn:src/index.ts#start", "fn:src/cli/run.ts#run"));
+    assert!(exact("fn:src/cli/run.ts#run", "fn:src/cli/util.ts#helper"));
+    assert!(edge(&idx, "file:src/cli/run.ts", "file:src/cli/util.ts").is_some());
 }

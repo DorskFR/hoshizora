@@ -54,6 +54,7 @@ fn import(path: &str, names: &[&str]) -> Import {
         alias: None,
         names: names.iter().map(|s| (*s).to_owned()).collect(),
         line: 1,
+        reexport: false,
     }
 }
 

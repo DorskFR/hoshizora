@@ -409,6 +409,75 @@ fn has_method(object: Node) -> bool {
     })
 }
 
+/// Properties of an object literal that are not methods (`{ a: f(x), b: () => .. }` → `a`).
+fn data_values(object: Node) -> Vec<Node> {
+    named_children(object)
+        .into_iter()
+        .filter(|p| {
+            p.kind() == "pair"
+                && p.child_by_field_name("value")
+                    .is_some_and(|x| !FUNCS.contains(&x.kind()))
+        })
+        .collect()
+}
+
+/// The expression under `(x)`, `x as T`, `x satisfies T` and `x!`.
+fn unwrap_expr(node: Node) -> Node {
+    let mut cur = node;
+    while matches!(
+        cur.kind(),
+        "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression"
+    ) {
+        match cur.named_child(0) {
+            Some(inner) => cur = inner,
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Methods whose callback runs per element or on settlement, so the call's result is data:
+/// `xs.map(f)`, `p.then(f)`.
+const VALUE_METHODS: &[&str] = &[
+    "map",
+    "filter",
+    "reduce",
+    "flatMap",
+    "find",
+    "findIndex",
+    "findLast",
+    "some",
+    "every",
+    "sort",
+    "toSorted",
+    "forEach",
+    "then",
+    "catch",
+    "finally",
+    "replace",
+    "replaceAll",
+    "from",
+    "fromEntries",
+    "entries",
+    "keys",
+    "values",
+];
+
+/// An initializer call whose result is a value, not a function: Svelte runes (`$derived(..)`,
+/// `$state(..)`) and iteration or promise methods.
+fn value_call(call: Node, source: &str) -> bool {
+    let Some(func) = call.child_by_field_name("function") else {
+        return false;
+    };
+    text(func, source).starts_with('$')
+        || (func.kind() == "member_expression"
+            && field_text(func, "property", source)
+                .is_some_and(|p| VALUE_METHODS.contains(&p.as_str())))
+}
+
 /// A class field as a `Param`: its declared type, else the callee or constructor that
 /// initialises it (`useX()` → `useX()`, `new Store()` → `Store`).
 fn field(member: Node, source: &str) -> Option<Param> {
@@ -686,12 +755,27 @@ impl<'a> Ctx<'a> {
         match node.kind() {
             "export_statement" => {
                 if let Some(decl) = node.child_by_field_name("declaration") {
+                    let before = self.symbols.len();
                     self.statement(decl);
-                } else if let Some(v) = node.child_by_field_name("value")
-                    && FUNCS.contains(&v.kind())
-                {
-                    let name = field_text(v, "name", src).unwrap_or_else(|| "default".into());
-                    self.function(node, v, name, None, true, vec![]);
+                    if has_child_kind(node, "default") {
+                        for sym in self.symbols[before..]
+                            .iter_mut()
+                            .filter(|s| s.parent.is_none())
+                        {
+                            sym.attributes.push("export default".into());
+                        }
+                    }
+                } else if node.child_by_field_name("value").is_none() {
+                    self.reexport(node);
+                } else if let Some(v) = node.child_by_field_name("value") {
+                    let inner = unwrap_expr(v);
+                    if FUNCS.contains(&inner.kind()) {
+                        let name =
+                            field_text(inner, "name", src).unwrap_or_else(|| "default".into());
+                        self.function(node, inner, name, None, true, vec!["export default".into()]);
+                    } else if inner.kind() == "object" && has_method(inner) {
+                        self.object_methods(inner, "default", true);
+                    }
                 }
             }
             "function_declaration" | "generator_function_declaration" => {
@@ -706,12 +790,12 @@ impl<'a> Ctx<'a> {
                     let Some(name) = field_text(d, "name", src) else {
                         continue;
                     };
-                    match d.child_by_field_name("value") {
+                    match d.child_by_field_name("value").map(unwrap_expr) {
                         Some(v) if FUNCS.contains(&v.kind()) => {
                             self.bound.push(d.id());
                             self.function(outer, v, name, None, public, vec![]);
                         }
-                        Some(v) if v.kind() == "call_expression" => {
+                        Some(v) if v.kind() == "call_expression" && !value_call(v, src) => {
                             self.candidates.push((outer, d, v, name, public));
                         }
                         Some(v) if v.kind() == "object" && has_method(v) => {
@@ -848,6 +932,49 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// `export * from "x"`, `export { a, b as c } from "x"`, and `export { a }` of a name
+    /// imported earlier in the file.
+    fn reexport(&mut self, node: Node) {
+        let src = self.source;
+        let line = common::line(node);
+        let names: Vec<String> = child_of_kind(node, "export_clause")
+            .map(|c| {
+                named_children(c)
+                    .into_iter()
+                    .filter_map(|s| field_text(s, "name", src))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["*".to_owned()]);
+        if let Some(source) = node.child_by_field_name("source") {
+            self.imports.push(Import {
+                path: common::string_value(source, src, &[], &[]),
+                alias: None,
+                names,
+                line,
+                reexport: true,
+            });
+            return;
+        }
+        for name in names {
+            let Some(path) = self.imports.iter().find_map(|i| {
+                let bound = i.alias.as_deref() == Some(name.as_str())
+                    || i.names.iter().any(|n| {
+                        n == &name || n.rsplit_once(" as ").is_some_and(|(_, a)| a == name)
+                    });
+                (bound && !i.reexport).then(|| i.path.clone())
+            }) else {
+                continue;
+            };
+            self.imports.push(Import {
+                path,
+                alias: None,
+                names: vec![name],
+                line,
+                reexport: true,
+            });
+        }
+    }
+
     fn import(&mut self, node: Node) {
         let src = self.source;
         let path = node
@@ -864,11 +991,13 @@ impl<'a> Ctx<'a> {
                         alias = named_children(c).first().map(|n| text(*n, src).to_string())
                     }
                     "named_imports" => {
-                        names.extend(
-                            named_children(c)
-                                .into_iter()
-                                .filter_map(|s| field_text(s, "name", src)),
-                        );
+                        names.extend(named_children(c).into_iter().filter_map(|s| {
+                            let name = field_text(s, "name", src)?;
+                            Some(match field_text(s, "alias", src) {
+                                Some(alias) if alias != name => format!("{name} as {alias}"),
+                                _ => name,
+                            })
+                        }));
                     }
                     _ => {}
                 }
@@ -879,6 +1008,7 @@ impl<'a> Ctx<'a> {
             alias,
             names,
             line: common::line(node),
+            reexport: false,
         });
     }
 }
@@ -944,6 +1074,22 @@ impl<'a> Ctx<'a> {
             } else {
                 stmt
             };
+            if matches!(
+                target.kind(),
+                "class_declaration" | "abstract_class_declaration"
+            ) && let Some(body) = target.child_by_field_name("body")
+            {
+                for m in named_children(body) {
+                    match m.kind() {
+                        "public_field_definition" => out.extend(
+                            m.child_by_field_name("value")
+                                .filter(|v| !FUNCS.contains(&v.kind())),
+                        ),
+                        "class_static_block" => out.push(m),
+                        _ => {}
+                    }
+                }
+            }
             match target.kind() {
                 "function_declaration"
                 | "generator_function_declaration"
@@ -954,11 +1100,34 @@ impl<'a> Ctx<'a> {
                 | "enum_declaration"
                 | "import_statement"
                 | "comment" => {}
-                "export_statement" => {}
+                "export_statement" => {
+                    let Some(v) = target.child_by_field_name("value").map(unwrap_expr) else {
+                        continue;
+                    };
+                    if FUNCS.contains(&v.kind()) {
+                        continue;
+                    }
+                    if v.kind() == "object" && has_method(v) {
+                        out.extend(data_values(v));
+                    } else {
+                        out.push(v);
+                    }
+                }
                 "lexical_declaration" | "variable_declaration" => {
-                    out.extend(named_children(target).into_iter().filter(|d| {
-                        d.kind() == "variable_declarator" && !self.bound.contains(&d.id())
-                    }))
+                    for d in named_children(target)
+                        .into_iter()
+                        .filter(|d| d.kind() == "variable_declarator")
+                    {
+                        if !self.bound.contains(&d.id()) {
+                            out.push(d);
+                        } else if let Some(v) = d
+                            .child_by_field_name("value")
+                            .map(unwrap_expr)
+                            .filter(|v| v.kind() == "object")
+                        {
+                            out.extend(data_values(v));
+                        }
+                    }
                 }
                 _ => out.push(target),
             }
@@ -974,6 +1143,16 @@ impl TsAdapter {
             Flavor::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Flavor::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         }
+    }
+
+    /// Calls and references of a script made of bare expression statements.
+    pub(crate) fn expression_body(&self, source: &str) -> anyhow::Result<Body> {
+        let tree = common::parse_tree(&self.grammar(), source)?;
+        Ok(common::analyze_nodes(
+            &named_children(tree.root_node()),
+            source,
+            &SPEC,
+        ))
     }
 
     /// Parses `source` and appends its symbols/imports to `facts`.
@@ -992,6 +1171,8 @@ impl TsAdapter {
             ctx.statement(stmt);
         }
         ctx.callable_bindings();
+        ctx.imports
+            .extend(dynamic_imports(tree.root_node(), source));
         let module = ctx.body(&ctx.module_nodes(tree.root_node()));
         let mut handlers = vec![];
         ui_handlers(tree.root_node(), source, &mut handlers);
@@ -1003,6 +1184,124 @@ impl TsAdapter {
             common::merge_module_symbol(&mut facts.symbols, m);
         }
         Ok(())
+    }
+}
+
+/// `import('./x')` calls as imports, bound to what receives the module: `const m = await
+/// import(..)` and `.then((m) => ..)` alias it, `const { a } = ..` names `a`, and a method
+/// called on the result (`(await import('./x')).run()`, also through a wrapper call such as
+/// `load(import('./x'))`) names that method.
+fn dynamic_imports(root: Node, source: &str) -> Vec<Import> {
+    let mut out = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        pending.extend(named_children(node));
+        if node.kind() != "call_expression"
+            || node.child_by_field_name("function").map(|f| f.kind()) != Some("import")
+        {
+            continue;
+        }
+        let Some(path) = node
+            .child_by_field_name("arguments")
+            .and_then(|a| named_children(a).into_iter().next())
+            .filter(|a| STRINGS.contains(&a.kind()))
+            .map(|a| common::string_value(a, source, INTERP, &[]))
+        else {
+            continue;
+        };
+        let mut cur = node;
+        while let Some(p) = cur.parent() {
+            let through = match p.kind() {
+                "await_expression" | "parenthesized_expression" | "arguments" => true,
+                "call_expression" => p
+                    .child_by_field_name("arguments")
+                    .is_some_and(|a| a.id() == cur.id()),
+                _ => false,
+            };
+            if !through {
+                break;
+            }
+            cur = p;
+        }
+        let mut import = Import {
+            path,
+            alias: None,
+            names: vec![],
+            line: common::line(node),
+            reexport: false,
+        };
+        if let Some(p) = cur.parent() {
+            match p.kind() {
+                "member_expression" => {
+                    let prop = field_text(p, "property", source).unwrap_or_default();
+                    if prop == "then" {
+                        let callback = p
+                            .parent()
+                            .and_then(|c| c.child_by_field_name("arguments"))
+                            .and_then(|a| named_children(a).into_iter().next())
+                            .filter(|f| FUNCS.contains(&f.kind()));
+                        import.alias = callback
+                            .and_then(|f| params(f, source).into_iter().next())
+                            .map(|p| p.name);
+                        if let Some(stored) = callback
+                            .and_then(|f| f.child_by_field_name("body"))
+                            .map(unwrap_expr)
+                            .filter(|b| b.kind() == "assignment_expression")
+                            .filter(|b| field_text(*b, "right", source) == import.alias)
+                            .and_then(|b| b.child_by_field_name("left"))
+                            .filter(|l| l.kind() == "identifier")
+                        {
+                            out.push(Import {
+                                alias: Some(text(stored, source).to_owned()),
+                                ..import.clone()
+                            });
+                        }
+                    } else {
+                        import.names.push(prop);
+                    }
+                }
+                "variable_declarator" => {
+                    if let Some(target) = p.child_by_field_name("name") {
+                        bind_target(target, source, &mut import);
+                    }
+                }
+                "assignment_expression" => {
+                    if let Some(target) = p.child_by_field_name("left") {
+                        bind_target(target, source, &mut import);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(import);
+    }
+    out.sort_by_key(|i| i.line);
+    out
+}
+
+fn bind_target(target: Node, source: &str, import: &mut Import) {
+    match target.kind() {
+        "identifier" => import.alias = Some(text(target, source).to_owned()),
+        "object_pattern" => {
+            for p in named_children(target) {
+                match p.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        import.names.push(text(p, source).to_owned());
+                    }
+                    "pair_pattern" => {
+                        if let (Some(k), Some(v)) =
+                            (field_text(p, "key", source), field_text(p, "value", source))
+                        {
+                            import
+                                .names
+                                .push(if k == v { k } else { format!("{k} as {v}") });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 

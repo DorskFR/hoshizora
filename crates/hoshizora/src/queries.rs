@@ -19,7 +19,7 @@ pub trait GraphQueries: NodeLookup + 'static {
     fn entrypoints(&self) -> Vec<Node>;
     fn with_effect(&self, kind: EffectKind, target: Option<&str>) -> Vec<Node>;
     fn search(&self, query: &str, limit: usize) -> Vec<SearchHit>;
-    fn static_insights(&self) -> Vec<Insight>;
+    fn static_insights(&self, include_tests: bool) -> Vec<Insight>;
     fn states(&self, domain: Option<&str>) -> StatesReport;
 }
 
@@ -84,8 +84,8 @@ impl GraphQueries for GraphIndex {
     fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         self.0.search(query, limit)
     }
-    fn static_insights(&self) -> Vec<Insight> {
-        self.0.static_insights()
+    fn static_insights(&self, include_tests: bool) -> Vec<Insight> {
+        self.0.static_insights_with(include_tests)
     }
     fn states(&self, domain: Option<&str>) -> StatesReport {
         self.0.states(domain)

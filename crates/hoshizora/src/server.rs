@@ -615,9 +615,18 @@ async fn effects<Q: GraphQueries>(
     Ok(Json(state.queries.with_effect(kind, p.target.as_deref())))
 }
 
-async fn insights<Q: GraphQueries>(Proj(state): Proj<Q>) -> Json<Insights> {
+#[derive(Deserialize)]
+struct InsightsParams {
+    #[serde(default)]
+    include_tests: bool,
+}
+
+async fn insights<Q: GraphQueries>(
+    Proj(state): Proj<Q>,
+    Query(p): Query<InsightsParams>,
+) -> Json<Insights> {
     Json(Insights {
-        insights: all_insights(&state),
+        insights: all_insights(&state, p.include_tests),
     })
 }
 
@@ -633,8 +642,8 @@ async fn states<Q: GraphQueries>(
     Json(state.queries.states(p.domain.as_deref()))
 }
 
-pub fn all_insights<Q: GraphQueries>(state: &ProjectState<Q>) -> Vec<Insight> {
-    let statics = state.queries.static_insights();
+pub fn all_insights<Q: GraphQueries>(state: &ProjectState<Q>, include_tests: bool) -> Vec<Insight> {
+    let statics = state.queries.static_insights(include_tests);
     state
         .runtime()
         .insights(hoshizora_runtime::now_unix_nanos(), &statics)
@@ -1005,7 +1014,7 @@ mod tests {
         fn search(&self, _query: &str, _limit: usize) -> Vec<SearchHit> {
             vec![]
         }
-        fn static_insights(&self) -> Vec<Insight> {
+        fn static_insights(&self, _include_tests: bool) -> Vec<Insight> {
             vec![Insight::IoInLoop {
                 node: FN_ID.into(),
                 effect: "db_read".into(),
@@ -1094,6 +1103,7 @@ mod tests {
             tracked_ref: None,
             indexed_ref: None,
             seen_version: None,
+            recent_versions: Vec::new(),
             auto_refresh: false,
         }
     }
