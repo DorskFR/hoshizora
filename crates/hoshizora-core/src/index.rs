@@ -995,11 +995,43 @@ impl Index {
 
     fn blocking(&self, i: usize, info: &hoshizora_model::FunctionInfo, out: &mut Vec<Insight>) {
         let n = &self.graph.nodes[i];
+        let offloads: Vec<u32> = self.outgoing[i]
+            .iter()
+            .map(|&ei| &self.graph.edges[ei])
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .filter(|e| self.idx(&e.to).is_some_and(|t| self.offloads(t)))
+            .filter_map(|e| e.line)
+            .chain(
+                n.effects
+                    .direct
+                    .iter()
+                    .filter(|e| e.kind == EffectKind::Spawn && offload_primitive(&e.via))
+                    .map(|e| e.line),
+            )
+            .collect();
+        let awaited_lines: Vec<u32> = self.outgoing[i]
+            .iter()
+            .map(|&ei| &self.graph.edges[ei])
+            .filter(|e| e.awaited)
+            .filter_map(|e| e.line)
+            .chain(
+                n.effects
+                    .direct
+                    .iter()
+                    .filter(|e| e.awaited)
+                    .map(|e| e.line),
+            )
+            .collect();
+        let offloaded = |line: u32| {
+            offloads
+                .iter()
+                .any(|&w| w <= line && !awaited_lines.iter().any(|&a| w < a && a <= line))
+        };
         let mut reasons: Vec<String> = n
             .effects
             .direct
             .iter()
-            .filter(|e| e.kind == EffectKind::Blocking)
+            .filter(|e| e.kind == EffectKind::Blocking && !offloaded(e.line))
             .map(|e| {
                 format!(
                     "blocking call {} at line {} in async function",
@@ -1012,31 +1044,6 @@ impl Index {
             Some(hoshizora_model::Language::TypeScript | hoshizora_model::Language::JavaScript)
         );
         if info.is_async && !js {
-            let offloads: Vec<u32> = self.outgoing[i]
-                .iter()
-                .map(|&ei| &self.graph.edges[ei])
-                .filter(|e| e.kind == EdgeKind::Calls)
-                .filter(|e| self.idx(&e.to).is_some_and(|t| self.offloads(t)))
-                .filter_map(|e| e.line)
-                .collect();
-            let awaited_lines: Vec<u32> = self.outgoing[i]
-                .iter()
-                .map(|&ei| &self.graph.edges[ei])
-                .filter(|e| e.awaited)
-                .filter_map(|e| e.line)
-                .chain(
-                    n.effects
-                        .direct
-                        .iter()
-                        .filter(|e| e.awaited)
-                        .map(|e| e.line),
-                )
-                .collect();
-            let offloaded = |line: u32| {
-                offloads
-                    .iter()
-                    .any(|&w| w <= line && !awaited_lines.iter().any(|&a| w < a && a <= line))
-            };
             for &ei in &self.outgoing[i] {
                 let e = &self.graph.edges[ei];
                 if e.kind != EdgeKind::Calls
@@ -1048,13 +1055,7 @@ impl Index {
                 }
                 let Some(t) = self.idx(&e.to) else { continue };
                 let target = &self.graph.nodes[t];
-                let sync_callee = target.function.as_ref().is_some_and(|f| !f.is_async);
-                let blocks = target
-                    .effects
-                    .transitive
-                    .iter()
-                    .any(|k| matches!(k, EffectKind::Blocking | EffectKind::Sleep));
-                if sync_callee && blocks {
+                if self.sync_blocks(t, 6, &mut HashSet::new()) {
                     reasons.push(format!(
                         "blocking call in async context via {} at line {}",
                         target.name,
@@ -1073,23 +1074,45 @@ impl Index {
         }
     }
 
+    /// A sync function that blocks its caller: it sleeps or blocks without awaiting, or calls
+    /// a sync function that does. An awaited sleep in a sync function sits in an `async` block
+    /// it spawns or returns, so it does not block the caller.
+    fn sync_blocks(&self, t: usize, depth: u32, seen: &mut HashSet<usize>) -> bool {
+        let n = &self.graph.nodes[t];
+        let blocking = |k: &EffectKind| matches!(k, EffectKind::Blocking | EffectKind::Sleep);
+        if !seen.insert(t)
+            || n.function.as_ref().is_none_or(|f| f.is_async)
+            || !n.effects.transitive.iter().any(blocking)
+        {
+            return false;
+        }
+        if depth == 0
+            || n.effects
+                .direct
+                .iter()
+                .any(|e| blocking(&e.kind) && !e.awaited)
+        {
+            return true;
+        }
+        self.outgoing[t]
+            .iter()
+            .map(|&ei| &self.graph.edges[ei])
+            .filter(|e| e.kind == EdgeKind::Calls && !e.attrs.contains_key("ref") && !e.awaited)
+            .filter(|e| plausible_call(e))
+            .filter_map(|e| self.idx(&e.to))
+            .any(|u| self.sync_blocks(u, depth - 1, seen))
+    }
+
     /// An async function that hands its work to a blocking thread pool (`spawn_blocking`,
     /// `block_in_place`, `asyncio.to_thread`), so the closure its callers pass runs off the
     /// async threads.
     fn offloads(&self, t: usize) -> bool {
         let n = &self.graph.nodes[t];
         n.function.as_ref().is_some_and(|f| f.is_async)
-            && n.effects.direct.iter().any(|e| {
-                e.kind == EffectKind::Spawn
-                    && [
-                        "spawn_blocking",
-                        "block_in_place",
-                        "to_thread",
-                        "run_in_executor",
-                    ]
-                    .iter()
-                    .any(|p| e.via.ends_with(p))
-            })
+            && n.effects
+                .direct
+                .iter()
+                .any(|e| e.kind == EffectKind::Spawn && offload_primitive(&e.via))
     }
 
     /// Loops nested three deep in the function itself, a loop over a collection nested in a
@@ -1124,6 +1147,17 @@ impl Index {
             });
         }
     }
+}
+
+fn offload_primitive(via: &str) -> bool {
+    [
+        "spawn_blocking",
+        "block_in_place",
+        "to_thread",
+        "run_in_executor",
+    ]
+    .iter()
+    .any(|p| via.ends_with(p))
 }
 
 const IO_KINDS: &[EffectKind] = &[

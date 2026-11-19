@@ -91,3 +91,80 @@ def lines_of(paths):
             for line in f:
                 out.append([c for c in line.split(",") if c])
     return out
+
+
+GAP = 3
+
+
+def near_matches(words, keys):
+    hits = 0
+    for at in range(len(words)):
+        limit = at if not keys else min(len(words) - 1, at + GAP)
+        for k in keys:
+            if any(words[i] == k for i in range(at, limit + 1)):
+                hits += 1
+    return hits
+
+
+def pair_legs(stops, route):
+    out = []
+    for a in stops:
+        for b in stops:
+            legs = [route(a, b)] + ([route(b, a)] if a != b else [])
+            for leg in legs:
+                out.append(leg)
+    return out
+
+
+def ring_hits(lines, points, rings=(1.0, 2.0, 4.0)):
+    hits = 0
+    for line in lines:
+        for r in rings:
+            for p in points:
+                if line.near(p, r):
+                    hits += 1
+    return hits
+
+
+def by_role(actors, roles_of, clips_of):
+    out = []
+    for actor in actors:
+        for role in roles_of[actor]:
+            for clip in clips_of[role]:
+                out.append((actor, clip))
+    return out
+
+
+def run_edges(rows):
+    n = 0
+    for row in rows:
+        edges = [c for c in row if c > 0]
+        for a in edges:
+            for b in edges:
+                n += a * b
+    return n
+
+
+def later_pairs(xs):
+    n = 0
+    for i in range(len(xs)):
+        for y in xs[i + 1 :]:
+            n += xs[i] * y
+    return n
+
+
+def against_seen(xs):
+    seen = [xs[0]]
+    n = 0
+    for x in xs:
+        for s in seen:
+            n += x * s
+        seen.append(x)
+    return n
+
+
+def halves(xs):
+    if len(xs) <= 1:
+        return [xs]
+    left, right = xs[: len(xs) // 2], xs[len(xs) // 2 :]
+    return halves(left) + halves(right)

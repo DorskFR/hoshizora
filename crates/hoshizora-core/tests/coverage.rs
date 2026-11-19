@@ -102,8 +102,9 @@ fn signals_per_location_and_aggregates() {
     head.write("src/main.rs", MAIN)
         .write("src/db.rs", DB_HEAD)
         .write("src/handlers.rs", HANDLERS_HEAD);
+    let base_index = base.index();
     let head_index = head.index();
-    let report = diff(&base.index(), &head_index);
+    let report = diff(&base_index, &head_index);
     assert_eq!(
         report.functions.modified,
         vec!["fn:src/handlers.rs#recompute"]
@@ -116,6 +117,7 @@ fn signals_per_location_and_aggregates() {
     };
     let case = coverage::evaluate(
         "planted",
+        &base_index,
         &head_index,
         &report,
         &[
@@ -147,12 +149,14 @@ fn signals_per_location_and_aggregates() {
     assert!(caller.impact_full, "{caller:?}");
     assert!(caller.impact_shown, "{caller:?}");
     assert!(caller.effects, "{caller:?}");
+    assert!(caller.callers && !caller.dangling, "{caller:?}");
     let orphan = by_line(13, "src/handlers.rs");
     assert_eq!(
         orphan.function.as_deref(),
         Some("fn:src/handlers.rs#orphan")
     );
     assert!(!orphan.changed && !orphan.impact_full && !orphan.effects && !orphan.states);
+    assert!(!orphan.callers && !orphan.callees);
     let outside = by_line(1, "src/handlers.rs");
     assert!(outside.function.is_none());
 
@@ -175,6 +179,10 @@ fn signals_per_location_and_aggregates() {
     let text = coverage::table(&report);
     assert!(text.contains("planted"), "{text}");
     assert!(text.contains("impact_full"), "{text}");
+    assert!(
+        text.contains("dangling") && text.contains("callees"),
+        "{text}"
+    );
     serde_json::to_string(&report).unwrap();
 }
 
@@ -190,8 +198,9 @@ fn top_level_code_is_outside_any_function() {
         "app.py",
         "import os\nLIMIT = 3\nos.getenv(\"B\")\n\n\ndef run():\n    return LIMIT\n",
     );
+    let base_index = base.index();
     let head_index = head.index();
-    let report = diff(&base.index(), &head_index);
+    let report = diff(&base_index, &head_index);
     assert_eq!(report.functions.modified, vec!["fn:app.py#<module>"]);
     assert_eq!(
         head_index.function_at("app.py", 2).map(|n| n.id.as_str()),
@@ -200,6 +209,7 @@ fn top_level_code_is_outside_any_function() {
 
     let case = coverage::evaluate(
         "module",
+        &base_index,
         &head_index,
         &report,
         &[

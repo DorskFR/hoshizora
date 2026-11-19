@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::diff::DiffReport;
+use crate::diff::{self, DiffReport};
 use crate::index::{DEFAULT_FLOW_KINDS, Index};
 
 pub const SIGNALS: &[&str] = &[
@@ -14,6 +14,9 @@ pub const SIGNALS: &[&str] = &[
     "impact_full",
     "effects",
     "states",
+    "dangling",
+    "callers",
+    "callees",
 ];
 
 /// A review correction, in head coordinates. `in_diff` marks locations inside the PR's own
@@ -42,6 +45,16 @@ pub struct LocationResult {
     pub effects: bool,
     /// Inside a function with a state finding, or within three lines of one.
     pub states: bool,
+    /// In a function with a dangling call, or inside the type or file the callee was
+    /// expected in.
+    #[serde(default)]
+    pub dangling: bool,
+    /// A direct caller of a changed function.
+    #[serde(default)]
+    pub callers: bool,
+    /// Called by a changed function at a call site the change introduced or rewrote.
+    #[serde(default)]
+    pub callees: bool,
 }
 
 /// Distinct head functions each signal covers.
@@ -52,6 +65,13 @@ pub struct SetSizes {
     pub impact_full: usize,
     pub effects: usize,
     pub states: usize,
+    /// Dangling calls reported, not functions.
+    #[serde(default)]
+    pub dangling: usize,
+    #[serde(default)]
+    pub callers: usize,
+    #[serde(default)]
+    pub callees: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,17 +117,23 @@ struct Sets {
     effects: HashSet<String>,
     states: HashSet<String>,
     state_lines: Vec<(String, u32)>,
+    dangling: HashSet<String>,
+    /// File and line span of each type or file a dangling callee was expected in.
+    dangling_owners: Vec<(String, u32, u32)>,
+    callers: HashSet<String>,
+    callees: HashSet<String>,
 }
 
 const STATE_NEAR_LINES: u32 = 3;
 
 pub fn evaluate(
     name: &str,
+    base: &Index,
     head: &Index,
     report: &DiffReport,
     locations: &[Location],
 ) -> CaseResult {
-    let sets = signal_sets(head, report);
+    let sets = signal_sets(base, head, report);
     let locations = locations
         .iter()
         .map(|loc| {
@@ -127,6 +153,12 @@ pub fn evaluate(
                 impact_full: has(&sets.impact_full),
                 effects: has(&sets.effects),
                 states: has(&sets.states) || near_state,
+                dangling: has(&sets.dangling)
+                    || sets.dangling_owners.iter().any(|(file, start, end)| {
+                        *file == loc.file && (*start..=*end).contains(&loc.line)
+                    }),
+                callers: has(&sets.callers),
+                callees: has(&sets.callees),
                 function,
             }
         })
@@ -139,12 +171,15 @@ pub fn evaluate(
             impact_full: sets.impact_full.len(),
             effects: sets.effects.len(),
             states: sets.states.len(),
+            dangling: report.dangling.len(),
+            callers: sets.callers.len(),
+            callees: sets.callees.len(),
         },
         locations,
     }
 }
 
-fn signal_sets(head: &Index, report: &DiffReport) -> Sets {
+fn signal_sets(base: &Index, head: &Index, report: &DiffReport) -> Sets {
     let changed: HashSet<String> = report
         .functions
         .added
@@ -186,6 +221,26 @@ fn signal_sets(head: &Index, report: &DiffReport) -> Sets {
             state_lines.push((file, site.line));
         }
     }
+    let dangling = report.dangling.iter().map(|d| d.function.clone()).collect();
+    let dangling_owners = report
+        .dangling
+        .iter()
+        .filter_map(|d| head.node(d.owner.as_deref()?))
+        .filter_map(|n| Some((n.file.clone()?, n.span?)))
+        .map(|(file, span)| (file, span.start_line, span.end_line))
+        .collect();
+    let callers = report
+        .callers
+        .values()
+        .flatten()
+        .filter(|id| !changed.contains(*id))
+        .cloned()
+        .collect();
+    let callees = diff::callees(base, head, report)
+        .into_values()
+        .flatten()
+        .filter(|id| !changed.contains(id))
+        .collect();
     Sets {
         changed,
         impact_shown,
@@ -193,6 +248,10 @@ fn signal_sets(head: &Index, report: &DiffReport) -> Sets {
         effects,
         states,
         state_lines,
+        dangling,
+        dangling_owners,
+        callers,
+        callees,
     }
 }
 
@@ -284,6 +343,9 @@ fn hit(l: &LocationResult, signal: &str) -> bool {
         "impact_full" => l.impact_full,
         "effects" => l.effects,
         "states" => l.states,
+        "dangling" => l.dangling,
+        "callers" => l.callers,
+        "callees" => l.callees,
         _ => false,
     }
 }
@@ -295,6 +357,9 @@ fn size(s: &SetSizes, signal: &str) -> usize {
         "impact_full" => s.impact_full,
         "effects" => s.effects,
         "states" => s.states,
+        "dangling" => s.dangling,
+        "callers" => s.callers,
+        "callees" => s.callees,
         _ => 0,
     }
 }
@@ -313,28 +378,36 @@ fn stats(sorted: &[usize]) -> SizeStats {
 }
 
 pub fn table(report: &Report) -> String {
+    const COLUMNS: [(&str, &str); 8] = [
+        ("changed", "changed"),
+        ("impact_shown", "shown"),
+        ("impact_full", "full"),
+        ("effects", "effects"),
+        ("states", "states"),
+        ("dangling", "dangling"),
+        ("callers", "callers"),
+        ("callees", "callees"),
+    ];
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:<24} {:>5} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
-        "case", "locs", "ood", "changed", "shown", "full", "effects", "states"
-    ));
+    out.push_str(&format!("{:<24} {:>5} {:>5}", "case", "locs", "ood"));
+    for (_, title) in COLUMNS {
+        out.push_str(&format!(" {title:>8}"));
+    }
+    out.push('\n');
     for c in &report.cases {
         let ood: Vec<&LocationResult> = c.locations.iter().filter(|l| !l.in_diff).collect();
-        let cell = |signal: &str| {
-            let hits = ood.iter().filter(|l| hit(l, signal)).count();
-            format!("{hits}/{}|{}", ood.len(), size(&c.sets, signal))
-        };
         out.push_str(&format!(
-            "{:<24} {:>5} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
+            "{:<24} {:>5} {:>5}",
             truncate(&c.name, 24),
             c.locations.len(),
-            ood.len(),
-            cell("changed"),
-            cell("impact_shown"),
-            cell("impact_full"),
-            cell("effects"),
-            cell("states"),
+            ood.len()
         ));
+        for (signal, _) in COLUMNS {
+            let hits = ood.iter().filter(|l| hit(l, signal)).count();
+            let cell = format!("{hits}/{}|{}", ood.len(), size(&c.sets, signal));
+            out.push_str(&format!(" {cell:>8}"));
+        }
+        out.push('\n');
     }
     let s = &report.summary;
     out.push_str(&format!(

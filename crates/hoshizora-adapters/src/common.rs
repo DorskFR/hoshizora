@@ -363,6 +363,19 @@ pub fn analyze_nodes_with(
         bound: Vec::new(),
         iterated: Vec::new(),
         guards: Vec::new(),
+        small: nodes
+            .first()
+            .map(|n| literal_defaults(*n, source, spec))
+            .unwrap_or_default(),
+        near: HashMap::new(),
+        parts: Vec::new(),
+        grown: {
+            let mut g = Vec::new();
+            for n in nodes {
+                grown(*n, source, &mut g);
+            }
+            g
+        },
     };
     for child in nodes {
         walk(*child, source, spec, State::default(), &mut out, &mut scope);
@@ -511,6 +524,15 @@ struct Scope<'a> {
     iterated: Vec<String>,
     /// Identifiers read by the conditions of the enclosing branches.
     guards: Vec<String>,
+    /// Locals holding a few items: a short literal list, a stencil built from a window, a
+    /// parameter defaulting to a literal tuple.
+    small: Vec<String>,
+    /// Locals a fixed reach past a point (`limit = min(n, at + GAP)`), with that point.
+    near: HashMap<String, String>,
+    /// Locals holding a part of a value (`let (a, b) = xs.split_at(mid)`, `left = xs[:mid]`).
+    parts: Vec<String>,
+    /// Locals the body grows (`xs.append(..)`, `xs += ..`): never small.
+    grown: Vec<String>,
 }
 
 fn walk(
@@ -536,7 +558,7 @@ fn walk(
         if let Some(it) = iterable {
             scope.headers.insert(it.id(), st);
         }
-        if !bounded_loop(node, pattern, iterable, source, spec, &scope.bound) {
+        if !bounded_loop(node, pattern, iterable, source, spec, scope) {
             st.loop_depth += 1;
             out.max_loop_depth = out.max_loop_depth.max(st.loop_depth);
             if let Some(base) = iterable
@@ -562,7 +584,7 @@ fn walk(
         && let Some(value) = node
             .child_by_field_name("value")
             .or_else(|| node.child_by_field_name("right"))
-        && (root_ident(unwrap_iterable(value, source), source)
+        && (root_ident(unwrap_iterable(comprehended(value), source), source)
             .is_some_and(|r| scope.bound.contains(&r))
             || keyed_by(value, source, spec, &scope.bound))
     {
@@ -576,6 +598,14 @@ fn walk(
             .is_some_and(|r| scope.bound.contains(&r))
     {
         pattern_names(target, source, spec.idents, &mut scope.bound);
+    }
+    if let Some((_, field)) = spec.binders.iter().find(|(k, _)| *k == kind)
+        && let Some(target) = node.child_by_field_name(field)
+        && let Some(value) = node
+            .child_by_field_name("value")
+            .or_else(|| node.child_by_field_name("right"))
+    {
+        track_local(kind, target, value, source, spec, scope);
     }
     if spec.closures.contains(&kind) {
         out.closures += 1;
@@ -628,7 +658,11 @@ fn walk(
         call.on_part = node
             .child_by_field_name("arguments")
             .and_then(|a| a.named_child(0))
-            .is_some_and(|a| PART_KINDS.contains(&a.kind()));
+            .is_some_and(|a| {
+                PART_KINDS.contains(&a.kind())
+                    || (spec.idents.contains(&a.kind())
+                        && scope.parts.iter().any(|p| p == text(a, source)))
+            });
         out.calls.push(call);
         if let Some(expand) = spec.expand {
             for mut c in expand(node, source) {
@@ -761,8 +795,9 @@ fn bounded_loop(
     iterable: Option<Node>,
     source: &str,
     spec: &BodySpec,
-    bound: &[String],
+    scope: &Scope,
 ) -> bool {
+    let bound = scope.bound.as_slice();
     let body = node
         .child_by_field_name("body")
         .map_or("", |b| text(b, source));
@@ -795,6 +830,9 @@ fn bounded_loop(
         })
         .filter(|c| c.kind() != "let_condition")
     {
+        if c_style_bounded(node, cond, source, scope) {
+            return true;
+        }
         let cond = text(cond, source);
         if retry_named(cond) || small_bound(cond) {
             return true;
@@ -813,8 +851,11 @@ fn bounded_loop(
     }
     let base = unwrap_iterable(it, source);
     if constant_iterable(base, source)
+        || (spec.idents.contains(&base.kind())
+            && scope.small.iter().any(|s| s == text(base, source)))
         || retry_named(last_segment(&strip_ws(text(base, source))).as_str())
         || window(base, source)
+        || reach_range(base, source, &scope.near)
         || (!is_range(base, source) && keyed_by(base, source, spec, bound))
         || part_indices(base, source, spec, bound)
     {
@@ -848,11 +889,10 @@ static CAPPED: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 
-/// `range(x - r, x + r + 1)`, `range(-r, r + 1)`, `x - r..=x + r`: a window of fixed reach
-/// around a point.
-fn window(node: Node, source: &str) -> bool {
+/// The two ends of `range(a, b)` / `a..b`, as written without whitespace.
+fn range_ends(node: Node, source: &str) -> Option<(String, String)> {
     if !is_range(node, source) {
-        return false;
+        return None;
     }
     let ends: Vec<String> = match node.child_by_field_name("arguments") {
         Some(args) => named_children(args),
@@ -861,7 +901,16 @@ fn window(node: Node, source: &str) -> bool {
     .into_iter()
     .map(|e| strip_ws(text(e, source)))
     .collect();
-    let [start, end] = ends.as_slice() else {
+    match <[String; 2]>::try_from(ends) {
+        Ok([start, end]) => Some((start, end)),
+        Err(_) => None,
+    }
+}
+
+/// `range(x - r, x + r + 1)`, `range(-r, r + 1)`, `x - r..=x + r`: a window of fixed reach
+/// around a point.
+fn window(node: Node, source: &str) -> bool {
+    let Some((start, end)) = range_ends(node, source) else {
         return false;
     };
     let Some((at, reach)) = start.rsplit_once('-') else {
@@ -872,7 +921,364 @@ fn window(node: Node, source: &str) -> bool {
     } else {
         format!("{at}+")
     };
-    !reach.is_empty() && (end == &format!("{at}{reach}") || end == &format!("{at}{reach}+1"))
+    !reach.is_empty() && (end == format!("{at}{reach}") || end == format!("{at}{reach}+1"))
+}
+
+/// `range(at, at + GAP)`, `range(at, limit + 1)` with `limit = min(n, at + GAP)`: a constant
+/// reach past the start.
+fn reach_range(node: Node, source: &str, near: &HashMap<String, String>) -> bool {
+    range_ends(node, source).is_some_and(|(start, end)| reaches(&start, &end, near))
+}
+
+fn reaches(start: &str, end: &str, near: &HashMap<String, String>) -> bool {
+    let end = end
+        .strip_suffix("+1")
+        .or_else(|| end.strip_suffix("-1"))
+        .unwrap_or(end);
+    anchor_of(end).or_else(|| near.get(end).cloned()).as_deref() == Some(start)
+}
+
+/// `at + GAP`, `min(n, at + GAP)`, `Math.min(n - 1, at + 3)`, `(at + K).min(n)` → `at`.
+fn anchor_of(t: &str) -> Option<String> {
+    let t = t
+        .strip_suffix("+1")
+        .or_else(|| t.strip_suffix("-1"))
+        .unwrap_or(t);
+    let args: Vec<&str> = if let Some(inner) = ["min(", "Math.min(", "cmp::min(", "std::cmp::min("]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        top_level_args(inner)
+    } else if let Some((recv, _)) = t.split_once(".min(") {
+        vec![recv]
+    } else {
+        vec![t]
+    };
+    args.into_iter().find_map(|a| {
+        let a = a.trim_start_matches('(').trim_end_matches(')');
+        REACH.captures(a).map(|c| c[1].to_owned())
+    })
+}
+
+/// [`anchor_of`], also through a choice between the point and a reach past it
+/// (`at if k == 0 else min(n, at + GAP)`).
+fn anchor_value(node: Node, source: &str) -> Option<String> {
+    let branches = match node.kind() {
+        "conditional_expression" => {
+            let items = named_children(node);
+            (items.len() == 3).then(|| [items[0], items[2]])
+        }
+        "ternary_expression" => node
+            .child_by_field_name("consequence")
+            .zip(node.child_by_field_name("alternative"))
+            .map(|(a, b)| [a, b]),
+        _ => return anchor_of(&strip_ws(text(node, source))),
+    }?;
+    let [a, b] = branches.map(|n| strip_ws(text(n, source)));
+    match (anchor_of(&a), anchor_of(&b)) {
+        (Some(x), Some(y)) if x == y => Some(x),
+        (Some(x), None) if x == b => Some(x),
+        (None, Some(y)) if y == a => Some(y),
+        _ => None,
+    }
+}
+
+/// `x + 3`, `at + MAX_GAP`.
+static REACH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([A-Za-z_][\w.]*)\+([A-Z][A-Z0-9_]*|\d+)$").expect("valid regex")
+});
+
+fn top_level_args(t: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut from) = (0i32, 0);
+    for (i, c) in t.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&t[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&t[from..]);
+    out
+}
+
+/// A C-style loop that walks a part of an enclosing loop's item (`c < buffer.channels`,
+/// `i < row.len()`) or a constant reach past its start (`i = at; i <= limit`).
+fn c_style_bounded(node: Node, cond: Node, source: &str, scope: &Scope) -> bool {
+    let cond = if cond.kind() == "expression_statement" {
+        match cond.named_child(0) {
+            Some(c) => c,
+            None => return false,
+        }
+    } else {
+        cond
+    };
+    let (Some(var), Some(op), Some(rhs)) = (
+        cond.child_by_field_name("left"),
+        cond.child_by_field_name("operator"),
+        cond.child_by_field_name("right"),
+    ) else {
+        return false;
+    };
+    if !matches!(text(op, source), "<" | "<=") {
+        return false;
+    }
+    if (PART_KINDS.contains(&rhs.kind()) || rhs.kind().contains("call"))
+        && root_ident(rhs, source)
+            .is_some_and(|r| r != "self" && r != "this" && scope.bound.contains(&r))
+    {
+        return true;
+    }
+    let init = node.child_by_field_name("initializer").or_else(|| {
+        child_of_kind(node, "for_clause").and_then(|c| c.child_by_field_name("initializer"))
+    });
+    init.and_then(|i| initial_value(i, text(var, source), source))
+        .is_some_and(|start| reaches(&start, &strip_ws(text(rhs, source)), &scope.near))
+}
+
+/// The value `name` starts at in a loop initializer (`let i = at`, `i := at`).
+fn initial_value(node: Node, name: &str, source: &str) -> Option<String> {
+    let target = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("left"));
+    let value = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("right"));
+    if let (Some(t), Some(v)) = (target, value)
+        && strip_ws(text(t, source)) == name
+    {
+        return Some(strip_ws(text(v, source)));
+    }
+    named_children(node)
+        .into_iter()
+        .find_map(|c| initial_value(c, name, source))
+}
+
+/// Records what a binding makes of its names: a small collection, a fixed reach past a point,
+/// or a part of a value.
+fn track_local(
+    kind: &str,
+    target: Node,
+    value: Node,
+    source: &str,
+    spec: &BodySpec,
+    scope: &mut Scope,
+) {
+    let mut names = Vec::new();
+    pattern_names(target, source, spec.idents, &mut names);
+    let plain = !kind.contains("augmented") && !kind.contains("compound");
+    let small = plain && small_value(value, source);
+    let part = plain && part_value(value, source);
+    let anchor = (plain && names.len() == 1)
+        .then(|| anchor_value(value, source))
+        .flatten();
+    for n in names {
+        let small = small && !scope.grown.contains(&n);
+        scope.small.retain(|s| *s != n);
+        scope.parts.retain(|s| *s != n);
+        if small {
+            scope.small.push(n.clone());
+        }
+        if part {
+            scope.parts.push(n.clone());
+        }
+        match &anchor {
+            Some(a) => scope.near.insert(n, a.clone()),
+            None => scope.near.remove(&n),
+        };
+    }
+}
+
+const LITERAL_KINDS: &[&str] = &[
+    "array_expression",
+    "tuple_expression",
+    "array",
+    "list",
+    "tuple",
+    "set",
+];
+
+/// A literal of at most [`SMALL_BOUND`] items (or a concatenation or choice of such), a
+/// stencil collected from a window, or a comprehension over windows and constants.
+fn small_value(node: Node, source: &str) -> bool {
+    small_or_empty(node, source) && !named_children(node).is_empty()
+}
+
+fn small_or_empty(node: Node, source: &str) -> bool {
+    let items = named_children(node);
+    match node.kind() {
+        "parenthesized_expression" => items.len() == 1 && small_or_empty(items[0], source),
+        k if LITERAL_KINDS.contains(&k) => {
+            items.len() <= SMALL_BOUND as usize
+                && node.child_by_field_name("length").is_none()
+                && !items.iter().any(|i| {
+                    matches!(
+                        i.kind(),
+                        "list_splat" | "spread_element" | "dictionary_splat"
+                    )
+                })
+        }
+        "binary_operator" | "binary_expression" => {
+            node.child_by_field_name("operator")
+                .is_some_and(|o| text(o, source) == "+")
+                && items.len() == 2
+                && items.iter().all(|i| small_or_empty(*i, source))
+        }
+        "conditional_expression" => {
+            items.len() == 3 && small_or_empty(items[0], source) && small_or_empty(items[2], source)
+        }
+        "ternary_expression" => ["consequence", "alternative"].iter().all(|f| {
+            node.child_by_field_name(f)
+                .is_some_and(|b| small_or_empty(b, source))
+        }),
+        k if k.ends_with("comprehension") || k == "generator_expression" => {
+            let clauses: Vec<Node> = items
+                .into_iter()
+                .filter(|c| c.kind() == "for_in_clause")
+                .collect();
+            !clauses.is_empty()
+                && clauses.iter().all(|c| {
+                    c.child_by_field_name("right").is_some_and(|it| {
+                        let it = unwrap_iterable(it, source);
+                        window(it, source) || constant_iterable(it, source)
+                    })
+                })
+        }
+        k if k.contains("call") => {
+            let base = chain_base(node);
+            base.id() != node.id() && window(base, source)
+        }
+        _ => false,
+    }
+}
+
+/// The value a method chain starts from: `(-r..=r).flat_map(..).collect()` → `-r..=r`.
+fn chain_base(mut node: Node) -> Node {
+    loop {
+        let next = match node.kind() {
+            "parenthesized_expression" | "reference_expression" | "await_expression" => {
+                named_children(node).pop()
+            }
+            k if k.contains("call") => node.child_by_field_name("function").and_then(|f| {
+                f.child_by_field_name("value")
+                    .or_else(|| f.child_by_field_name("object"))
+            }),
+            _ => None,
+        };
+        match next {
+            Some(n) => node = n,
+            None => return node,
+        }
+    }
+}
+
+/// `xs[:mid]`, `&xs[..mid]`, `(xs[:m], xs[m:])`, `xs.split_at(mid)`: a part of a value.
+fn part_value(node: Node, source: &str) -> bool {
+    match node.kind() {
+        "reference_expression" | "parenthesized_expression" => named_children(node)
+            .pop()
+            .is_some_and(|n| part_value(n, source)),
+        "subscript" | "subscript_expression" | "index_expression" | "slice_expression" => true,
+        "expression_list" | "tuple" | "tuple_expression" => {
+            let items = named_children(node);
+            !items.is_empty() && items.iter().all(|i| part_value(*i, source))
+        }
+        k if k.contains("call") => node.child_by_field_name("function").is_some_and(|f| {
+            matches!(
+                last_segment(&strip_ws(text(f, source))).as_str(),
+                "split_at" | "split_at_mut" | "split_first" | "split_last"
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Parameters defaulting to a short literal (`rings=(35.0, 50.0, 70.0)`) of the function
+/// whose body starts at `first`.
+fn literal_defaults(first: Node, source: &str, spec: &BodySpec) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = first.parent();
+    for _ in 0..3 {
+        let Some(n) = cur else { break };
+        if let Some(params) = n.child_by_field_name("parameters") {
+            for p in named_children(params) {
+                if let (Some(v), Some(name)) = (
+                    p.child_by_field_name("value"),
+                    p.child_by_field_name("name")
+                        .or_else(|| p.child_by_field_name("pattern")),
+                ) && small_value(v, source)
+                {
+                    pattern_names(name, source, spec.idents, &mut out);
+                }
+            }
+            break;
+        }
+        cur = n.parent();
+    }
+    out
+}
+
+/// Names a body grows in place: receivers of `append`/`push`/`extend`/`insert`/`add`, and
+/// targets of `+=`.
+fn grown(node: Node, source: &str, out: &mut Vec<String>) {
+    let k = node.kind();
+    if k.contains("call")
+        && let Some(f) = node.child_by_field_name("function")
+        && let Some(obj) = f
+            .child_by_field_name("value")
+            .or_else(|| f.child_by_field_name("object"))
+            .or_else(|| f.child_by_field_name("operand"))
+        && matches!(
+            last_segment(&strip_ws(text(f, source))).as_str(),
+            "append"
+                | "appendleft"
+                | "push"
+                | "push_back"
+                | "push_front"
+                | "unshift"
+                | "extend"
+                | "insert"
+                | "add"
+                | "update"
+        )
+        && let Some(r) = root_ident(obj, source)
+    {
+        out.push(r);
+    }
+    if (k.contains("augmented") || k.contains("compound"))
+        && let Some(t) = node.child_by_field_name("left")
+        && let Some(r) = root_ident(t, source)
+    {
+        out.push(r);
+    }
+    for c in named_children(node) {
+        grown(c, source, out);
+    }
+}
+
+/// The index of `m[k]`.
+fn subscript_index(node: Node) -> Option<Node> {
+    match node.kind() {
+        "subscript" => node.child_by_field_name("subscript"),
+        "subscript_expression" | "index_expression" => node
+            .child_by_field_name("index")
+            .or_else(|| node.named_child(1)),
+        _ => None,
+    }
+}
+
+/// The iterated expression of a comprehension, else the expression itself.
+fn comprehended(node: Node) -> Node {
+    if node.kind().ends_with("comprehension") || node.kind() == "generator_expression" {
+        loop_parts(node).1.unwrap_or(node)
+    } else {
+        node
+    }
 }
 
 /// `range(len(row))`, `range(min(len(a), len(b)))`, `0..item.len()`: the indices of a part of
@@ -892,13 +1298,22 @@ fn part_indices(node: Node, source: &str, spec: &BodySpec, bound: &[String]) -> 
         })
 }
 
-/// A call outside any closure whose arguments read only names the enclosing loops bound:
-/// `ctx.groups_of(c.id)`, `repo.copies(*id, hash).await?`.
+/// A call outside any closure whose arguments read only names the enclosing loops bound, or a
+/// lookup keyed by them: `ctx.groups_of(c.id)`, `repo.copies(*id, hash).await?`, `m[k]`.
 fn keyed_by(node: Node, source: &str, spec: &BodySpec, bound: &[String]) -> bool {
     if spec.closures.contains(&node.kind()) {
         return false;
     }
-    if node.kind().contains("call")
+    if let Some(index) =
+        subscript_index(node).filter(|i| !matches!(i.kind(), "slice" | "range_expression"))
+    {
+        let mut names = Vec::new();
+        idents(index, source, spec, &mut names);
+        if !names.is_empty() && names.iter().all(|n| bound.contains(n)) {
+            return true;
+        }
+    }
+    if (node.kind().contains("call") || node.kind() == "new_expression")
         && let Some(args) = node.child_by_field_name("arguments")
         && !named_children(args)
             .iter()

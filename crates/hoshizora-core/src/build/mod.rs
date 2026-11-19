@@ -3,13 +3,14 @@ mod effects;
 mod packages;
 pub(crate) mod resolve;
 mod states;
+mod unresolved;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use hoshizora_model::{
     CallSite, Confidence, Edge, EdgeKind, Effects, FileFacts, Flow, FunctionInfo, GRAPH_VERSION,
-    Graph, GraphMeta, Language, Node, NodeId, NodeKind, Span, Symbol, SymbolKind,
+    Graph, GraphMeta, Language, Node, NodeId, NodeKind, Span, Symbol, SymbolKind, UnresolvedCall,
 };
 
 use crate::packs::Packs;
@@ -101,6 +102,7 @@ pub(crate) struct Ctx<'a> {
     pub counters: BTreeMap<&'static str, u32>,
     pub warnings: Vec<String>,
     pub sql_sites: Vec<SqlSite>,
+    pub unresolved: Vec<UnresolvedCall>,
 }
 
 impl<'a> Ctx<'a> {
@@ -197,6 +199,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
         counters: BTreeMap::new(),
         warnings: Vec::new(),
         sql_sites: Vec::new(),
+        unresolved: Vec::new(),
     };
 
     packages::build(&mut ctx);
@@ -216,6 +219,10 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
     languages.sort();
     languages.dedup();
 
+    let mut unresolved = std::mem::take(&mut ctx.unresolved);
+    unresolved
+        .sort_by(|a, b| (&a.function, a.line, &a.callee).cmp(&(&b.function, b.line, &b.callee)));
+    unresolved.dedup();
     let mut warnings = ctx.warnings;
     for (key, n) in &ctx.counters {
         warnings.push(format!("{key}: {n}"));
@@ -234,6 +241,7 @@ pub fn build_graph(root: &Path, files: Vec<FileFacts>, packs: &Packs) -> Graph {
         nodes: ctx.nodes,
         edges: ctx.edges,
         states,
+        unresolved,
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 const TABLES: &[&str] = &["users", "sessions"];
@@ -130,4 +131,43 @@ pub fn against_all(groups: &[Vec<u32>], items: &[u32]) -> usize {
         n += pairs(items) + g.len();
     }
     n
+}
+
+pub fn neighbours(steps: &[(i64, i64)], grid: &HashMap<(i64, i64), Vec<i64>>) -> i64 {
+    let mut n = 0;
+    for &(y, x) in steps {
+        let ys = [y - 1, y + 1];
+        let xs = [x - 1, x + 1];
+        for &cy in &ys {
+            for &cx in xs.iter() {
+                n += grid[&(cy, cx)].len() as i64;
+            }
+        }
+    }
+    n
+}
+
+pub fn stencil(points: &[(i64, i64)], r: i64) -> i64 {
+    let around: Vec<(i64, i64)> = (-r..=r)
+        .flat_map(|dy| (-r..=r).map(move |dx| (dy, dx)))
+        .collect();
+    let mut n = 0;
+    for &(y, x) in points {
+        for &(dy, dx) in &around {
+            for &(ey, ex) in &around {
+                n += y * dy * ey + x * dx * ex;
+            }
+        }
+    }
+    n
+}
+
+pub fn split_halves(xs: &[u32]) -> Vec<&[u32]> {
+    if xs.len() <= 1 {
+        return vec![xs];
+    }
+    let (a, b) = xs.split_at(xs.len() / 2);
+    let mut out = split_halves(a);
+    out.extend(split_halves(b));
+    out
 }

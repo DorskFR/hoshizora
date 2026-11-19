@@ -106,6 +106,29 @@ fn loops_over_parts_or_constants_do_not_multiply() {
     }
 }
 
+#[test]
+fn locally_bound_small_or_per_item_loops_do_not_multiply() {
+    let idx = index();
+    for (node, want) in [
+        ("fn:loops.py#near_matches", "O(n^2)"),
+        ("fn:web/loops.ts#nearHits", "O(n^2)"),
+        ("fn:loops.py#pair_legs", "O(n^2)"),
+        ("fn:loops.py#ring_hits", "O(n^2)"),
+        ("fn:src/loops.rs#neighbours", "O(n)"),
+        ("fn:src/loops.rs#stencil", "O(n)"),
+        ("fn:loops.py#by_role", "O(n)"),
+        ("fn:loops.py#run_edges", "O(n)"),
+        ("fn:web/loops.ts#mixdown", "O(n)"),
+        ("fn:loops.py#later_pairs", "O(n^2)"),
+        ("fn:loops.py#against_seen", "O(n^2)"),
+    ] {
+        assert_eq!(time(&idx, node), want, "{node}");
+    }
+    for node in ["fn:loops.py#halves", "fn:src/loops.rs#split_halves"] {
+        assert_ne!(time(&idx, node), "O(2^n)", "{node}");
+    }
+}
+
 fn inefficient_nodes(insights: &[Insight]) -> Vec<&str> {
     insights
         .iter()
@@ -207,14 +230,25 @@ fn blocking_reasons(insights: &[Insight], node: &str) -> Vec<String> {
 fn work_handed_to_a_spawn_blocking_wrapper_is_not_blocking() {
     let idx = index();
     let insights = idx.static_insights();
-    for node in ["fn:src/offload.rs#offloaded", "fn:src/offload.rs#same_line"] {
-        assert_eq!(blocking_reasons(&insights, node), Vec::<String>::new());
+    for node in [
+        "fn:src/offload.rs#offloaded",
+        "fn:src/offload.rs#same_line",
+        "fn:src/offload.rs#hash_off_thread",
+        "fn:src/offload.rs#boot_ticker",
+    ] {
+        assert_eq!(
+            blocking_reasons(&insights, node),
+            Vec::<String>::new(),
+            "{node}"
+        );
     }
-    assert_eq!(
-        blocking_reasons(&insights, "fn:src/offload.rs#inline").len(),
-        1,
-        "{insights:?}"
-    );
+    for node in [
+        "fn:src/offload.rs#inline",
+        "fn:src/offload.rs#hash_inline",
+        "fn:src/offload.rs#boot_nap",
+    ] {
+        assert_eq!(blocking_reasons(&insights, node).len(), 1, "{node}");
+    }
 }
 
 #[test]

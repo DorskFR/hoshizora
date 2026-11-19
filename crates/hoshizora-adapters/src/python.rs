@@ -376,6 +376,88 @@ fn visibility(name: &str) -> Visibility {
 
 /// Statements of a body, with those inside `if`/`for`/`while`/`with`/`try` blocks, so
 /// definitions nested in control flow are found; nested definitions are not entered.
+/// Attributes a class body assigns at class level or as `self.x = …` in its methods, with the
+/// initialiser as `default`. A `*` entry stands for attributes set by name (`setattr(self, …)`).
+fn class_attributes(body: Node, source: &str) -> Vec<Param> {
+    let mut out: Vec<Param> = Vec::new();
+    let mut push = |name: &str, value: Option<Node>| {
+        if !out.iter().any(|p| p.name == name) {
+            out.push(Param {
+                name: name.to_owned(),
+                ty: None,
+                default: value.map(|v| collapse_ws(text(v, source))),
+            });
+        }
+    };
+    for stmt in named_children(body) {
+        let def = match stmt.kind() {
+            "decorated_definition" => stmt.child_by_field_name("definition"),
+            "function_definition" => Some(stmt),
+            "expression_statement" => {
+                for a in named_children(stmt) {
+                    if a.kind() == "assignment"
+                        && let Some(left) = a.child_by_field_name("left")
+                        && left.kind() == "identifier"
+                    {
+                        push(text(left, source), a.child_by_field_name("right"));
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        let Some(def) = def.filter(|d| d.kind() == "function_definition") else {
+            continue;
+        };
+        let Some(this) = def
+            .child_by_field_name("parameters")
+            .and_then(|p| named_children(p).into_iter().next())
+            .filter(|p| p.kind() == "identifier")
+            .map(|p| text(p, source))
+        else {
+            continue;
+        };
+        let mut pending: Vec<Node> = def.child_by_field_name("body").into_iter().collect();
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "class_definition" => continue,
+                "assignment" | "augmented_assignment" => {
+                    if let Some(left) = node.child_by_field_name("left") {
+                        let mut targets = vec![left];
+                        while let Some(t) = targets.pop() {
+                            if t.kind() == "attribute" {
+                                if t.child_by_field_name("object")
+                                    .is_some_and(|o| text(o, source) == this)
+                                    && let Some(attr) = field_text(t, "attribute", source)
+                                {
+                                    push(&attr, node.child_by_field_name("right"));
+                                }
+                            } else {
+                                targets.extend(named_children(t));
+                            }
+                        }
+                    }
+                }
+                "call" => {
+                    let setattr = node
+                        .child_by_field_name("function")
+                        .is_some_and(|f| text(f, source) == "setattr");
+                    let on_self = node
+                        .child_by_field_name("arguments")
+                        .and_then(|a| named_children(a).into_iter().next())
+                        .is_some_and(|a| text(a, source) == this);
+                    if setattr && on_self {
+                        push("*", None);
+                    }
+                }
+                _ => {}
+            }
+            pending.extend(named_children(node).into_iter().rev());
+        }
+    }
+    out
+}
+
 fn nested_statements(body: Node) -> Vec<Node> {
     let mut out = Vec::new();
     let mut pending: Vec<Node> = named_children(body).into_iter().rev().collect();
@@ -499,7 +581,8 @@ impl<'a> Ctx<'a> {
             parent: parent.map(str::to_string),
             signature: header(node, self.source, "body"),
             params: if is_class {
-                vec![]
+                body.map(|b| class_attributes(b, self.source))
+                    .unwrap_or_default()
             } else {
                 params(node, self.source)
             },

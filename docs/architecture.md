@@ -46,6 +46,13 @@ between the three `db_*` kinds (a `DELETE` is a `db_delete`; both writes and del
 `writes` edge to the table), `BEGIN` / `FOR UPDATE` add a `lock`, and pack rules map ORM
 calls and transaction begins the same way.
 
+Unresolved calls (Python): calls that resolved to no function but name project code, tagged
+`own` (`self.m()`, no such method or attribute anywhere in a closed class hierarchy, subclasses
+included), `field` (`self.f.m()`, `f` constructed as or passed in as a project class lacking `m`),
+`module` (`mod.f()` on a project module defining no `f`) or `name` (no project function has the
+name; library receivers, builtins and common method names left out). `diff` turns the ones a
+change introduced into `dangling` findings.
+
 States, three levels: (1) declared value domains and the branch sites on them, with what each
 site misses; (2) table columns written with string literals, their values, readers and the
 domains covering them, so a new status value shows the readers without a case for it; (3) the

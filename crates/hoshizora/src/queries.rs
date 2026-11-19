@@ -23,6 +23,15 @@ pub trait GraphQueries: NodeLookup + 'static {
     fn states(&self, domain: Option<&str>) -> StatesReport;
 }
 
+/// Static findings shown by default. `inefficient` is reported only on request: on hand-checked
+/// samples of real repositories most of its static reports are true but not worth acting on.
+pub fn shown(mut insights: Vec<Insight>, inefficient: bool) -> Vec<Insight> {
+    if !inefficient {
+        insights.retain(|i| !matches!(i, Insight::Inefficient { .. }));
+    }
+    insights
+}
+
 pub struct GraphIndex(pub Index);
 
 impl GraphIndex {
