@@ -44,6 +44,11 @@ with `{"auto_refresh": true}`; it is saved in `projects.json`. For opted-in proj
 `git ls-remote` compares the tracked ref with the indexed commit and rebuilds when it moved;
 rebuilds run one project at a time.
 
+Clones, fetches and `ls-remote` calls that fail on a network error (DNS, refused or reset
+connection, TLS, HTTP 5xx) are tried 4 times with a 1s, 2s, 4s backoff; authentication and
+not-found errors fail at once. A git project still left `failed` by a network error is rebuilt at
+the next `--refresh-interval` tick, opted in or not.
+
 A project without a declared `ref` also follows the deployed code: when its spans carry a
 `service.version` and the remote has a tag `v<version>` or `<version>`, the project switches to
 that tag. When several deployments report different versions, the newest by semver among those

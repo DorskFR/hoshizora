@@ -1,7 +1,7 @@
 //! Shallow clones and updates of project repositories through the `git` binary.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -16,7 +16,15 @@ pub struct GitOptions {
     pub timeout: Option<Duration>,
     /// Test hook: accept `file://` URLs, which the API always refuses.
     pub allow_file_urls: bool,
+    /// Tries of a clone, fetch or ls-remote failing with a transient network error; the delay
+    /// doubles after each failed try, up to [`MAX_RETRY_DELAY`].
+    pub attempts: u32,
+    pub retry_delay: Duration,
+    #[cfg(test)]
+    pub program: Option<PathBuf>,
 }
+
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 impl GitOptions {
     pub fn from_env() -> Self {
@@ -25,7 +33,9 @@ impl GitOptions {
                 .ok()
                 .filter(|t| !t.is_empty()),
             timeout: Some(Duration::from_secs(600)),
-            allow_file_urls: false,
+            attempts: 4,
+            retry_delay: Duration::from_secs(1),
+            ..Default::default()
         }
     }
 }
@@ -86,8 +96,48 @@ pub fn slugify(s: &str) -> String {
     }
 }
 
+/// Whether a git error is a network hiccup worth retrying rather than a bad URL, ref or
+/// credential.
+pub fn is_transient(error: &str) -> bool {
+    const PERMANENT: &[&str] = &[
+        "Authentication failed",
+        "Repository not found",
+        "could not read Username",
+        "could not read Password",
+        "Permission denied",
+        "returned error: 401",
+        "returned error: 403",
+        "returned error: 404",
+    ];
+    const TRANSIENT: &[&str] = &[
+        "Could not resolve host",
+        "Connection timed out",
+        "Connection reset",
+        "Failed to connect",
+        "early EOF",
+        "RPC failed",
+        "TLS",
+        "gnutls_handshake",
+    ];
+    if PERMANENT.iter().any(|p| error.contains(p)) {
+        return false;
+    }
+    TRANSIENT.iter().any(|p| error.contains(p))
+        || error
+            .match_indices("returned error: 5")
+            .any(|(i, m)| error[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+fn program(_opts: &GitOptions) -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = &_opts.program {
+        return p.clone();
+    }
+    PathBuf::from("git")
+}
+
 fn command(opts: &GitOptions, url: Option<&str>) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(program(opts));
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -105,7 +155,7 @@ fn command(opts: &GitOptions, url: Option<&str>) -> Command {
     cmd
 }
 
-async fn run(opts: &GitOptions, mut cmd: Command, what: &str) -> anyhow::Result<String> {
+async fn run(opts: &GitOptions, cmd: &mut Command, what: &str) -> anyhow::Result<String> {
     let fut = cmd.output();
     let output = match opts.timeout {
         Some(t) => tokio::time::timeout(t, fut)
@@ -119,6 +169,32 @@ async fn run(opts: &GitOptions, mut cmd: Command, what: &str) -> anyhow::Result<
         bail!("git {what} failed: {}", stderr.trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// [`run`], tried again with backoff while it fails with a transient error. `scratch` is
+/// deleted before each new try so a clone starts from an empty destination.
+async fn run_network(
+    opts: &GitOptions,
+    cmd: &mut Command,
+    what: &str,
+    scratch: Option<&Path>,
+) -> anyhow::Result<String> {
+    let mut delay = opts.retry_delay;
+    let mut attempt = 1;
+    loop {
+        match run(opts, cmd, what).await {
+            Err(e) if attempt < opts.attempts && is_transient(&format!("{e:#}")) => {
+                tracing::warn!(attempt, error = %e, "git {what} failed, retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_RETRY_DELAY);
+                attempt += 1;
+                if let Some(dir) = scratch {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+            result => return result,
+        }
+    }
 }
 
 pub async fn clone(
@@ -141,7 +217,9 @@ pub async fn clone(
     }
     cmd.arg("--").arg(url).arg(dest);
     tracing::info!(url, dest = %dest.display(), "cloning");
-    run(opts, cmd, "clone").await.map(drop)
+    run_network(opts, &mut cmd, "clone", Some(dest))
+        .await
+        .map(drop)
 }
 
 /// Fetches the latest commit of `ref` (or the cloned branch) and resets the checkout to it.
@@ -158,11 +236,11 @@ pub async fn update(
         validate_ref(r)?;
         cmd.arg(r);
     }
-    run(opts, cmd, "fetch").await?;
+    run_network(opts, &mut cmd, "fetch", None).await?;
     let mut cmd = command(opts, None);
     cmd.current_dir(dest)
         .args(["reset", "--hard", "--quiet", "FETCH_HEAD"]);
-    run(opts, cmd, "reset").await.map(drop)
+    run(opts, &mut cmd, "reset").await.map(drop)
 }
 
 /// Commit `ref` (a branch, tag or `HEAD`) points at on the remote, without a clone; `None`
@@ -183,7 +261,7 @@ pub async fn ls_remote(
             .arg(format!("refs/tags/{ref}", ref = r#ref))
             .arg(format!("refs/tags/{ref}^{{}}", ref = r#ref));
     }
-    let out = run(opts, cmd, "ls-remote").await?;
+    let out = run_network(opts, &mut cmd, "ls-remote", None).await?;
     Ok(parse_ls_remote(&out, r#ref))
 }
 
@@ -210,7 +288,7 @@ fn parse_ls_remote(out: &str, r#ref: &str) -> Option<String> {
 pub async fn head(opts: &GitOptions, dest: &Path) -> anyhow::Result<String> {
     let mut cmd = command(opts, None);
     cmd.current_dir(dest).args(["rev-parse", "HEAD"]);
-    run(opts, cmd, "rev-parse").await
+    run(opts, &mut cmd, "rev-parse").await
 }
 
 /// Extracts `rev` of a local repository into `dest` with `git archive | tar`, without touching
@@ -437,6 +515,121 @@ mod tests {
         };
         let url = format!("file://{}", dir.display());
         assert_eq!(ls_remote(&opts, &url, "v1").await.unwrap(), Some(commit));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_errors() {
+        for e in [
+            "git fetch failed: fatal: unable to access 'https://github.com/a/b/': Could not resolve host: github.com",
+            "fatal: unable to access 'x': Failed to connect to github.com port 443",
+            "error: RPC failed; curl 56 Connection reset by peer\nfatal: early EOF",
+            "fatal: unable to access 'x': The requested URL returned error: 503",
+            "fatal: unable to access 'x': gnutls_handshake() failed",
+        ] {
+            assert!(is_transient(e), "{e}");
+        }
+        for e in [
+            "fatal: Authentication failed for 'https://github.com/a/b/'",
+            "remote: Repository not found.\nfatal: repository 'x' not found",
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: unable to access 'x': The requested URL returned error: 404",
+            "fatal: unable to access 'x': The requested URL returned error: 403",
+            "fatal: unable to access 'x': The requested URL returned error: 5",
+            "fatal: Remote branch nope not found in upstream origin",
+        ] {
+            assert!(!is_transient(e), "{e}");
+        }
+    }
+
+    /// A `git` that fails with `message` on its first `fails` runs, then reports `abc` as HEAD.
+    fn fake_git(name: &str, fails: u32, message: &str) -> (GitOptions, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "hoshizora-fakegit-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("git");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nn=$(cat \"$0.count\" 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > \"$0.count\"\n\
+                 if [ $n -le {fails} ]; then echo \"fatal: {message}\" >&2; exit 128; fi\n\
+                 printf 'abc\\tHEAD\\n'\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let opts = GitOptions {
+            attempts: 4,
+            program: Some(script),
+            ..Default::default()
+        };
+        (opts, dir)
+    }
+
+    fn runs(dir: &Path) -> u32 {
+        std::fs::read_to_string(dir.join("git.count"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_retried() {
+        let url = "https://github.com/a/b";
+        let (opts, dir) = fake_git("transient", 2, "Could not resolve host: github.com");
+        assert_eq!(
+            ls_remote(&opts, url, "HEAD").await.unwrap().as_deref(),
+            Some("abc")
+        );
+        assert_eq!(runs(&dir), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (opts, dir) = fake_git("exhausted", 10, "Connection timed out");
+        let err = ls_remote(&opts, url, "HEAD").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Connection timed out"),
+            "{err:#}"
+        );
+        assert_eq!(runs(&dir), 4, "gives up after the configured attempts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_failures_are_not_retried() {
+        let (opts, dir) = fake_git(
+            "auth",
+            10,
+            "Authentication failed for 'https://github.com/a/b/'",
+        );
+        let err = ls_remote(&opts, "https://github.com/a/b", "HEAD")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Authentication failed"));
+        assert_eq!(runs(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clone_retries_from_an_empty_destination() {
+        let (opts, dir) = fake_git("clone", 1, "early EOF");
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(dest.join("partial")).unwrap();
+        clone(&opts, "https://github.com/a/b", None, &dest)
+            .await
+            .unwrap();
+        assert_eq!(runs(&dir), 2);
+        assert!(
+            !dest.exists(),
+            "the partial clone was cleared before retrying"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
