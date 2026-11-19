@@ -21,6 +21,37 @@ pub struct Graph {
     pub edges: Vec<Edge>,
     #[serde(default)]
     pub states: States,
+    /// Calls that resolved to no function although they name project code, sorted by function
+    /// then line. Python only: compiled and type-checked languages report these at build time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<UnresolvedCall>,
+}
+
+/// A call no project function answers, and what made the call look like project code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedCall {
+    pub function: NodeId,
+    /// Callee as written: `self.tactics.heard`, `geometry.clamp`, `helper`.
+    pub callee: String,
+    pub name: String,
+    pub line: u32,
+    pub scope: UnresolvedScope,
+    /// Type or file node the callee was looked up in, for `own`, `field` and `module`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedScope {
+    /// `self.name()` on a project class whose hierarchy defines no such method or attribute.
+    Own,
+    /// `self.field.name()` where the field is named after a project class lacking the method.
+    Field,
+    /// `module.name()` on an imported project module that defines no such name.
+    Module,
+    /// No project function has this name; the call could still be a library or local one.
+    Name,
 }
 
 /// Declared value domains and the branch sites linked to them, plus the table columns SQL

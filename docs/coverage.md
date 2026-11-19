@@ -53,7 +53,8 @@ revisions, or two prebuilt graph files:
 
 Every location is mapped to the innermost head function whose span contains the line
 (`function: null` when it is outside any function, e.g. a type, a constant, an import or other
-top-level code; such locations count as misses). For that function:
+top-level code; such locations count as misses, except for `dangling`, which also matches the
+callee's expected type or file by span). For that function:
 
 | signal | true when the function... | set |
 | --- | --- | --- |
@@ -62,6 +63,9 @@ top-level code; such locations count as misses). For that function:
 | `impact_full` | reaches a changed function over flow edges, with no cap | all transitive callers of changed functions, minus changed |
 | `effects` | is reachable from an entrypoint listed in `entrypoint_effect_delta` or `tests_effect_delta` | everything those entrypoints reach |
 | `states` | owns a site in `states.silent_defaults` or `states.domains[].unhandled`, or the line is within 3 lines of such a site | functions with a state finding |
+| `dangling` | holds a call in `dangling`, or the line is inside the type or file that call's callee was expected in (`owner`) | dangling calls reported |
+| `callers` | directly calls a changed function (flow edges, tests excluded, uncapped) | those callers, minus changed |
+| `callees` | is called by a changed function at a call site the change introduced (no base edge to it) or rewrote (the call's line is not in the base body) | those callees, minus changed |
 
 `impact_shown` versus `impact_full` tells whether the cap is what loses the correction, or
 whether the call graph never reached it at all.
@@ -69,8 +73,8 @@ whether the call graph never reached it at all.
 ## Output
 
 ```
-case                      locs   ood  changed    shown     full  effects   states
-pr-123                       3     2    0/2|2    1/2|4    1/2|11   1/2|9    0/2|0
+case                      locs   ood  changed    shown     full  effects   states dangling  callers  callees
+pr-123                       3     2    0/2|2    1/2|4    1/2|11   1/2|9    0/2|0    0/2|0    1/2|3    0/2|1
 
 1 cases, 2 out-of-diff locations (0 outside any function)
 signal               recall     median        p90        max
@@ -79,6 +83,9 @@ impact_shown     1/2 (50%)          4          4          4
 impact_full      1/2 (50%)         11         11         11
 effects          1/2 (50%)          9          9          9
 states            0/2 (0%)          0          0          0
+dangling          0/2 (0%)          0          0          0
+callers          1/2 (50%)          3          3          3
+callees           0/2 (0%)          1          1          1
 ```
 
 Per case, each signal cell is `hits/out-of-diff locations|set size`. The summary gives recall

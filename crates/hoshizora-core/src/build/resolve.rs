@@ -13,7 +13,7 @@ use hoshizora_model::{
 
 use super::analysis::is_test_file;
 use super::packages::{self, normalise};
-use super::{Ctx, FileScope, ImportTarget, effects};
+use super::{Ctx, FileScope, ImportTarget, effects, unresolved};
 
 /// Names matching more candidates than this are dropped rather than guessed.
 pub(crate) const MAX_CANDIDATES: usize = 3;
@@ -409,6 +409,7 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 
 pub(crate) fn calls(ctx: &mut Ctx) {
     ctx.self_calls = vec![Vec::new(); ctx.fns.len()];
+    let hierarchy = unresolved::Hierarchy::new(ctx);
     for f in 0..ctx.fns.len() {
         let sym = ctx.symbol(f);
         let Some(body) = &sym.body else { continue };
@@ -431,6 +432,11 @@ pub(crate) fn calls(ctx: &mut Ctx) {
             } else {
                 EdgeKind::Calls
             };
+            if targets.is_empty()
+                && let Some(u) = unresolved::classify(ctx, &hierarchy, f, call)
+            {
+                ctx.unresolved.push(u);
+            }
             let candidates = targets.len();
             for (t, confidence) in targets {
                 if t == f && !call.reference {
@@ -608,7 +614,7 @@ fn type_methods(ctx: &Ctx, ty: &str, name: &str) -> Option<Vec<usize>> {
     ctx.fn_by_type_method.get(ty)?.get(name).cloned()
 }
 
-fn is_self(segment: &str) -> bool {
+pub(crate) fn is_self(segment: &str) -> bool {
     matches!(segment, "self" | "this" | "cls" | "Self")
 }
 
@@ -621,7 +627,7 @@ const EXPR_RECEIVER: &str = "<expr>";
 
 /// Trait and lifecycle method names that std and third-party types implement too: on a
 /// receiver of unknown type, being the only project method of that name is not evidence.
-const COMMON_METHODS: &[&str] = &[
+pub(crate) const COMMON_METHODS: &[&str] = &[
     "abort",
     "accept",
     "acquire",
@@ -1109,7 +1115,7 @@ fn resolve_targets(
 
 /// An import that resolved to no project file and that no project module is named after
 /// (`numpy`, `math`), as opposed to a sibling module the import resolution missed.
-fn external(ctx: &Ctx, imp: &super::ImportTarget) -> bool {
+pub(crate) fn external(ctx: &Ctx, imp: &super::ImportTarget) -> bool {
     imp.file.is_none()
         && !ctx.module_names.contains(
             imp.path
@@ -1221,7 +1227,7 @@ fn field_types(ctx: &Ctx, f: usize, receiver: &str) -> Vec<String> {
 
 /// Type nodes a name refers to from `fi`: through an import, in the file, else by name
 /// within the file's package.
-fn types_named(ctx: &Ctx, fi: usize, name: &str) -> Vec<usize> {
+pub(crate) fn types_named(ctx: &Ctx, fi: usize, name: &str) -> Vec<usize> {
     if let Some(&imp) = ctx.scopes[fi].bindings.get(name)
         && let Some(tf) = ctx.scopes[fi].imports[imp].file
         && let Some(&t) = ctx.type_by_file_local[tf].get(name)

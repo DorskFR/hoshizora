@@ -18,7 +18,7 @@ self time and percentiles per function.
 hoshizora index path/to/repo          # parse it, write .hoshizora/graph.json
 hoshizora serve                       # API, OTLP receiver and the 3D viewer on :7317
 hoshizora query flow '<node id>'      # everything a function or route triggers, as JSON
-hoshizora query insights              # N+1 queries, sequential awaits, quadratic loops
+hoshizora query insights              # N+1 queries, sequential awaits, check-then-act writes
 hoshizora diff ./base ./head          # what a change does to effects, tables and entrypoints
 ```
 
@@ -62,10 +62,8 @@ indexed /path/to/hoshizora/examples/demo in 60.59ms
   dead       1
   ...
 $ hoshizora query insights | jq -r '.insights[] | "\(.kind)\t\(.node)"'
-inefficient	fn:api/src/catalog.rs#find_duplicate_stars
 io_in_loop	fn:api/src/handlers.rs#list_stars
 parallelisable	fn:api/src/handlers.rs#launch_observation
-inefficient	fn:api/src/handlers.rs#launch_observation
 io_in_loop	fn:api/src/handlers.rs#recompute_catalog
 read_then_write	fn:api/src/handlers.rs#recompute_catalog
 $ hoshizora serve

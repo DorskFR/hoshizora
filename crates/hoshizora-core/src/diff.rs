@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use hoshizora_model::{
-    EffectKind, EntrypointKind, Insight, Language, Node, NodeKind, StateColumn, StateSite,
+    EdgeKind, EffectKind, EntrypointKind, Insight, Language, Node, NodeKind, StateColumn,
+    StateSite, UnresolvedScope,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,45 @@ pub struct DiffReport {
     pub impact: BTreeMap<String, ImpactSummary>,
     #[serde(default)]
     pub states: StatesDelta,
+    /// Calls the change left pointing at nothing.
+    #[serde(default)]
+    pub dangling: Vec<DanglingCall>,
+    /// Merge conflict markers (`<<<<<<<`, `=======`, `>>>>>>>` lines) new in head.
+    #[serde(default)]
+    pub conflict_markers: Vec<FileLine>,
+    /// Changed function → its direct non-test callers outside the change, uncapped.
+    #[serde(default)]
+    pub callers: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLine {
+    pub file: String,
+    pub line: u32,
+}
+
+/// A head call that names project code no function answers, introduced by the change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DanglingCall {
+    pub function: String,
+    pub callee: String,
+    pub line: u32,
+    pub reason: DanglingReason,
+    /// Type or file the callee was expected in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Base function the same call reached before it was removed or renamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DanglingReason {
+    /// A new call to a method or module function that does not exist.
+    Missing,
+    /// The function this call reached in base is gone from head.
+    Removed,
 }
 
 /// Value domains whose members changed, and the branch sites that do not follow.
@@ -187,8 +227,10 @@ pub fn diff(base: &Index, head: &Index) -> DiffReport {
         .map(|id| (id.clone(), impact_of(head, id)))
         .collect();
     let states = states_delta(base, head, &changed);
+    let dangling = dangling(base, head, &moved_to_from, &mut head_src);
+    let conflict_markers = conflict_markers(base, head);
 
-    DiffReport {
+    let mut report = DiffReport {
         functions: FunctionDelta {
             added: added.into_iter().map(str::to_owned).collect(),
             removed: removed.into_iter().map(str::to_owned).collect(),
@@ -201,7 +243,245 @@ pub fn diff(base: &Index, head: &Index) -> DiffReport {
         insights,
         impact,
         states,
+        dangling,
+        conflict_markers,
+        callers: BTreeMap::new(),
+    };
+    report.callers = callers(head, &report);
+    report
+}
+
+fn marker_lines(text: &str) -> Vec<u32> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l.trim_end() == "======="
+        })
+        .map(|(i, _)| i as u32 + 1)
+        .collect()
+}
+
+/// Marker lines in head files that have more of them than the same file in base, so a
+/// document quoting a marker is not reported on every change.
+fn conflict_markers(base: &Index, head: &Index) -> Vec<FileLine> {
+    let read = |index: &Index, file: &str| {
+        std::fs::read_to_string(Path::new(&index.graph.meta.root).join(file)).ok()
+    };
+    let mut out = Vec::new();
+    for n in &head.graph.nodes {
+        let (NodeKind::File, Some(file)) = (n.kind, n.file.as_deref()) else {
+            continue;
+        };
+        let Some(text) = read(head, file) else {
+            continue;
+        };
+        let lines = marker_lines(&text);
+        if lines.is_empty() {
+            continue;
+        }
+        let before = read(base, file).map_or(0, |t| marker_lines(&t).len());
+        if lines.len() > before {
+            out.extend(lines.into_iter().map(|line| FileLine {
+                file: file.to_owned(),
+                line,
+            }));
+        }
     }
+    out
+}
+
+/// The head file of a base function still defines it by name: the parser lost it (a syntax
+/// error, conflict markers), the code did not.
+fn still_defined(src: &mut Sources, base_fn: &Node) -> bool {
+    let Some(file) = base_fn.file.as_deref() else {
+        return false;
+    };
+    let pattern = format!("def {}(", base_fn.name);
+    src.text(file)
+        .is_some_and(|lines| lines.iter().any(|l| l.trim_start().contains(&pattern)))
+}
+
+fn is_call(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Calls | EdgeKind::Spawns)
+}
+
+/// Head calls that resolve to nothing: those whose base target is gone, and new calls of a
+/// confident form (`self.method`, `self.field.method`, `module.function`). A call that was
+/// already unresolved in base, or whose base target still exists, is not the change's doing.
+fn dangling(
+    base: &Index,
+    head: &Index,
+    moved_to_from: &HashMap<&str, &str>,
+    head_src: &mut Sources,
+) -> Vec<DanglingCall> {
+    let before: HashSet<(&str, &str)> = base
+        .graph
+        .unresolved
+        .iter()
+        .map(|u| (u.function.as_str(), u.callee.as_str()))
+        .collect();
+    let mut out: Vec<DanglingCall> = Vec::new();
+    for u in &head.graph.unresolved {
+        if head.idx(&u.function).is_some_and(|i| head.is_test(i)) {
+            continue;
+        }
+        let caller = moved_to_from
+            .get(u.function.as_str())
+            .copied()
+            .unwrap_or(u.function.as_str());
+        let mut gone = None;
+        let mut still_there = false;
+        if let Some(bi) = base.idx(caller) {
+            for &ei in &base.outgoing[bi] {
+                let edge = &base.graph.edges[ei];
+                if !is_call(edge.kind) || base.node(&edge.to).is_none_or(|n| n.name != u.name) {
+                    continue;
+                }
+                if head.idx(&edge.to).is_some()
+                    || base
+                        .node(&edge.to)
+                        .is_some_and(|n| still_defined(head_src, n))
+                {
+                    still_there = true;
+                } else {
+                    gone.get_or_insert_with(|| edge.to.clone());
+                }
+            }
+        }
+        let reason = match (&gone, u.scope) {
+            _ if still_there => continue,
+            (Some(_), _) => DanglingReason::Removed,
+            (None, UnresolvedScope::Name) => continue,
+            (None, _) if before.contains(&(caller, u.callee.as_str())) => continue,
+            (None, _) => DanglingReason::Missing,
+        };
+        if out
+            .iter()
+            .any(|d| d.function == u.function && d.callee == u.callee)
+        {
+            continue;
+        }
+        let owner = u.owner.clone().or_else(|| {
+            let parent = base.node(gone.as_deref()?)?.parent.as_deref()?;
+            head.idx(parent).map(|_| parent.to_owned())
+        });
+        out.push(DanglingCall {
+            function: u.function.clone(),
+            callee: u.callee.clone(),
+            line: u.line,
+            reason,
+            owner,
+            was: gone,
+        });
+    }
+    out
+}
+
+/// Direct callers of each changed function outside the change and outside tests, uncapped.
+pub fn callers(head: &Index, report: &DiffReport) -> BTreeMap<String, Vec<String>> {
+    let changed = changed_set(report);
+    let mut out = BTreeMap::new();
+    for id in &changed {
+        let Some(i) = head.idx(id) else { continue };
+        let mut list: Vec<String> = head.incoming[i]
+            .iter()
+            .map(|&ei| &head.graph.edges[ei])
+            .filter(|e| DEFAULT_FLOW_KINDS.contains(&e.kind))
+            .filter_map(|e| head.idx(&e.from))
+            .filter(|&c| head.graph.nodes[c].kind == NodeKind::Function && !head.is_test(c))
+            .map(|c| head.graph.nodes[c].id.clone())
+            .filter(|c| !changed.contains(c))
+            .collect();
+        list.sort();
+        list.dedup();
+        if !list.is_empty() {
+            out.insert(id.clone(), list);
+        }
+    }
+    out
+}
+
+/// Functions a changed function calls at a call site the change introduced or rewrote: no
+/// base edge to that callee, or the call's line is not in the base body.
+pub fn callees(base: &Index, head: &Index, report: &DiffReport) -> BTreeMap<String, Vec<String>> {
+    let changed = changed_set(report);
+    let to_base: HashMap<&str, &str> = report
+        .functions
+        .moved
+        .iter()
+        .map(|m| (m.to.as_str(), m.from.as_str()))
+        .collect();
+    let mut base_src = Sources::new(&base.graph.meta.root);
+    let mut head_src = Sources::new(&head.graph.meta.root);
+    let mut out = BTreeMap::new();
+    for id in &changed {
+        let Some(hi) = head.idx(id) else { continue };
+        let old = to_base.get(id.as_str()).copied().unwrap_or(id.as_str());
+        let base_node = base.idx(old);
+        let base_targets: HashSet<&str> = base_node
+            .map(|bi| {
+                base.outgoing[bi]
+                    .iter()
+                    .map(|&ei| &base.graph.edges[ei])
+                    .filter(|e| DEFAULT_FLOW_KINDS.contains(&e.kind))
+                    .map(|e| e.to.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let base_lines: HashSet<String> = base_node
+            .and_then(|bi| base_src.body(&base.graph.nodes[bi]))
+            .map(|b| b.lines().map(normalise).collect())
+            .unwrap_or_default();
+        let head_node = &head.graph.nodes[hi];
+        let head_lines: Vec<String> = head_src
+            .body(head_node)
+            .map(|b| b.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        let start = head_node.span.map_or(1, |s| s.start_line.max(1));
+        let mut list: Vec<String> = Vec::new();
+        for &ei in &head.outgoing[hi] {
+            let e = &head.graph.edges[ei];
+            if !DEFAULT_FLOW_KINDS.contains(&e.kind) || changed.contains(&e.to) || e.to == *id {
+                continue;
+            }
+            let Some(t) = head.idx(&e.to) else { continue };
+            if head.graph.nodes[t].kind != NodeKind::Function || head.is_test(t) {
+                continue;
+            }
+            let target_in_base = to_base.get(e.to.as_str()).copied().unwrap_or(&e.to);
+            let rewritten = e
+                .line
+                .and_then(|l| head_lines.get(l.checked_sub(start)? as usize))
+                .is_some_and(|line| !base_lines.contains(&normalise(line)));
+            if !base_targets.contains(target_in_base) || rewritten {
+                list.push(e.to.clone());
+            }
+        }
+        list.sort();
+        list.dedup();
+        if !list.is_empty() {
+            out.insert(id.clone(), list);
+        }
+    }
+    out
+}
+
+fn changed_set(report: &DiffReport) -> HashSet<String> {
+    report
+        .functions
+        .added
+        .iter()
+        .chain(&report.functions.modified)
+        .chain(
+            report
+                .functions
+                .moved
+                .iter()
+                .filter(|m| m.modified)
+                .map(|m| &m.to),
+        )
+        .cloned()
+        .collect()
 }
 
 fn family(language: Language) -> &'static str {
@@ -449,18 +729,20 @@ impl<'a> Sources<'a> {
         }
     }
 
-    fn body(&mut self, n: &Node) -> Option<String> {
-        let file = n.file.as_deref()?;
-        let span = n.span?;
-        let lines = self
-            .files
+    fn text(&mut self, file: &str) -> Option<&Vec<String>> {
+        self.files
             .entry(file.to_owned())
             .or_insert_with(|| {
                 std::fs::read_to_string(self.root.join(file))
                     .ok()
                     .map(|s| s.lines().map(str::to_owned).collect())
             })
-            .as_ref()?;
+            .as_ref()
+    }
+
+    fn body(&mut self, n: &Node) -> Option<String> {
+        let span = n.span?;
+        let lines = self.text(n.file.as_deref()?)?;
         let start = (span.start_line.max(1) - 1) as usize;
         let end = (span.end_line as usize).min(lines.len());
         (start < end).then(|| lines[start..end].join("\n"))

@@ -25,16 +25,35 @@ hoshizora coverage --cases cases.json                          # score diffs aga
 - the effects each entrypoint gains or loses (tests in their own section);
 - the readers and writers of every table the changed code touches;
 - insights that appeared or went away;
+- `callers`: for each changed function, every direct caller outside the change and outside
+  tests, uncapped;
 - for each changed function, the nearest user-facing entrypoints (routes, UI handlers, jobs, CLI,
   main) with one shortest path each, capped at 10 with an `omitted` count;
 - a `states` section: domains whose values were added or removed, with every site in the repo
-  that does not handle a new value.
+  that does not handle a new value;
+- `dangling`: Python calls the change left pointing at nothing, either `missing` (a new
+  `self.method()`, `self.field.method()` or `module.function()` call that no project class or
+  module defines, judged over the whole class hierarchy including subclasses, with `owner` the
+  type or file it was expected in) or `removed` (the function the same call reached in base is
+  gone, `was` names it). Compiled and type-checked languages are left out: their build reports
+  these already;
+- `conflict_markers`: `<<<<<<<` / `=======` / `>>>>>>>` lines in head files that have more of
+  them than in base.
 
 ## coverage
 
 `coverage` replays `diff` over labelled PRs and reports, per signal, how many of the review
 corrections outside the diff it would have pointed at and how large its set was; see
 [coverage.md](coverage.md).
+
+## insights
+
+`query insights` lists `io_in_loop`, `parallelisable` and `read_then_write`. Static
+`inefficient` findings (blocking calls in async code, loops nested three deep or over the same
+collection, branching recursion) come only with `--inefficient`: on hand-checked samples of real
+repositories about half of them were wrong and almost none were worth acting on. `serve` still
+reports functions whose runtime self time is high and whose code is complex, and `diff` always
+reports the ones in changed code.
 
 ## states
 

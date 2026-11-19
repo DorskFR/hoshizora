@@ -428,6 +428,7 @@ pub fn slim_graph(graph: &Graph) -> Graph {
         nodes,
         edges,
         states: hoshizora_model::States::default(),
+        unresolved: Vec::new(),
     }
 }
 
@@ -622,6 +623,8 @@ struct InsightsParams {
     include_tests: bool,
     #[serde(default)]
     unhandled_values: bool,
+    #[serde(default)]
+    inefficient: bool,
 }
 
 async fn insights<Q: GraphQueries>(
@@ -635,6 +638,7 @@ async fn insights<Q: GraphQueries>(
                 include_tests: p.include_tests,
                 unhandled_values: p.unhandled_values,
             },
+            p.inefficient,
         ),
     })
 }
@@ -654,8 +658,9 @@ async fn states<Q: GraphQueries>(
 pub fn all_insights<Q: GraphQueries>(
     state: &ProjectState<Q>,
     opts: InsightOptions,
+    inefficient: bool,
 ) -> Vec<Insight> {
-    let statics = state.queries.static_insights(opts);
+    let statics = crate::queries::shown(state.queries.static_insights(opts), inefficient);
     state
         .runtime()
         .insights(hoshizora_runtime::now_unix_nanos(), &statics)
@@ -1028,12 +1033,20 @@ mod tests {
             vec![]
         }
         fn static_insights(&self, _opts: InsightOptions) -> Vec<Insight> {
-            vec![Insight::IoInLoop {
-                node: FN_ID.into(),
-                effect: "db_read".into(),
-                line: 3,
-                observed_calls_per_parent: None,
-            }]
+            vec![
+                Insight::IoInLoop {
+                    node: FN_ID.into(),
+                    effect: "db_read".into(),
+                    line: 3,
+                    observed_calls_per_parent: None,
+                },
+                Insight::Inefficient {
+                    node: FN_ID.into(),
+                    self_p95_nanos: None,
+                    complexity: "O(n^3)".into(),
+                    reasons: vec!["nested loops (depth 3)".into()],
+                },
+            ]
         }
         fn states(&self, domain: Option<&str>) -> StatesReport {
             let d = StateDomain {
@@ -1418,7 +1431,17 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         let (_, insights) = get_json(&app, "/api/insights").await;
-        assert_eq!(insights["insights"][0]["kind"], "io_in_loop");
+        let kinds = |v: &serde_json::Value| -> Vec<String> {
+            v["insights"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["kind"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(kinds(&insights), ["io_in_loop"]);
+        let (_, insights) = get_json(&app, "/api/insights?inefficient=true").await;
+        assert_eq!(kinds(&insights), ["inefficient", "io_in_loop"]);
     }
 
     #[tokio::test]

@@ -158,6 +158,10 @@ enum QueryCommand {
         /// Also report catch-alls that silently swallow domain values (`unhandled_values`).
         #[arg(long)]
         unhandled_values: bool,
+        /// Also report static `inefficient` findings (blocking calls in async code, deep or
+        /// pairwise loop nests, branching recursion).
+        #[arg(long)]
+        inefficient: bool,
     },
     /// Value domains (enums, literal unions, const lists) and the branches on them, with the
     /// values each branch misses.
@@ -667,7 +671,7 @@ fn coverage_case(
         })
         .collect();
     Ok(hoshizora_core::coverage::evaluate(
-        name, &head, &report, &locations,
+        name, &base, &head, &report, &locations,
     ))
 }
 
@@ -700,11 +704,15 @@ fn cmd_query(graph_path: &Path, query: QueryCommand) -> anyhow::Result<()> {
         QueryCommand::Insights {
             include_tests,
             unhandled_values,
+            inefficient,
         } => serde_json::to_value(hoshizora_model::api::Insights {
-            insights: index.static_insights(hoshizora_core::InsightOptions {
-                include_tests,
-                unhandled_values,
-            }),
+            insights: queries::shown(
+                index.static_insights(hoshizora_core::InsightOptions {
+                    include_tests,
+                    unhandled_values,
+                }),
+                inefficient,
+            ),
         })?,
         QueryCommand::States { domain } => serde_json::to_value(index.states(domain.as_deref()))?,
         QueryCommand::Search { q, limit } => serde_json::to_value(index.search(&q, limit))?,
