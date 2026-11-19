@@ -520,7 +520,8 @@ impl<Q: GraphQueries> AppState<Q> {
 
     /// Checks the remote of a git project: adopts the tag matching `seen_version` when the
     /// project has no declared ref, then queues a rebuild if the tracked ref no longer points
-    /// at the indexed commit. Checks run one at a time.
+    /// at the indexed commit. A project that failed on a transient git error is rebuilt instead.
+    /// Checks run one at a time.
     pub async fn refresh_project(self: &Arc<Self>, id: &str) -> anyhow::Result<Refresh> {
         let _slot = self.refresh_slot.lock().await;
         let project = self.get(id).context("project was removed")?;
@@ -533,6 +534,12 @@ impl<Q: GraphQueries> AppState<Q> {
         };
         if busy(project.status) {
             return Ok(Refresh::Skipped);
+        }
+        if transient_failure(&project) {
+            tracing::info!(project = id, "retrying after a transient git failure");
+            self.reindex(id)
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            return Ok(Refresh::Reindexing);
         }
         if declared.is_none()
             && let Some(version) = &project.seen_version
@@ -586,7 +593,7 @@ impl<Q: GraphQueries> AppState<Q> {
             .read()
             .iter()
             .filter(|e| matches!(e.project.source, ProjectSource::Git { .. }))
-            .filter(|e| e.project.auto_refresh)
+            .filter(|e| e.project.auto_refresh || transient_failure(&e.project))
             .map(|e| e.project.id.clone())
             .collect();
         for id in ids {
@@ -596,7 +603,8 @@ impl<Q: GraphQueries> AppState<Q> {
         }
     }
 
-    /// Checks the remote of every git project with `auto_refresh` every `interval`.
+    /// Checks the remote of every git project with `auto_refresh` every `interval`, and retries
+    /// every git project that failed on a transient error.
     pub fn spawn_refresh(self: &Arc<Self>, interval: Duration) {
         let state = Arc::clone(self);
         tokio::spawn(async move {
@@ -942,6 +950,12 @@ pub fn version_tags(version: &str) -> Vec<String> {
         return Vec::new();
     }
     vec![format!("v{bare}"), bare.to_string()]
+}
+
+fn transient_failure(project: &Project) -> bool {
+    project.status == ProjectStatus::Failed
+        && matches!(project.source, ProjectSource::Git { .. })
+        && project.error.as_deref().is_some_and(git::is_transient)
 }
 
 fn busy(status: ProjectStatus) -> bool {
@@ -1529,6 +1543,30 @@ mod tests {
         assert_eq!(remote.calls(), 1);
         assert_eq!(state.get(&on.id).unwrap().status, ProjectStatus::Cloning);
         assert_eq!(state.get(&off.id).unwrap().status, ProjectStatus::Ready);
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn periodic_check_retries_transient_failures() {
+        let remote = FakeRemote::new(&[("HEAD", "abc")]);
+        let state = fake_state(Arc::clone(&remote));
+        let dns = ready_git(&state, "file:///nowhere/f/dns", None, "abc");
+        let auth = ready_git(&state, "file:///nowhere/f/auth", None, "abc");
+        state.set_status(
+            &dns.id,
+            ProjectStatus::Failed,
+            Some("git fetch failed: fatal: unable to access 'https://github.com/a/b/': Could not resolve host: github.com".into()),
+        );
+        state.set_status(
+            &auth.id,
+            ProjectStatus::Failed,
+            Some("git fetch failed: fatal: Authentication failed".into()),
+        );
+
+        state.refresh_all().await;
+        assert_eq!(state.get(&dns.id).unwrap().status, ProjectStatus::Cloning);
+        assert_eq!(state.get(&auth.id).unwrap().status, ProjectStatus::Failed);
+        assert_eq!(remote.calls(), 0, "a retry needs no remote check");
         let _ = std::fs::remove_dir_all(&state.data_dir);
     }
 
